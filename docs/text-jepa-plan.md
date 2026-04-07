@@ -1,8 +1,8 @@
-# Text JEPA Implementation Plan
+# Layer JEPA Implementation Plan
 
 ## Goal
 
-Build a clean text-first Joint-Embedding Predictive Architecture system from scratch, without depending on the legacy `jepa/` package.
+Build Layer, our text-first Joint-Embedding Predictive Architecture system, from scratch without depending on the legacy `jepa/` package.
 
 The target system is:
 
@@ -16,6 +16,8 @@ This document is the execution plan.
 The companion deep-dive flow document is:
 
 - `docs/text-jepa-flow.md`
+
+Layer is the codename for the JEPA latent-prediction system we are building here.
 
 ## What We Are Building
 
@@ -69,10 +71,16 @@ Implication for implementation:
 
 - I-JEPA paper:
   `JEPA.pdf`
-- LeJEPA paper:
-  `LeJEPA.pdf`
+
+### Adjacent precedent
+
 - LLM-JEPA paper:
   `LLM-JEPA Large Language Models.pdf`
+
+### Theoretical extension
+
+- LeJEPA paper:
+  `LeJEPA.pdf`
 
 ### Online sources used
 
@@ -87,7 +95,7 @@ Implication for implementation:
 
 ### Key takeaways from the evidence
 
-1. I-JEPA establishes the core JEPA template:
+1. I-JEPA establishes the core JEPA template we are implementing in Layer:
    target encoder, context encoder, predictor, latent regression loss, EMA teacher.
 2. data2vec extends the same idea to language:
    predict latent representations of the full input from a masked view with a self-distillation setup.
@@ -528,7 +536,7 @@ Risk:
 
 Mitigation:
 
-- keep v1 as raw text JEPA only
+- keep v1 as Layer only
 
 ## 2. Silent shape bugs
 

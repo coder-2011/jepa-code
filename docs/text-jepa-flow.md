@@ -1,8 +1,8 @@
-# Text JEPA Flow, Shapes, and Diagrams
+# Layer JEPA Flow, Shapes, and Diagrams
 
 ## Purpose
 
-This document defines the **full raw text JEPA system** we intend to build:
+This document defines the **full raw text JEPA system** we intend to build as Layer:
 
 - masked spans are replaced by `[MASK]` tokens
 - the context encoder processes the masked full-length sequence
@@ -28,7 +28,7 @@ We use three evidence tags throughout:
 
 ## 1. One-Sentence Definition
 
-**Text JEPA** learns a representation by predicting the target encoder's latent states for masked text spans, using a context encoder that sees the same sequence with those spans replaced by `[MASK]`, while gradients flow only through the predictor and context encoder.
+**Layer** learns a representation by predicting the target encoder's latent states for masked text spans, using a context encoder that sees the same sequence with those spans replaced by `[MASK]`, while gradients flow only through the predictor and context encoder.
 
 ## 2. Notation
 
@@ -241,7 +241,7 @@ Shape does not change:
 This is the crucial text substitution:
 
 - image JEPA: sparse visible context patches
-- text JEPA here: dense full sequence with `[MASK]` placeholders
+- Layer here: dense full sequence with `[MASK]` placeholders
 
 ## 6.4 Embedding layer
 
@@ -703,7 +703,7 @@ This is usually cheaper than a full-length encoder when `T_max << L`.
 
 Because `[MASK]` tokens are retained, the context encoder still runs at full `L`.
 
-So this text JEPA variant is:
+So this Layer variant is:
 
 - simpler to batch than sparse-length I-JEPA
 - but less compute-efficient than sparse visible-token encoding
@@ -833,7 +833,7 @@ Implication:
 
 If we want one exact sentence to implement against, use this:
 
-> A text JEPA model takes a full-length sequence with selected target spans replaced by `[MASK]`, encodes it with a bidirectional context encoder, encodes the unmasked sequence with an EMA-updated stop-gradient target encoder, predicts the target encoder's latent states at the masked positions using query-based cross-attention over context states, and minimizes masked latent MSE over the valid target positions only.
+> Layer takes a full-length sequence with selected target spans replaced by `[MASK]`, encodes it with a bidirectional context encoder, encodes the unmasked sequence with an EMA-updated stop-gradient target encoder, predicts the target encoder's latent states at the masked positions using query-based cross-attention over context states, and minimizes masked latent MSE over the valid target positions only.
 
 ## References
 
