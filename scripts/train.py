@@ -2,7 +2,6 @@ from argparse import ArgumentParser
 import math
 from pathlib import Path
 import os
-import random
 import sys
 
 import torch
@@ -20,6 +19,7 @@ from text_jepa.data import create_fineweb_dataloader
 from text_jepa.models.layer_model import LayerModel
 from text_jepa.tokenization import load_tokenizer_from_yaml
 from text_jepa.train.step import train_step
+from text_jepa.utils.repro import configure_reproducibility, resolve_deterministic, resolve_seed
 
 load_local_env(ROOT)
 
@@ -44,7 +44,10 @@ def parse_args():
     parser.add_argument("--min-language-score", type=float, default=0.98)
     parser.add_argument("--max-docs", type=int)
     parser.add_argument("--predictor-num-layers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--deterministic", dest="deterministic", action="store_true")
+    parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    parser.set_defaults(deterministic=None)
     parser.add_argument("--device", default=default_device())
     parser.add_argument("--wandb-project", default="layer-jepa")
     parser.add_argument("--wandb-name")
@@ -57,6 +60,7 @@ def parse_args():
     parser.add_argument("--val-max-batches", type=int, default=2)
     return parser.parse_args()
 
+
 def choose_wandb_mode(requested_mode):
     if requested_mode is not None:
         return requested_mode
@@ -65,13 +69,6 @@ def choose_wandb_mode(requested_mode):
     # Fall back to offline mode when no API key is present so local runs do not fail on logging setup.
     return "online" if os.getenv("WANDB_API_KEY") else "offline"
 
-
-def seed_everything(seed):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        # Seed all visible CUDA devices for reproducible local experiments.
-        torch.cuda.manual_seed_all(seed)
 
 def build_model(config, tokenizer, predictor_num_layers):
     model_config = config["model"]
@@ -105,6 +102,7 @@ def build_run_config(args, config, dataset_size):
         "max_docs": args.max_docs,
         "predictor_num_layers": args.predictor_num_layers,
         "seed": args.seed,
+        "deterministic": args.deterministic,
         "device": args.device,
         "checkpoint_dir": args.checkpoint_dir,
         "save_every": args.save_every,
@@ -192,10 +190,11 @@ def evaluate(model, dataloader, device, max_batches):
 
 def main():
     args = parse_args()
-    seed_everything(args.seed)
-
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    args.seed = resolve_seed(config, args.seed)
+    args.deterministic = resolve_deterministic(config, args.deterministic)
+    configure_reproducibility(args.seed, deterministic=args.deterministic)
     tokenizer = load_tokenizer_from_yaml(args.config)
     # Dataset filtering happens inside create_fineweb_dataloader so the training loop sees only ready batches.
     dataloader = build_dataloader(args, tokenizer, shuffle=True, seed=args.seed)

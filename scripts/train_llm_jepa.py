@@ -2,7 +2,6 @@ from argparse import ArgumentParser
 import math
 from pathlib import Path
 import os
-import random
 import sys
 
 import torch
@@ -19,6 +18,7 @@ from text_jepa.data import create_llm_jepa_dataloader
 from text_jepa.models.llm_jepa import LLMJEPAModel
 from text_jepa.tokenization import load_tokenizer_from_yaml, load_yaml_config
 from text_jepa.train.llm_jepa_step import train_llm_jepa_step
+from text_jepa.utils.repro import configure_reproducibility, resolve_deterministic, resolve_seed
 
 load_local_env(ROOT)
 
@@ -52,7 +52,10 @@ def parse_args():
     parser.add_argument("--gamma-lm", type=float, default=1.0)
     parser.add_argument("--jepa-metric", default="cosine")
     parser.add_argument("--max-docs", type=int)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--deterministic", dest="deterministic", action="store_true")
+    parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    parser.set_defaults(deterministic=None)
     parser.add_argument("--device", default=default_device())
     parser.add_argument("--wandb-project", default="llm-jepa")
     parser.add_argument("--wandb-name")
@@ -72,13 +75,6 @@ def choose_wandb_mode(requested_mode):
     if os.getenv("WANDB_MODE"):
         return os.environ["WANDB_MODE"]
     return "online" if os.getenv("WANDB_API_KEY") else "offline"
-
-
-def seed_everything(seed):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def move_batch_to_device(batch, device):
@@ -120,6 +116,7 @@ def build_run_config(args, config, dataset_size, max_length):
         "val_every": args.val_every,
         "val_max_batches": args.val_max_batches,
         "seed": args.seed,
+        "deterministic": args.deterministic,
         "device": args.device,
         "max_length": max_length,
         "dataset_size": dataset_size,
@@ -189,9 +186,10 @@ def evaluate(model, dataloader, device, max_batches):
 
 def main():
     args = parse_args()
-    seed_everything(args.seed)
-
     config = load_yaml_config(args.config)
+    args.seed = resolve_seed(config, args.seed)
+    args.deterministic = resolve_deterministic(config, args.deterministic)
+    configure_reproducibility(args.seed, deterministic=args.deterministic)
     tokenizer = load_tokenizer_from_yaml(args.config)
     max_length = args.max_length or config["tokenizer"]["max_length"]
 

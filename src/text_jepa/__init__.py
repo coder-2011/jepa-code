@@ -26,11 +26,13 @@ from .tokenization import get_tokenizer_metadata, load_tokenizer_from_yaml, load
 from .train.step import train_step
 from .train.llm_jepa_step import train_llm_jepa_step
 from .utils.ema import update_ema
+from .utils.repro import configure_reproducibility, resolve_deterministic, resolve_seed
 
 __all__ = [
     "build_target_mask",
     "benchmark_messages",
     "collate_masked_examples",
+    "configure_reproducibility",
     "Encoder",
     "EncoderTower",
     "find_word_spans",
@@ -46,6 +48,8 @@ __all__ = [
     "mask_text_from_yaml",
     "masked_latent_mse",
     "Predictor",
+    "resolve_deterministic",
+    "resolve_seed",
     "score_prediction",
     "sample_word_blocks",
     "create_fineweb_dataloader",

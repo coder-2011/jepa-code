@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 def write_test_config(
     path,
     model_name="Qwen/Qwen3-0.6B",
+    seed=0,
+    deterministic=True,
     max_length=12,
     mask_ratio=0.15,
     max_block_words=2,
@@ -30,6 +32,10 @@ def write_test_config(
                     "model_name": model_name,
                     "max_length": max_length,
                     "mask_token": "[MASK]",
+                },
+                "runtime": {
+                    "seed": seed,
+                    "deterministic": deterministic,
                 },
                 "masking": {
                     "mask_ratio": mask_ratio,

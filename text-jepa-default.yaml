@@ -1,3 +1,7 @@
+runtime:
+  seed: 0
+  deterministic: true
+
 tokenizer:
   model_name: Qwen/Qwen3-0.6B
   max_length: 512
