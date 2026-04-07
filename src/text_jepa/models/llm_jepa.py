@@ -28,8 +28,7 @@ class LLMJEPAModel(nn.Module):
         self.jepa_metric = jepa_metric
         self.ema_momentum = float(ema_momentum)
 
-        for parameter in self.target_backbone.parameters():
-            parameter.requires_grad_(False)
+        self.target_backbone.requires_grad_(False)
         update_ema(self.target_backbone, self.backbone, momentum=0.0)
 
     def _last_token_embeddings(self, hidden_states, attention_mask, indices=None):

@@ -87,14 +87,28 @@ def write_messages_jsonl(path):
                 {"role": "system", "content": "Convert text to regex."},
                 {"role": "user", "content": "match dog then digit"},
                 {"role": "assistant", "content": "dog[0-9]"},
-            ]
+            ],
+            "text": [
+                {"role": "system", "content": "Convert text to regex."},
+                {"role": "user", "content": "match dog then digit"},
+            ],
+            "code": [
+                {"role": "assistant", "content": "dog[0-9]"},
+            ],
         },
         {
             "messages": [
                 {"role": "system", "content": "Convert text to regex."},
                 {"role": "user", "content": "match cat then vowel"},
                 {"role": "assistant", "content": "cat[aeiou]"},
-            ]
+            ],
+            "text": [
+                {"role": "system", "content": "Convert text to regex."},
+                {"role": "user", "content": "match cat then vowel"},
+            ],
+            "code": [
+                {"role": "assistant", "content": "cat[aeiou]"},
+            ],
         },
     ]
     with path.open("w", encoding="utf-8") as handle:
@@ -129,6 +143,112 @@ def test_llm_jepa_dataset_builds_lm_and_view_tensors(tmp_path):
     assert example["source_input_ids"][example["source_last_index"] - 1].item() == predictor_ids[0]
     assert (example["labels"] == -100).any()
     assert (example["labels"] != -100).any()
+
+
+def test_llm_jepa_dataset_requires_explicit_text_and_code_views(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    rows = [
+        {
+            "messages": [
+                {"role": "system", "content": "Convert text to regex."},
+                {"role": "user", "content": "match dog then digit"},
+                {"role": "assistant", "content": "dog[0-9]"},
+            ]
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=FakeChatTokenizer(),
+        max_length=24,
+        predictors=1,
+    )
+
+    try:
+        dataset[0]
+    except ValueError as exc:
+        assert "explicit `text` and `code` views" in str(exc)
+    else:
+        raise AssertionError("Expected the dataset to reject rows without explicit JEPA views")
+
+
+def test_llm_jepa_dataset_rejects_truncated_text_view(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    rows = [
+        {
+            "messages": [
+                {"role": "system", "content": "Convert text to regex."},
+                {"role": "user", "content": "one two three four five six seven eight nine ten eleven twelve"},
+                {"role": "assistant", "content": "dog[0-9]"},
+            ],
+            "text": [
+                {"role": "system", "content": "Convert text to regex."},
+                {"role": "user", "content": "one two three four five six seven eight nine ten eleven twelve"},
+            ],
+            "code": [
+                {"role": "assistant", "content": "dog[0-9]"},
+            ],
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=FakeChatTokenizer(),
+        max_length=8,
+        predictors=2,
+    )
+
+    try:
+        dataset[0]
+    except ValueError as exc:
+        assert "text view length" in str(exc)
+        assert "refusing to truncate" in str(exc)
+    else:
+        raise AssertionError("Expected the dataset to reject truncated text views")
+
+
+def test_llm_jepa_dataset_rejects_truncated_code_view(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    rows = [
+        {
+            "messages": [
+                {"role": "system", "content": "Convert."},
+                {"role": "user", "content": "dog digit"},
+                {"role": "assistant", "content": "one two three four five six seven eight nine ten eleven twelve"},
+            ],
+            "text": [
+                {"role": "system", "content": "Convert."},
+                {"role": "user", "content": "dog digit"},
+            ],
+            "code": [
+                {"role": "assistant", "content": "one two three four five six seven eight nine ten eleven twelve"},
+            ],
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=FakeChatTokenizer(),
+        max_length=8,
+        predictors=1,
+    )
+
+    try:
+        dataset[0]
+    except ValueError as exc:
+        assert "code view length" in str(exc)
+        assert "refusing to truncate" in str(exc)
+    else:
+        raise AssertionError("Expected the dataset to reject truncated code views")
 
 
 def test_llm_jepa_dataset_accepts_encoding_objects_from_chat_template(tmp_path):

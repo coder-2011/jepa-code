@@ -156,8 +156,17 @@ def _render_messages(tokenizer, messages, add_generation_prompt=False):
     return _normalize_token_ids(encoded["input_ids"])
 
 
-def _pad_ids(token_ids, max_length, pad_token_id):
-    token_ids = token_ids[:max_length]
+def _pad_ids(token_ids, max_length, pad_token_id, *, field_name, allow_truncation):
+    token_ids = list(token_ids)
+    original_length = len(token_ids)
+    if original_length > max_length:
+        if not allow_truncation:
+            raise ValueError(
+                f"{field_name} length {original_length} exceeds max_length={max_length}; "
+                "refusing to truncate because it would silently change the JEPA view contract"
+            )
+        token_ids = token_ids[:max_length]
+
     attention_mask = [1] * len(token_ids)
     while len(token_ids) < max_length:
         token_ids.append(pad_token_id)
@@ -181,10 +190,11 @@ def _extract_views(row):
     messages = row["messages"]
     text_messages = row.get("text")
     code_messages = row.get("code")
-    if text_messages is None:
-        text_messages = [message for message in messages if message["role"] == "user"][-1:]
-    if code_messages is None:
-        code_messages = [message for message in messages if message["role"] == "assistant"][-1:]
+    if text_messages is None or code_messages is None:
+        raise ValueError(
+            "paired LLM-JEPA examples must provide explicit `text` and `code` views; "
+            "implicit last-user/last-assistant fallback is not allowed"
+        )
     if not text_messages or not code_messages:
         raise ValueError("paired LLM-JEPA examples require user/text and assistant/code views")
     return messages, text_messages, code_messages
@@ -222,7 +232,7 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
         messages, text_messages, code_messages = _extract_views(self.rows[index])
         source_messages = json.loads(json.dumps(text_messages))
         if self.predictor_token_strings:
-            source_messages[0]["content"] += "".join(self.predictor_token_strings)
+            source_messages[-1]["content"] += "".join(self.predictor_token_strings)
 
         full_token_ids = _render_messages(self.tokenizer, messages, add_generation_prompt=False)
         prompt_token_ids = _render_messages(self.tokenizer, messages[:-1], add_generation_prompt=True)
@@ -233,6 +243,8 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
             full_token_ids,
             self.max_length,
             self.tokenizer.pad_token_id,
+            field_name="messages",
+            allow_truncation=True,
         )
         labels = input_ids.clone()
         labels[: min(len(prompt_token_ids), self.max_length)] = -100
@@ -242,11 +254,15 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
             source_token_ids,
             self.max_length,
             self.tokenizer.pad_token_id,
+            field_name="text view",
+            allow_truncation=False,
         )
         target_input_ids, target_attention_mask = _pad_ids(
             target_token_ids,
             self.max_length,
             self.tokenizer.pad_token_id,
+            field_name="code view",
+            allow_truncation=False,
         )
 
         return {
