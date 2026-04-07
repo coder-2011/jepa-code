@@ -16,7 +16,7 @@ Input:
 Output:
 
 - contextualized latent for every token position
-- shape: `(B, L, D)`
+- shape: $(B, L, D)$
 
 Job:
 
@@ -28,7 +28,7 @@ In practice, this should just be a standard encoder-only Transformer:
 
 - token embeddings
 - positional embeddings
-- `N` Transformer encoder blocks
+- $N$ Transformer encoder blocks
 - final hidden states
 
 So the context encoder is the "student" network.
@@ -46,7 +46,7 @@ Input:
 Output:
 
 - target latent for every token position
-- shape: `(B, L, D)`
+- shape: $(B, L, D)$
 
 Job:
 
@@ -74,14 +74,14 @@ This is the module that turns context-side representations into predictions for 
 
 Input:
 
-- context encoder output `Sx` with shape `(B, L, D)`
-- target position indices `p_tgt` with shape `(B, T_max)`
+- context encoder output $S_x$ with shape $(B, L, D)$
+- target position indices $p_{\mathrm{tgt}}$ with shape $(B, T_{\max})$
 - optional target-position embeddings or learned query tokens
 
 Output:
 
 - predicted latent states only for the target positions
-- shape: `(B, T_max, D)`
+- shape: $(B, T_{\max}, D)$
 
 Job:
 
@@ -97,9 +97,9 @@ Best first design:
 - add target positional embeddings to create target queries
 - run a small Transformer-style predictor:
   - self-attention over target queries
-  - cross-attention from target queries into full context states `Sx`
+  - cross-attention from target queries into full context states $S_x$
   - FFN
-- output one `D`-dimensional latent per target token
+- output one $D$-dimensional latent per target token
 
 So:
 
@@ -109,19 +109,19 @@ So:
 ## How They Fit Together
 
 1. Context encoder sees masked sequence:
-   - outputs `Sx: (B, L, D)`
+   - outputs $S_x$ with shape $(B, L, D)$
 
 2. Target encoder sees full sequence:
-   - outputs `Sy: (B, L, D)`
+   - outputs $S_y$ with shape $(B, L, D)$
 
 3. Gather teacher targets at masked positions:
-   - `Sy_tgt: (B, T_max, D)`
+   - $S_{y,\mathrm{tgt}}$ with shape $(B, T_{\max}, D)$
 
-4. Predictor uses `Sx + target positions`:
-   - outputs `Shat_y_tgt: (B, T_max, D)`
+4. Predictor uses $S_x$ with target positions:
+   - outputs $\hat{S}_{y,\mathrm{tgt}}$ with shape $(B, T_{\max}, D)$
 
 5. Loss compares:
-   - `Shat_y_tgt` vs `stopgrad(Sy_tgt)`
+   - $\hat{S}_{y,\mathrm{tgt}}$ vs $\operatorname{stopgrad}(S_{y,\mathrm{tgt}})$
 
 ## Simple Mental Model
 
@@ -140,7 +140,7 @@ So:
 
 ## Notes
 
-- `B` is batch size
-- `L` is sequence length
-- `D` is hidden size
-- `T_max` is the padded maximum number of target positions in the batch
+- $B$ is batch size
+- $L$ is sequence length
+- $D$ is hidden size
+- $T_{\max}$ is the padded maximum number of target positions in the batch

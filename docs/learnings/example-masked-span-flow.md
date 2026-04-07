@@ -17,7 +17,7 @@ Input:
 
 Output:
 
-- `Sx` - representations of the full sequence
+- $S_x$ - representations of the full sequence
 - with `[MASK]` tokens at hidden positions
 
 ## Target encoder
@@ -31,21 +31,23 @@ Input:
 
 Output:
 
-- `Sy` - representations including "fox" and "jumps"
+- $S_y$ - representations including "fox" and "jumps"
 
 ## Predictor
 
 Input:
 
-- `Sx`
-- positional hints for positions 3 and 4
+- $S_x$
+- positional hints for positions $3$ and $4$
 
 Output:
 
-- `Shat_y` - predicted representations for positions 3 and 4
+- $\hat{S}_y$ - predicted representations for positions $3$ and $4$
 
 ## Loss
 
-`distance(Shat_y, Sy at positions 3 and 4)`
+$$
+\operatorname{distance}\!\left(\hat{S}_y, S_y\big|_{\{3,4\}}\right)
+$$
 
 = how wrong was the prediction of "fox jumps" representations
