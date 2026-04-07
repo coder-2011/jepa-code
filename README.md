@@ -102,6 +102,7 @@ For the smallest local LLM-JEPA sanity run:
 ```bash
 source .venv/bin/activate
 python scripts/train_llm_jepa.py \
+  --model-name hf-internal-testing/tiny-random-gpt2 \
   --steps 1 \
   --batch-size 1 \
   --max-length 128 \
@@ -113,7 +114,8 @@ python scripts/train_llm_jepa.py \
 ## Notes on Local Runs
 
 - On Apple Silicon, the trainers should prefer `mps` over `cpu`.
-- The default LLM-JEPA local recipe is intentionally small because full Qwen-based training is expensive on a laptop.
+- The default LLM-JEPA smoke recipe uses `hf-internal-testing/tiny-random-gpt2` because `sshleifer/tiny-gpt2` has hidden size `2`, which makes cosine JEPA degenerate.
+- Keep `Qwen/Qwen3-0.6B` as the intended real backbone for non-smoke runs unless you explicitly override it.
 - W&B defaults to offline mode unless online auth is available.
 
 ## Documentation

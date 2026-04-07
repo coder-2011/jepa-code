@@ -177,13 +177,46 @@ def _pad_ids(token_ids, max_length, pad_token_id, *, field_name, allow_truncatio
     )
 
 
-def _last_content_index(token_ids, eos_token_id, max_length):
-    if not token_ids:
-        return 0
-    index = min(len(token_ids), max_length) - 1
-    if token_ids[index] == eos_token_id and index > 0:
-        index -= 1
-    return index
+def _token_id(tokenizer, token):
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None:
+            return token_id
+    vocab = getattr(tokenizer, "vocab", None)
+    if isinstance(vocab, dict) and token in vocab:
+        return vocab[token]
+    return None
+
+
+def _content_readout_index(tokenizer, token_ids, max_length, preferred_tokens=None):
+    visible_length = min(len(token_ids), max_length)
+    if visible_length <= 0:
+        raise ValueError("JEPA views must include at least one visible token")
+
+    if preferred_tokens:
+        preferred_token_ids = {
+            token_id
+            for token_id in (_token_id(tokenizer, token) for token in preferred_tokens)
+            if token_id is not None
+        }
+        for index in range(visible_length - 1, -1, -1):
+            if token_ids[index] in preferred_token_ids:
+                return index
+        raise ValueError("Could not find the configured predictor token inside the visible JEPA source view")
+
+    special_token_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    for index in range(visible_length - 1, -1, -1):
+        token_id = token_ids[index]
+        if token_id in special_token_ids:
+            continue
+        token_text = None
+        if hasattr(tokenizer, "decode"):
+            token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+        if token_text is not None and not token_text.strip():
+            continue
+        return index
+
+    raise ValueError("Could not find a non-special, non-whitespace readout token in the JEPA view")
 
 
 def _extract_views(row):
@@ -282,13 +315,22 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
             "source_input_ids": source_input_ids,
             "source_attention_mask": source_attention_mask,
             "source_last_index": torch.tensor(
-                _last_content_index(source_token_ids, self.tokenizer.eos_token_id, self.max_length),
+                _content_readout_index(
+                    self.tokenizer,
+                    source_token_ids,
+                    self.max_length,
+                    preferred_tokens=self.predictor_token_strings,
+                ),
                 dtype=torch.long,
             ),
             "target_input_ids": target_input_ids,
             "target_attention_mask": target_attention_mask,
             "target_last_index": torch.tensor(
-                _last_content_index(target_token_ids, self.tokenizer.eos_token_id, self.max_length),
+                _content_readout_index(
+                    self.tokenizer,
+                    target_token_ids,
+                    self.max_length,
+                ),
                 dtype=torch.long,
             ),
         }

@@ -1,6 +1,9 @@
 import json
+import warnings
+from types import SimpleNamespace
 
 import torch
+from torch import nn
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from text_jepa.data import LLMJEPAPairedJsonlDataset, create_llm_jepa_dataloader
@@ -78,6 +81,28 @@ class FakeBatchEncodingTokenizer(FakeChatTokenizer):
         if not tokenize:
             return token_ids
         return {"input_ids": token_ids}
+
+
+class DummyBaseModel(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.embedding = nn.Embedding(32, hidden_size)
+
+    def forward(self, input_ids, attention_mask, **kwargs):
+        assert "output_hidden_states" not in kwargs
+        return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+
+class DummyBackbone(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.base_model = DummyBaseModel(hidden_size=hidden_size)
+        self.config = SimpleNamespace(hidden_size=hidden_size)
+
+    def forward(self, input_ids, attention_mask, labels=None, use_cache=False):
+        hidden_states = self.base_model(input_ids, attention_mask, use_cache=use_cache).last_hidden_state
+        loss = hidden_states.sum() * 0.0
+        return SimpleNamespace(loss=loss)
 
 
 def write_messages_jsonl(path):
@@ -356,6 +381,26 @@ def test_llm_jepa_model_combines_lm_and_jepa_losses(tmp_path):
     assert not outputs["target_embeddings"].requires_grad
 
 
+def test_llm_jepa_model_reads_final_hidden_state_without_hidden_state_stack(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    write_messages_jsonl(data_path)
+    tokenizer = FakeChatTokenizer()
+    dataloader = create_llm_jepa_dataloader(
+        jsonl_path=data_path,
+        tokenizer=tokenizer,
+        max_length=24,
+        batch_size=2,
+        predictors=1,
+    )
+    batch = next(iter(dataloader))
+
+    model = LLMJEPAModel(DummyBackbone(hidden_size=8), ema_momentum=0.5)
+    outputs = model(**batch)
+
+    assert outputs["source_embeddings"].shape == (2, 8)
+    assert outputs["target_embeddings"].shape == (2, 8)
+
+
 def test_llm_jepa_target_backbone_is_gradient_free(tmp_path):
     data_path = tmp_path / "paired.jsonl"
     write_messages_jsonl(data_path)
@@ -434,3 +479,24 @@ def test_train_llm_jepa_step_updates_parameters(tmp_path):
         not torch.equal(previous, current)
         for previous, current in zip(target_before, model.target_backbone.parameters())
     )
+
+
+def test_llm_jepa_warns_when_cosine_metric_is_used_with_2d_hidden_states():
+    backbone = GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=32,
+            n_positions=16,
+            n_ctx=16,
+            n_embd=2,
+            n_layer=1,
+            n_head=1,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        LLMJEPAModel(backbone, jepa_metric="cosine")
+
+    assert any("geometrically degenerate" in str(warning.message) for warning in caught)

@@ -1,4 +1,5 @@
 from copy import deepcopy
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -28,8 +29,32 @@ class LLMJEPAModel(nn.Module):
         self.jepa_metric = jepa_metric
         self.ema_momentum = float(ema_momentum)
 
+        hidden_size = getattr(backbone.config, "hidden_size", None) or getattr(backbone.config, "n_embd", None)
+        if self.jepa_metric == "cosine" and hidden_size is not None and hidden_size <= 2:
+            warnings.warn(
+                "Cosine JEPA with hidden_size<=2 is geometrically degenerate: final hidden states can collapse "
+                "to a single line after normalization, making cosine similarities saturate at +/-1.",
+                stacklevel=2,
+            )
+
         self.target_backbone.requires_grad_(False)
         update_ema(self.target_backbone, self.backbone, momentum=0.0)
+
+    def _final_hidden_state(self, backbone, input_ids, attention_mask):
+        base_model = getattr(backbone, "base_model", None)
+        if base_model is None:
+            raise ValueError("LLMJEPAModel requires a causal LM backbone with a `base_model` module")
+
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if last_hidden_state is None:
+            raise ValueError("backbone.base_model(...) must return `last_hidden_state`")
+        return last_hidden_state
 
     def _last_token_embeddings(self, hidden_states, attention_mask, indices=None):
         if indices is None:
@@ -62,27 +87,25 @@ class LLMJEPAModel(nn.Module):
             labels=labels,
             use_cache=False,
         )
-        source_outputs = self.backbone(
-            input_ids=source_input_ids,
-            attention_mask=source_attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
+        source_hidden_states = self._final_hidden_state(
+            self.backbone,
+            source_input_ids,
+            source_attention_mask,
         )
         with torch.no_grad():
-            target_outputs = self.target_backbone(
-                input_ids=target_input_ids,
-                attention_mask=target_attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
+            target_hidden_states = self._final_hidden_state(
+                self.target_backbone,
+                target_input_ids,
+                target_attention_mask,
             )
 
         source_embeddings = self._last_token_embeddings(
-            source_outputs.hidden_states[-1],
+            source_hidden_states,
             source_attention_mask,
             source_last_index,
         )
         target_embeddings = self._last_token_embeddings(
-            target_outputs.hidden_states[-1],
+            target_hidden_states,
             target_attention_mask,
             target_last_index,
         )
