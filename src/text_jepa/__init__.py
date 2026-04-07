@@ -11,6 +11,7 @@ from .masking import (
     sample_word_blocks,
 )
 from .models.encoder import Encoder
+from .models.layer_model import LayerModel
 from .models.predictor import Predictor
 from .models.tower import EncoderTower
 from .tokenization import get_tokenizer_metadata, load_tokenizer_from_yaml, load_yaml_config
@@ -27,6 +28,7 @@ __all__ = [
     "get_tokenizer_metadata",
     "load_tokenizer_from_yaml",
     "load_yaml_config",
+    "LayerModel",
     "map_words_to_tokens",
     "mask_text",
     "mask_text_from_yaml",
