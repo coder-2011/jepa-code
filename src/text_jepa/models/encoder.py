@@ -29,12 +29,16 @@ class Encoder(nn.Module):
         )
         layer.norm1 = nn.RMSNorm(hidden_dim)
         layer.norm2 = nn.RMSNorm(hidden_dim)
+        # TransformerEncoderLayer fast-path logic expects normalization modules to expose `.bias`.
+        layer.norm1.bias = None
+        layer.norm2.bias = None
         self.encoder = nn.TransformerEncoder(
             layer,
             num_layers=num_layers,
             enable_nested_tensor=False,
         )
         self.final_norm = nn.RMSNorm(hidden_dim)
+        self.final_norm.bias = None
 
     def forward(self, x, attention_mask=None):
         if x.ndim != 3:
