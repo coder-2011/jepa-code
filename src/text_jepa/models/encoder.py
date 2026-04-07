@@ -1,5 +1,7 @@
 from torch import nn
 
+from ._norms import make_rms_norm
+
 
 class Encoder(nn.Module):
     def __init__(self, num_layers, hidden_dim, num_heads, ffn_dim, dropout=0.0):
@@ -27,18 +29,14 @@ class Encoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        layer.norm1 = nn.RMSNorm(hidden_dim)
-        layer.norm2 = nn.RMSNorm(hidden_dim)
-        # TransformerEncoderLayer fast-path logic expects normalization modules to expose `.bias`.
-        layer.norm1.bias = None
-        layer.norm2.bias = None
+        layer.norm1 = make_rms_norm(hidden_dim)
+        layer.norm2 = make_rms_norm(hidden_dim)
         self.encoder = nn.TransformerEncoder(
             layer,
             num_layers=num_layers,
             enable_nested_tensor=False,
         )
-        self.final_norm = nn.RMSNorm(hidden_dim)
-        self.final_norm.bias = None
+        self.final_norm = make_rms_norm(hidden_dim)
 
     def forward(self, x, attention_mask=None):
         if x.ndim != 3:

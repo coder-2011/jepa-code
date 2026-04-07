@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from ._norms import make_rms_norm
+
 
 class Predictor(nn.Module):
     def __init__(
@@ -43,18 +45,14 @@ class Predictor(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        layer.norm1 = nn.RMSNorm(hidden_dim)
-        layer.norm2 = nn.RMSNorm(hidden_dim)
-        layer.norm3 = nn.RMSNorm(hidden_dim)
-        layer.norm1.bias = None
-        layer.norm2.bias = None
-        layer.norm3.bias = None
+        layer.norm1 = make_rms_norm(hidden_dim)
+        layer.norm2 = make_rms_norm(hidden_dim)
+        layer.norm3 = make_rms_norm(hidden_dim)
         self.decoder = nn.TransformerDecoder(
             layer,
             num_layers=num_layers,
         )
-        self.final_norm = nn.RMSNorm(hidden_dim)
-        self.final_norm.bias = None
+        self.final_norm = make_rms_norm(hidden_dim)
 
     def forward(self, context_states, attention_mask, target_positions, target_valid_mask):
         if context_states.ndim != 3:
