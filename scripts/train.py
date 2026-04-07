@@ -46,13 +46,6 @@ def parse_args():
     parser.add_argument("--val-max-batches", type=int, default=2)
     return parser.parse_args()
 
-
-def load_config(config_path):
-    # The script needs the full nested config because it builds both tokenizer and model objects.
-    with Path(config_path).open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
-
-
 def choose_wandb_mode(requested_mode):
     if requested_mode is not None:
         return requested_mode
@@ -68,12 +61,6 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         # Seed all visible CUDA devices for reproducible local experiments.
         torch.cuda.manual_seed_all(seed)
-
-
-def move_batch_to_device(batch, device):
-    # The batch contract is tensor-only today, so a simple dict comprehension is enough.
-    return {name: tensor.to(device) for name, tensor in batch.items()}
-
 
 def build_model(config, tokenizer, predictor_num_layers):
     model_config = config["model"]
@@ -125,6 +112,20 @@ def build_run_config(args, config, dataset_size):
     }
 
 
+def build_dataloader(args, tokenizer, shuffle, seed):
+    return create_fineweb_dataloader(
+        jsonl_path=args.data_path,
+        tokenizer=tokenizer,
+        config_path=args.config,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        seed=seed,
+        min_token_count=args.min_token_count,
+        min_language_score=args.min_language_score,
+        max_docs=args.max_docs,
+    )
+
+
 def checkpoint_state(step, model, optimizer, run_config):
     return {
         "step": step,
@@ -154,62 +155,40 @@ def load_checkpoint(path, model, optimizer, device):
 
 
 def resolve_resume_path(resume_from, checkpoint_dir, auto_resume):
-    if resume_from is not None:
-        return Path(resume_from)
-    if not auto_resume:
-        return None
     latest_path = Path(checkpoint_dir) / "latest.pt"
-    if latest_path.exists():
-        return latest_path
-    return None
+    return Path(resume_from) if resume_from else latest_path if auto_resume and latest_path.exists() else None
 
 
 def evaluate(model, dataloader, device, max_batches):
+    was_training = model.training
     model.eval()
-    losses = []
+    total_loss = 0.0
+    num_batches = 0
     with torch.no_grad():
-        for batch_index, batch in enumerate(dataloader):
-            if batch_index >= max_batches:
+        for batch in dataloader:
+            if num_batches >= max_batches:
                 break
-            batch = move_batch_to_device(batch, device)
-            losses.append(model(**batch)["loss"].item())
-    model.train()
-    if not losses:
+            batch = {name: tensor.to(device) for name, tensor in batch.items()}
+            total_loss += model(**batch)["loss"].item()
+            num_batches += 1
+    model.train(was_training)
+    if num_batches == 0:
         raise ValueError("validation dataloader produced no batches")
-    return sum(losses) / len(losses)
+    return total_loss / num_batches
 
 
 def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    config = load_config(args.config)
+    with Path(args.config).open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
     tokenizer = load_tokenizer_from_yaml(args.config)
     # Dataset filtering happens inside create_fineweb_dataloader so the training loop sees only ready batches.
-    dataloader = create_fineweb_dataloader(
-        jsonl_path=args.data_path,
-        tokenizer=tokenizer,
-        config_path=args.config,
-        batch_size=args.batch_size,
-        shuffle=True,
-        seed=args.seed,
-        min_token_count=args.min_token_count,
-        min_language_score=args.min_language_score,
-        max_docs=args.max_docs,
-    )
+    dataloader = build_dataloader(args, tokenizer, shuffle=True, seed=args.seed)
     val_dataloader = None
     if args.val_every > 0:
-        val_dataloader = create_fineweb_dataloader(
-            jsonl_path=args.data_path,
-            tokenizer=tokenizer,
-            config_path=args.config,
-            batch_size=args.batch_size,
-            shuffle=False,
-            seed=args.seed + 10_000,
-            min_token_count=args.min_token_count,
-            min_language_score=args.min_language_score,
-            max_docs=args.max_docs,
-        )
+        val_dataloader = build_dataloader(args, tokenizer, shuffle=False, seed=args.seed + 10_000)
     dataset_size = len(dataloader.dataset)
     if dataset_size == 0:
         raise ValueError("No documents matched the current FineWeb dataloader filters")
@@ -238,7 +217,7 @@ def main():
             while step < args.steps:
                 for batch in dataloader:
                     # Device transfer happens batch-by-batch so CPU dataloading stays simple.
-                    batch = move_batch_to_device(batch, args.device)
+                    batch = {name: tensor.to(args.device) for name, tensor in batch.items()}
                     outputs = train_step(model, optimizer, batch)
                     loss_value = outputs["loss"].item()
                     if not math.isfinite(loss_value):
