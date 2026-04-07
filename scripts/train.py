@@ -21,6 +21,14 @@ from text_jepa.tokenization import load_tokenizer_from_yaml
 from text_jepa.train.step import train_step
 
 
+def default_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def parse_args():
     parser = ArgumentParser()
     # Defaults are intentionally small so the script can double as a local smoke-training entrypoint.
@@ -34,7 +42,7 @@ def parse_args():
     parser.add_argument("--max-docs", type=int)
     parser.add_argument("--predictor-num-layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=default_device())
     parser.add_argument("--wandb-project", default="layer-jepa")
     parser.add_argument("--wandb-name")
     parser.add_argument("--wandb-mode", default=None)
