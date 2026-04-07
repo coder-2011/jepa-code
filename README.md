@@ -2,14 +2,7 @@
 
 This repository is for studying and building JEPA-style architectures in a cleaner local workspace.
 
-It currently contains three tracks:
-
-- `jepa/`
-  Reference-only legacy JEPA package. Do not edit.
-- `lejepa/`
-  Reference-only LeJEPA implementation. Do not edit.
-- `src/text_jepa/`
-  Active implementation area for new JEPA experiments in this repo.
+Active implementation work lives under `src/text_jepa/`, with training scripts in `scripts/` and tests in `tests/`.
 
 ## Current Focus
 
@@ -46,8 +39,6 @@ justfile               Common developer commands
 
 ## Important Boundaries
 
-- Do not modify `jepa/`
-- Do not modify `lejepa/`
 - Durable project notes live in `.codex/learning.md`
 
 ## Environment
