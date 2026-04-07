@@ -114,6 +114,20 @@ def ensure_predictor_tokens(tokenizer, predictors):
     return tokens
 
 
+def _normalize_token_ids(token_ids):
+    if isinstance(token_ids, torch.Tensor):
+        return token_ids.tolist()
+    if hasattr(token_ids, "ids"):
+        return list(token_ids.ids)
+    if isinstance(token_ids, dict):
+        return _normalize_token_ids(token_ids["input_ids"])
+    if isinstance(token_ids, list):
+        if token_ids and hasattr(token_ids[0], "ids"):
+            return list(token_ids[0].ids)
+        return token_ids
+    return token_ids
+
+
 def _render_messages(tokenizer, messages, add_generation_prompt=False):
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
         token_ids = tokenizer.apply_chat_template(
@@ -121,9 +135,7 @@ def _render_messages(tokenizer, messages, add_generation_prompt=False):
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
         )
-        if isinstance(token_ids, torch.Tensor):
-            return token_ids.tolist()
-        return token_ids
+        return _normalize_token_ids(token_ids)
 
     text = []
     for message in messages:
@@ -139,7 +151,7 @@ def _render_messages(tokenizer, messages, add_generation_prompt=False):
         padding=False,
         return_attention_mask=False,
     )
-    return encoded["input_ids"]
+    return _normalize_token_ids(encoded["input_ids"])
 
 
 def _pad_ids(token_ids, max_length, pad_token_id):

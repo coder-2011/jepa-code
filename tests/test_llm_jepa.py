@@ -51,6 +51,35 @@ class FakeChatTokenizer:
         return len(self.vocab)
 
 
+class FakeEncoding:
+    def __init__(self, ids):
+        self.ids = ids
+
+
+class FakeEncodingTokenizer(FakeChatTokenizer):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        token_ids = super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+        if not tokenize:
+            return token_ids
+        return FakeEncoding(token_ids)
+
+
+class FakeBatchEncodingTokenizer(FakeChatTokenizer):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        token_ids = super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+        if not tokenize:
+            return token_ids
+        return {"input_ids": token_ids}
+
+
 def write_messages_jsonl(path):
     rows = [
         {
@@ -100,6 +129,44 @@ def test_llm_jepa_dataset_builds_lm_and_view_tensors(tmp_path):
     assert example["source_input_ids"][example["source_last_index"] - 1].item() == predictor_ids[0]
     assert (example["labels"] == -100).any()
     assert (example["labels"] != -100).any()
+
+
+def test_llm_jepa_dataset_accepts_encoding_objects_from_chat_template(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    write_messages_jsonl(data_path)
+    tokenizer = FakeEncodingTokenizer()
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=tokenizer,
+        max_length=24,
+        predictors=1,
+    )
+
+    example = dataset[0]
+
+    assert example["input_ids"].shape == (24,)
+    assert example["source_input_ids"].shape == (24,)
+    assert example["target_input_ids"].shape == (24,)
+
+
+def test_llm_jepa_dataset_accepts_batch_encoding_like_chat_template(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    write_messages_jsonl(data_path)
+    tokenizer = FakeBatchEncodingTokenizer()
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=tokenizer,
+        max_length=24,
+        predictors=1,
+    )
+
+    example = dataset[0]
+
+    assert example["input_ids"].shape == (24,)
+    assert example["source_input_ids"].shape == (24,)
+    assert example["target_input_ids"].shape == (24,)
 
 
 def test_llm_jepa_model_combines_lm_and_jepa_losses(tmp_path):
