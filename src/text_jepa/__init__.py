@@ -1,5 +1,6 @@
 # Keep the package surface intentionally small, but expose the main utility helpers.
 from .batching import collate_masked_examples
+from .losses.latent_loss import gather_target_states, masked_latent_mse
 from .masking import (
     build_target_mask,
     find_word_spans,
@@ -21,6 +22,7 @@ __all__ = [
     "Encoder",
     "EncoderTower",
     "find_word_spans",
+    "gather_target_states",
     "get_masking_settings",
     "get_tokenizer_metadata",
     "load_tokenizer_from_yaml",
@@ -28,6 +30,7 @@ __all__ = [
     "map_words_to_tokens",
     "mask_text",
     "mask_text_from_yaml",
+    "masked_latent_mse",
     "Predictor",
     "sample_word_blocks",
     "update_ema",
