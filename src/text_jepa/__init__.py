@@ -15,6 +15,7 @@ from .models.layer_model import LayerModel
 from .models.predictor import Predictor
 from .models.tower import EncoderTower
 from .tokenization import get_tokenizer_metadata, load_tokenizer_from_yaml, load_yaml_config
+from .train.step import train_step
 from .utils.ema import update_ema
 
 __all__ = [
@@ -35,5 +36,6 @@ __all__ = [
     "masked_latent_mse",
     "Predictor",
     "sample_word_blocks",
+    "train_step",
     "update_ema",
 ]
