@@ -5,6 +5,7 @@ lejepa/
 .env.*
 tmp/
 wandb/
+checkpoints/
 llm-jepa/
 __pycache__/
 *.pyc
