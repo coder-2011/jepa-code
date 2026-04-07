@@ -69,6 +69,7 @@ Use this workspace to study, compare, and improve JEPA-style architectures. The 
 - Keep the top-level `justfile` current:
   - add a recipe for each new test file
   - add a recipe for new repetitive developer tasks that are likely to be run more than once
+- For tiny experiments, keep W&B offline rather than running online.
 - Useful commands:
   - `cd jepa && python -m unittest tests.test_model.TestJEPA`
   - `cd jepa && black . && isort . && flake8 && mypy jepa`
