@@ -40,6 +40,29 @@ We are **not** building these first:
 - decoder-only causal attention as the default baseline
 - broad framework abstractions before the core contracts are stable
 
+## Initial Training Scale
+
+The initial practical training target is not a tiny toy model and not a frontier-scale model.
+
+We will start by trying to train a model in the low hundreds of millions of parameters.
+
+Current working assumption:
+
+- first serious model size: roughly a couple hundred million parameters
+- first distributed training target: 2 to 3 GPUs
+
+Why this scale:
+
+- large enough to make architecture and optimization behavior meaningful
+- small enough to iterate without turning every experiment into infrastructure work
+- appropriate for validating masking, predictor design, EMA behavior, and latent loss contracts before attempting larger runs
+
+Implication for implementation:
+
+- the code should support multi-GPU training from the beginning
+- activation memory, padding strategy, and batch construction need to be designed with distributed training in mind
+- checkpointing and logging should assume long-running experiments, not only notebook-scale smoke tests
+
 ## Evidence Base
 
 ### Primary sources
@@ -406,14 +429,16 @@ These are proposed defaults, not canonical paper constants.
 - tokenizer: BPE or WordPiece tokenizer with explicit `[MASK]`
 - architecture: encoder-only Transformer
 - sequence length `L`: 256 or 512 for early experiments
-- hidden size `D`: 512 or 768
+- hidden size `D`: start in the 768 to 1024 range for the first serious run
 - heads `H`: `D / 64`
-- encoder depth: 6 to 12 layers for the first working version
+- encoder depth: start around 12 to 18 layers for the first serious run
 - predictor depth: 2 to 4 blocks
 - target span count per sample: 1 to 4
 - total masked ratio: start around 15 to 30 percent
 - loss: masked MSE over target positions
 - EMA coefficient `tau`: start near `0.99` to `0.999`
+
+For the first end-to-end training campaign, prefer a configuration that lands in the low hundreds of millions of parameters rather than an extremely small prototype.
 
 ## Main Open Decisions
 
