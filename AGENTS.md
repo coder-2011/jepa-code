@@ -25,6 +25,12 @@ Use this workspace to study, compare, and improve JEPA-style architectures. The 
   - `lejepa/eval/`: eval assets and outputs
 - `JEPA.pdf`, `LeJEPA.pdf`: architecture references; do not commit derived artifacts unless explicitly needed.
 
+## Edit Boundaries
+- Never edit, refactor, delete, or otherwise modify files inside `jepa/`.
+- Never edit, refactor, delete, or otherwise modify files inside `lejepa/`.
+- Those folders are reference material only in this workspace.
+- New implementation work should live outside those folders unless the user explicitly overrides this rule.
+
 ## Reasoning and Explanations
 - Prioritize clarity and truthfulness.
 - Separate canonical JEPA ideas from what a given repo happens to implement.
