@@ -3,5 +3,6 @@ lejepa/
 .tmp_pdfenv/
 .venv/
 .env.*
+tmp/
 __pycache__/
 *.pyc
