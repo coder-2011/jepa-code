@@ -40,27 +40,33 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
     word_to_tokens = []
 
     for word_index, (word_start, word_end) in enumerate(word_spans):
-        token_indices = []
+        token_start = None
+        token_end = None
 
-        for token_index, ((token_start, token_end), attn, is_special) in enumerate(
+        for token_index, ((char_start, char_end), attn, is_special) in enumerate(
             zip(offset_mapping, attention_mask, special_tokens_mask)
         ):
             # Skip padding, special tokens, and zero-width offsets before overlap checks.
-            if attn == 0 or is_special == 1 or token_start == token_end:
+            if attn == 0 or is_special == 1 or char_start == char_end:
                 continue
 
-            overlaps = not (token_end <= word_start or token_start >= word_end)
-            if overlaps:
-                token_indices.append(token_index)
+            if char_end <= word_start:
+                continue
+            if char_start >= word_end:
+                break
 
-        if token_indices:
+            if token_start is None:
+                token_start = token_index
+            token_end = token_index + 1
+
+        if token_start is not None:
             word_to_tokens.append(
                 {
                     "word_index": word_index,
                     "char_span": (word_start, word_end),
                     # Store token spans half-open so they can be sliced directly.
-                    "token_start": min(token_indices),
-                    "token_end": max(token_indices) + 1,
+                    "token_start": token_start,
+                    "token_end": token_end,
                 }
             )
 
