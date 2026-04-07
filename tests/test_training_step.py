@@ -39,6 +39,7 @@ def test_train_step_returns_loss_and_updates_target_tower():
     target_before = [parameter.detach().clone() for parameter in model.target_tower.parameters()]
     outputs = train_step(model, optimizer, batch)
 
+    # A single step should both produce a scalar loss and advance the EMA teacher weights.
     assert outputs["loss"].ndim == 0
     assert any(
         not torch.equal(before, after)

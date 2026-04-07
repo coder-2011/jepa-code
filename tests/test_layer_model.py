@@ -33,6 +33,7 @@ def test_layer_model_forward_returns_expected_shapes():
     model = make_layer_model()
     outputs = model(**make_inputs())
 
+    # The model returns both dense tower states and gathered target-side supervision tensors.
     assert outputs["context_states"].shape == (2, 4, 8)
     assert outputs["target_states"].shape == (2, 4, 8)
     assert outputs["predicted_target_states"].shape == (2, 2, 8)
@@ -45,6 +46,7 @@ def test_layer_model_forward_returns_expected_keys():
     model = make_layer_model()
     outputs = model(**make_inputs())
 
+    # Keep the public forward payload stable because training and debugging code both consume it.
     assert set(outputs) == {
         "context_states",
         "target_states",
@@ -61,6 +63,7 @@ def test_layer_model_blocks_gradients_to_target_tower():
 
     outputs["loss"].backward()
 
+    # Only the student path should receive gradients; the teacher stays stop-gradient.
     assert any(parameter.grad is not None for parameter in model.context_tower.parameters())
     assert any(parameter.grad is not None for parameter in model.predictor.parameters())
     assert all(parameter.grad is None for parameter in model.target_tower.parameters())
@@ -75,6 +78,7 @@ def test_layer_model_target_tower_can_be_updated_by_ema():
         first_context_parameter.add_(1.0)
         target_before = first_target_parameter.clone()
 
+    # EMA should move the teacher even though it never receives optimizer gradients directly.
     update_ema(model.target_tower, model.context_tower, model.ema_momentum)
 
     assert not torch.equal(first_target_parameter, target_before)

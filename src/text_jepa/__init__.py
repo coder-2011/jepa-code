@@ -1,4 +1,3 @@
-# Keep the package surface intentionally small, but expose the main utility helpers.
 from .batching import collate_masked_examples
 from .data import FineWebJsonlDataset, create_fineweb_dataloader
 from .losses.latent_loss import gather_target_states, masked_latent_mse

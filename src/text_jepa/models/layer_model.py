@@ -25,6 +25,7 @@ class LayerModel(nn.Module):
         super().__init__()
 
         self.ema_momentum = float(ema_momentum)
+        # Student tower sees the masked sequence and receives gradient updates.
         self.context_tower = EncoderTower(
             vocab_size=vocab_size,
             max_length=max_length,
@@ -34,6 +35,7 @@ class LayerModel(nn.Module):
             ffn_dim=encoder_ffn_dim,
             dropout=dropout,
         )
+        # Teacher tower mirrors the student architecture but is updated only through EMA.
         self.target_tower = EncoderTower(
             vocab_size=vocab_size,
             max_length=max_length,
@@ -43,6 +45,7 @@ class LayerModel(nn.Module):
             ffn_dim=encoder_ffn_dim,
             dropout=dropout,
         )
+        # Predictor maps context-side latents at requested positions into teacher-latent targets.
         self.predictor = Predictor(
             hidden_dim=hidden_dim,
             max_length=max_length,
@@ -51,6 +54,7 @@ class LayerModel(nn.Module):
             ffn_dim=predictor_ffn_dim,
             dropout=dropout,
         )
+        # Start with an exact parameter copy so the teacher is valid before the first optimizer step.
         update_ema(self.target_tower, self.context_tower, momentum=0.0)
 
     def forward(
@@ -79,16 +83,20 @@ class LayerModel(nn.Module):
         if input_ids_full.shape[0] != target_positions.shape[0]:
             raise ValueError("batch size must match between sequence inputs and target inputs")
 
+        # Student latents come from the masked view.
         context_states = self.context_tower(input_ids_ctx, attention_mask=attention_mask)
         with torch.no_grad():
+            # Teacher latents stay stop-gradient even though they share architecture with the student.
             target_states = self.target_tower(input_ids_full, attention_mask=attention_mask)
 
+        # Predictor emits one latent per padded target slot.
         predicted_target_states = self.predictor(
             context_states,
             attention_mask,
             target_positions,
             target_valid_mask,
         )
+        # Gather the teacher sequence down to the sparse target positions used for supervision.
         target_target_states = gather_target_states(target_states, target_positions)
         loss = masked_latent_mse(
             predicted_target_states,
@@ -97,6 +105,7 @@ class LayerModel(nn.Module):
         )
 
         return {
+            # Returning both dense and gathered states keeps debugging and loss inspection straightforward.
             "context_states": context_states,
             "target_states": target_states,
             "predicted_target_states": predicted_target_states,
