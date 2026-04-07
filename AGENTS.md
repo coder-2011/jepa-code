@@ -76,7 +76,9 @@ Use this workspace to study, compare, and improve JEPA-style architectures. The 
 - Use 4-space indentation.
 - `snake_case` for functions, modules, and variables; `PascalCase` for classes.
 - Keep modules focused and tensor contracts explicit.
-- Add docstrings or comments when shape assumptions are non-obvious.
+- Add short, information-dense comments only where they clarify something non-obvious.
+- If a line is already obvious, do not comment it.
+- Prefer comments that explain the why or the contract, not the obvious what.
 - Keep edits surgical; avoid broad refactors unless the task explicitly calls for architectural cleanup.
 
 ## Git Safety
