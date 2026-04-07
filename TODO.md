@@ -1,1 +1,2 @@
 - [ ] Add LLM-JEPA-style custom attention masking in a later pass; keep the first pass span-based without that mask logic
+- [ ] Test system if we load embedding weights from some pretrained transformer
