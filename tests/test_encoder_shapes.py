@@ -46,3 +46,26 @@ def test_encoder_rejects_head_dimension_mismatch():
         assert "divisible by num_heads" in str(exc)
     else:
         raise AssertionError("Expected Encoder to reject an incompatible head configuration")
+
+
+def test_encoder_uses_rms_norm():
+    encoder = Encoder(num_layers=2, hidden_dim=8, num_heads=2, ffn_dim=32)
+
+    assert isinstance(encoder.final_norm, torch.nn.RMSNorm)
+    assert isinstance(encoder.encoder.layers[0].norm1, torch.nn.RMSNorm)
+    assert isinstance(encoder.encoder.layers[0].norm2, torch.nn.RMSNorm)
+
+
+def test_encoder_state_dict_load_round_trip():
+    encoder = Encoder(num_layers=2, hidden_dim=8, num_heads=2, ffn_dim=32, dropout=0.0)
+    reloaded = Encoder(num_layers=2, hidden_dim=8, num_heads=2, ffn_dim=32, dropout=0.0)
+    x = torch.randn(2, 5, 8)
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]], dtype=torch.long)
+
+    # A load round-trip should preserve the encoder's exact computation.
+    reloaded.load_state_dict(encoder.state_dict())
+
+    original_output = encoder(x, attention_mask=attention_mask)
+    reloaded_output = reloaded(x, attention_mask=attention_mask)
+
+    assert torch.allclose(original_output, reloaded_output)
