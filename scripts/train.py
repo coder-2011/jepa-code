@@ -15,10 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 # Keep script execution independent from editable installs while the package is still in active development.
 sys.path.insert(0, str(ROOT / "src"))
 
+from text_jepa.env import load_local_env
 from text_jepa.data import create_fineweb_dataloader
 from text_jepa.models.layer_model import LayerModel
 from text_jepa.tokenization import load_tokenizer_from_yaml
 from text_jepa.train.step import train_step
+
+load_local_env(ROOT)
 
 
 def default_device():

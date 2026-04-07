@@ -14,10 +14,13 @@ from wandb import AlertLevel
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from text_jepa.env import load_local_env
 from text_jepa.data import create_llm_jepa_dataloader
 from text_jepa.models.llm_jepa import LLMJEPAModel
 from text_jepa.tokenization import load_tokenizer_from_yaml, load_yaml_config
 from text_jepa.train.llm_jepa_step import train_llm_jepa_step
+
+load_local_env(ROOT)
 
 
 def default_device():

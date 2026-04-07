@@ -9,8 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # Mirror the main training script's import behavior so the smoke check can run from the repo root.
 sys.path.insert(0, str(ROOT / "src"))
 
+from text_jepa.env import load_local_env
 from text_jepa.models.layer_model import LayerModel
 from text_jepa.train.step import train_step
+
+load_local_env(ROOT)
 
 
 def load_config():

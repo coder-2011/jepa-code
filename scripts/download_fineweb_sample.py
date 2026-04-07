@@ -1,8 +1,16 @@
 from argparse import ArgumentParser
 from pathlib import Path
 import json
+import sys
 
 from datasets import load_dataset
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from text_jepa.env import load_local_env
+
+load_local_env(ROOT)
 
 
 def parse_args():
