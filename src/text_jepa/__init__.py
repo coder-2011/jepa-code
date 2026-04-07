@@ -9,11 +9,13 @@ from .masking import (
     mask_text_from_yaml,
     sample_word_blocks,
 )
+from .models.encoder import Encoder
 from .tokenization import get_tokenizer_metadata, load_tokenizer_from_yaml, load_yaml_config
 
 __all__ = [
     "build_target_mask",
     "collate_masked_examples",
+    "Encoder",
     "find_word_spans",
     "get_masking_settings",
     "get_tokenizer_metadata",
