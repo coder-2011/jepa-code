@@ -10,6 +10,8 @@ from .masking import (
     sample_word_blocks,
 )
 from .models.encoder import Encoder
+from .models.predictor import Predictor
+from .models.tower import EncoderTower
 from .tokenization import get_tokenizer_metadata, load_tokenizer_from_yaml, load_yaml_config
 from .utils.ema import update_ema
 
@@ -17,6 +19,7 @@ __all__ = [
     "build_target_mask",
     "collate_masked_examples",
     "Encoder",
+    "EncoderTower",
     "find_word_spans",
     "get_masking_settings",
     "get_tokenizer_metadata",
@@ -25,6 +28,7 @@ __all__ = [
     "map_words_to_tokens",
     "mask_text",
     "mask_text_from_yaml",
+    "Predictor",
     "sample_word_blocks",
     "update_ema",
 ]
