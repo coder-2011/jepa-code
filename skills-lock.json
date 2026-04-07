@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "exa-search": {
+      "source": "tdimino/claude-code-minoan",
+      "sourceType": "github",
+      "computedHash": "451b6be2ee9372546f78657fa231b40e6fe7b3177fcb1a534eca93462e053b28"
+    }
+  }
+}
