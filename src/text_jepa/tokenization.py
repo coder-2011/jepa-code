@@ -8,35 +8,25 @@ def load_yaml_config(config_path):
     path = Path(config_path)
     # Default to an empty dict so missing sections fail through our own validation.
     with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        return yaml.safe_load(handle)
 
 
 def load_tokenizer_from_yaml(config_path):
-    if AutoTokenizer is None:
-        raise ImportError("transformers is required to load the Hugging Face tokenizer")
 
     config = load_yaml_config(config_path)
     # Read only the tokenizer section here; masking settings live in masking.py.
     tokenizer_config = config.get("tokenizer") or {}
 
     model_name = tokenizer_config.get("model_name")
-    if not model_name:
-        raise ValueError("tokenizer.model_name must be set in the YAML config")
 
     max_length = tokenizer_config.get("max_length")
     if not isinstance(max_length, int) or max_length <= 0:
         raise ValueError("tokenizer.max_length must be a positive integer")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    # The masker depends on character offsets, which are only available on fast tokenizers.
-    if not getattr(tokenizer, "is_fast", False):
-        raise ValueError("A fast tokenizer is required because masking uses offset mappings")
-
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token is None:
-            raise ValueError("Tokenizer needs either a pad token or an eos token")
-        # Reuse eos as pad so fixed-length batching works even for causal-LM tokenizers.
-        tokenizer.pad_token = tokenizer.eos_token
+  
+    # Reuse eos as pad so fixed-length batching works even for causal-LM tokenizers.
+    tokenizer.pad_token = tokenizer.eos_token
 
     desired_mask_token = tokenizer_config.get("mask_token", "[MASK]")
     if tokenizer.mask_token is None:
