@@ -3,7 +3,7 @@ import random
 
 import torch
 
-from .tokenization import load_yaml_config, tokenize_text, validate_yaml_config
+from .tokenization import load_yaml_config, tokenize_text
 
 
 WORD_PATTERN = re.compile(r"\w+(?:['-]\w+)*")
@@ -11,15 +11,23 @@ WORD_PATTERN = re.compile(r"\w+(?:['-]\w+)*")
 
 def get_masking_settings(config_path):
     config = load_yaml_config(config_path)
-    validate_yaml_config(config)
-    tokenizer_config = config["tokenizer"]
+    tokenizer_config = config.get("tokenizer") or {}
     # Keep masking config separate so tokenizer loading and masking can evolve independently.
-    masking_config = config["masking"]
+    masking_config = config.get("masking") or {}
 
-    max_length = tokenizer_config["max_length"]
+    max_length = tokenizer_config.get("max_length")
+    if not isinstance(max_length, int) or max_length <= 0:
+        raise ValueError("tokenizer.max_length must be a positive integer")
+
     mask_ratio = masking_config.get("mask_ratio", 0.15)
-    max_block_words = masking_config.get("max_block_words", 2)
+    if not isinstance(mask_ratio, (int, float)) or not 0 < mask_ratio < 1:
+        raise ValueError("masking.mask_ratio must be between 0 and 1")
 
+    max_block_words = masking_config.get("max_block_words", 2)
+    if not isinstance(max_block_words, int) or max_block_words <= 0:
+        raise ValueError("masking.max_block_words must be a positive integer")
+
+    # Return plain values instead of another config object to keep the API compact.
     return max_length, float(mask_ratio), max_block_words
 
 
@@ -32,33 +40,27 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
     word_to_tokens = []
 
     for word_index, (word_start, word_end) in enumerate(word_spans):
-        token_start = None
-        token_end = None
+        token_indices = []
 
-        for token_index, ((char_start, char_end), attn, is_special) in enumerate(
+        for token_index, ((token_start, token_end), attn, is_special) in enumerate(
             zip(offset_mapping, attention_mask, special_tokens_mask)
         ):
             # Skip padding, special tokens, and zero-width offsets before overlap checks.
-            if attn == 0 or is_special == 1 or char_start == char_end:
+            if attn == 0 or is_special == 1 or token_start == token_end:
                 continue
 
-            if char_end <= word_start:
-                continue
-            if char_start >= word_end:
-                break
+            overlaps = not (token_end <= word_start or token_start >= word_end)
+            if overlaps:
+                token_indices.append(token_index)
 
-            if token_start is None:
-                token_start = token_index
-            token_end = token_index + 1
-
-        if token_start is not None:
+        if token_indices:
             word_to_tokens.append(
                 {
                     "word_index": word_index,
                     "char_span": (word_start, word_end),
                     # Store token spans half-open so they can be sliced directly.
-                    "token_start": token_start,
-                    "token_end": token_end,
+                    "token_start": min(token_indices),
+                    "token_end": max(token_indices) + 1,
                 }
             )
 
