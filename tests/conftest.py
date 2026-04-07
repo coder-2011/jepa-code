@@ -3,11 +3,13 @@ import sys
 from pathlib import Path
 
 
+# Keep tests importable without installing the package into the virtualenv.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 class FakeTokenizer:
     def __init__(self, has_mask_token=True):
+        # Mirror the small subset of Hugging Face tokenizer attributes our code touches.
         self.is_fast = True
         self.pad_token = "<pad>"
         self.pad_token_id = 0
@@ -18,6 +20,7 @@ class FakeTokenizer:
         self.mask_token_id = 99 if has_mask_token else None
 
     def add_special_tokens(self, mapping):
+        # Behave like a tokenizer that successfully appended a missing mask token.
         self.mask_token = mapping["mask_token"]
         self.mask_token_id = 99
         return 1
@@ -38,17 +41,20 @@ class FakeTokenizer:
         if isinstance(text, list):
             raise NotImplementedError("FakeTokenizer only supports single examples in tests")
 
+        # Mirror the real shape contract closely enough that masking logic can be tested offline.
         input_ids = [self.bos_token_id]
         attention_mask = [1]
         offset_mapping = [(0, 0)]
         special_tokens_mask = [1]
 
         for index, match in enumerate(re.finditer(r"\S+", text)):
+            # Give each surface word one token id so mask tests stay easy to reason about.
             input_ids.append(10 + index)
             attention_mask.append(1)
             offset_mapping.append((match.start(), match.end()))
             special_tokens_mask.append(0)
 
+        # Add an eos token so tests also exercise special-token exclusion.
         input_ids.append(self.eos_token_id)
         attention_mask.append(1)
         offset_mapping.append((0, 0))
@@ -59,6 +65,7 @@ class FakeTokenizer:
         offset_mapping = offset_mapping[:max_length]
         special_tokens_mask = special_tokens_mask[:max_length]
 
+        # Pad with zero-width offsets so padding can never be selected as a mask target.
         while len(input_ids) < max_length:
             input_ids.append(self.pad_token_id)
             attention_mask.append(0)

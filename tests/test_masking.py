@@ -15,6 +15,7 @@ from conftest import FakeTokenizer
 
 
 def write_config(path, max_length=12, mask_ratio=0.4, max_block_words=2):
+    # Mirror the real config layout so the YAML entry point is tested honestly.
     path.write_text(
         yaml.safe_dump(
             {
@@ -36,6 +37,7 @@ def write_config(path, max_length=12, mask_ratio=0.4, max_block_words=2):
 def test_find_word_spans_basic_sentence():
     spans = find_word_spans("The quick brown fox")
 
+    # Word spans are half-open character ranges.
     assert spans == [(0, 3), (4, 9), (10, 15), (16, 19)]
 
 
@@ -51,6 +53,7 @@ def test_map_words_to_tokens_produces_token_ranges():
         encoded["special_tokens_mask"],
     )
 
+    # Each raw word should map to at least one token span in this simple tokenizer.
     assert len(word_to_tokens) == 4
     assert all(item["token_start"] < item["token_end"] for item in word_to_tokens)
 
@@ -67,6 +70,7 @@ def test_mask_text_returns_required_contract():
         rng=random.Random(0),
     )
 
+    # Keep the top-level masking contract stable because later JEPA modules will depend on it.
     assert set(output) == {
         "input_ids_full",
         "input_ids_ctx",
@@ -90,6 +94,7 @@ def test_masked_positions_are_replaced_in_context():
         rng=random.Random(0),
     )
 
+    # Every target position should be swapped to the mask token id on the context side.
     assert torch.all(output["input_ids_ctx"][output["target_mask"]] == tokenizer.mask_token_id)
 
 
@@ -104,6 +109,7 @@ def test_unmasked_positions_are_unchanged():
         rng=random.Random(0),
     )
 
+    # The masker should not perturb visible context tokens.
     assert torch.equal(
         output["input_ids_ctx"][~output["target_mask"]],
         output["input_ids_full"][~output["target_mask"]],
@@ -121,6 +127,7 @@ def test_target_positions_match_target_mask():
         rng=random.Random(0),
     )
 
+    # Positions are just the sparse form of the dense boolean target mask.
     expected = torch.nonzero(output["target_mask"], as_tuple=False).squeeze(-1)
     assert torch.equal(output["target_positions"], expected)
 
@@ -137,6 +144,7 @@ def test_no_special_tokens_are_masked():
         rng=random.Random(0),
     )
 
+    # Special tokens are marked explicitly and should never leak into the target mask.
     special_positions = torch.tensor(encoded["special_tokens_mask"], dtype=torch.bool)
     assert not torch.any(output["target_mask"] & special_positions)
 
@@ -152,6 +160,7 @@ def test_no_padding_tokens_are_masked():
         rng=random.Random(0),
     )
 
+    # Padding should be excluded even when max_length is larger than the text.
     padding_positions = output["attention_mask"] == 0
     assert not torch.any(output["target_mask"] & padding_positions)
 
@@ -167,6 +176,7 @@ def test_mask_ratio_is_approximate_not_exact():
         rng=random.Random(0),
     )
 
+    # Block masking is discrete, so we only expect a reasonable neighborhood around the target.
     masked_count = int(output["target_mask"].sum().item())
     assert 2 <= masked_count <= 5
 
@@ -182,6 +192,7 @@ def test_two_word_blocks_are_used_at_most():
         rng=random.Random(0),
     )
 
+    # The sampled word-space blocks should respect the configured upper bound.
     assert all(end - start <= 2 for start, end in output["masked_span_ranges_word"])
 
 
@@ -197,4 +208,5 @@ def test_mask_text_from_yaml_uses_config_values(tmp_path):
         rng=random.Random(0),
     )
 
+    # The YAML path should propagate max_length through the convenience wrapper.
     assert output["input_ids_full"].shape[0] == 10
