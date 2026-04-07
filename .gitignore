@@ -4,5 +4,6 @@ lejepa/
 .venv/
 .env.*
 tmp/
+wandb/
 __pycache__/
 *.pyc
