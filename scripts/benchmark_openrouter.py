@@ -28,6 +28,11 @@ SYNTH_STYLE = (
     "Use the dataset's regex notation. Use ~ for negation and & for conjunction when needed. "
     "Do not add anchors like ^ or $. Return only the regex expression."
 )
+SYNTH_JUDGE_PROMPT = (
+    "You are grading a regex answer. Decide whether the candidate regex is functionally correct for "
+    "the natural-language request. Ignore formatting differences and minor syntax variation if the "
+    "candidate expresses the same condition. Return JSON with keys correct (boolean) and reason (string)."
+)
 
 
 class RateLimitExceeded(RuntimeError):
@@ -110,6 +115,7 @@ def request_prediction(
     timeout: float,
     retries: int,
     retry_sleep: float,
+    response_format: dict | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -121,6 +127,8 @@ def request_prediction(
             "exclude": True,
         },
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -157,6 +165,51 @@ def evaluate_prediction(prediction: str, row: dict, dataset_name: str) -> bool:
     )
 
 
+def judge_synth_prediction(
+    session: requests.Session,
+    *,
+    api_key: str,
+    judge_model: str,
+    row: dict,
+    prediction: str,
+    timeout: float,
+    retries: int,
+    retry_sleep: float,
+) -> tuple[bool | None, str | None]:
+    messages = [
+        {"role": "system", "content": SYNTH_JUDGE_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "instruction": row["messages"][1]["content"],
+                    "gold_regex": row["messages"][2]["content"],
+                    "candidate_regex": prediction,
+                },
+                ensure_ascii=True,
+            ),
+        },
+    ]
+    raw = request_prediction(
+        session,
+        api_key=api_key,
+        model=judge_model,
+        messages=messages,
+        max_tokens=128,
+        timeout=timeout,
+        retries=retries,
+        retry_sleep=retry_sleep,
+        response_format={"type": "json_object"},
+    )
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, f"judge_invalid_json: {raw}"
+    correct = parsed.get("correct")
+    reason = parsed.get("reason")
+    return (bool(correct) if isinstance(correct, bool) else None), reason if isinstance(reason, str) else None
+
+
 def append_result(handle, result: dict) -> None:
     handle.write(json.dumps(result) + "\n")
     handle.flush()
@@ -176,6 +229,9 @@ def benchmark(args: argparse.Namespace) -> dict:
 
     completed = 0
     correct = 0
+    exact_correct = 0
+    relaxed_correct = 0
+    relaxed_scored = 0
     failed = 0
     samples: list[dict] = []
     stopped_reason = None
@@ -205,9 +261,28 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "prompt": row["messages"][1]["content"],
                         "gold": row["messages"][2]["content"],
                         "prediction": prediction,
-                        "match": evaluate_prediction(prediction, row, dataset_path.name),
+                        "match_exact": evaluate_prediction(prediction, row, dataset_path.name),
+                        "match": None,
+                        "match_relaxed": None,
+                        "judge_reason": None,
                         "error": None,
                     }
+                    if dataset_path.name.startswith("synth"):
+                        judged, reason = judge_synth_prediction(
+                            session,
+                            api_key=api_key,
+                            judge_model=args.judge_model or args.model,
+                            row=row,
+                            prediction=prediction,
+                            timeout=args.timeout,
+                            retries=args.retries,
+                            retry_sleep=args.retry_sleep,
+                        )
+                        result["match_relaxed"] = judged
+                        result["judge_reason"] = reason
+                        result["match"] = judged
+                    else:
+                        result["match"] = result["match_exact"]
                 except RateLimitExceeded as error:
                     stopped_reason = f"rate_limited: {error}"
                     break
@@ -217,13 +292,20 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "prompt": row["messages"][1]["content"],
                         "gold": row["messages"][2]["content"],
                         "prediction": "",
+                        "match_exact": False,
                         "match": False,
+                        "match_relaxed": None,
+                        "judge_reason": None,
                         "error": f"{type(error).__name__}: {error}",
                     }
                 append_result(sink, result)
 
             completed += 1
             correct += int(bool(result.get("match")))
+            exact_correct += int(bool(result.get("match_exact")))
+            if result.get("match_relaxed") is not None:
+                relaxed_scored += 1
+                relaxed_correct += int(bool(result.get("match_relaxed")))
             if result.get("error"):
                 failed += 1
             if len(samples) < 5:
@@ -235,6 +317,11 @@ def benchmark(args: argparse.Namespace) -> dict:
         "count": completed,
         "correct": correct,
         "accuracy": (correct / completed) if completed else 0.0,
+        "correct_exact": exact_correct if args.include_exact else None,
+        "accuracy_exact": ((exact_correct / completed) if completed else 0.0) if args.include_exact else None,
+        "correct_relaxed": relaxed_correct if relaxed_scored else None,
+        "accuracy_relaxed": (relaxed_correct / relaxed_scored) if relaxed_scored else None,
+        "relaxed_scored": relaxed_scored,
         "failed": failed,
         "stopped_reason": stopped_reason,
         "output_file": str(output_path),
@@ -254,6 +341,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-sleep", type=float, default=10.0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no-strict-answer-only", action="store_true")
+    parser.add_argument("--judge-model")
+    parser.add_argument("--include-exact", action="store_true")
     return parser.parse_args()
 
 
