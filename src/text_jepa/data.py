@@ -101,3 +101,188 @@ def create_fineweb_dataloader(
         collate_fn=collate_masked_examples,
         generator=generator,
     )
+
+
+def predictor_tokens(predictors):
+    return [f"<|predictor_{index}|>" for index in range(1, predictors + 1)]
+
+
+def ensure_predictor_tokens(tokenizer, predictors):
+    tokens = predictor_tokens(predictors)
+    if tokens and hasattr(tokenizer, "add_special_tokens"):
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+    return tokens
+
+
+def _render_messages(tokenizer, messages, add_generation_prompt=False):
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        token_ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+        )
+        if isinstance(token_ids, torch.Tensor):
+            return token_ids.tolist()
+        return token_ids
+
+    text = []
+    for message in messages:
+        text.append(f"{message['role']}: {message['content']}")
+    if add_generation_prompt:
+        text.append("assistant:")
+    if hasattr(tokenizer, "encode"):
+        return tokenizer.encode("\n".join(text), add_special_tokens=True)
+
+    encoded = tokenizer(
+        "\n".join(text),
+        truncation=False,
+        padding=False,
+        return_attention_mask=False,
+    )
+    return encoded["input_ids"]
+
+
+def _pad_ids(token_ids, max_length, pad_token_id):
+    token_ids = token_ids[:max_length]
+    attention_mask = [1] * len(token_ids)
+    while len(token_ids) < max_length:
+        token_ids.append(pad_token_id)
+        attention_mask.append(0)
+    return (
+        torch.tensor(token_ids, dtype=torch.long),
+        torch.tensor(attention_mask, dtype=torch.long),
+    )
+
+
+def _last_content_index(token_ids, eos_token_id, max_length):
+    if not token_ids:
+        return 0
+    index = min(len(token_ids), max_length) - 1
+    if token_ids[index] == eos_token_id and index > 0:
+        index -= 1
+    return index
+
+
+def _extract_views(row):
+    messages = row["messages"]
+    text_messages = row.get("text")
+    code_messages = row.get("code")
+    if text_messages is None:
+        text_messages = [message for message in messages if message["role"] == "user"][-1:]
+    if code_messages is None:
+        code_messages = [message for message in messages if message["role"] == "assistant"][-1:]
+    if not text_messages or not code_messages:
+        raise ValueError("paired LLM-JEPA examples require user/text and assistant/code views")
+    return messages, text_messages, code_messages
+
+
+class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        jsonl_path,
+        tokenizer,
+        max_length,
+        predictors=1,
+        max_docs=None,
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.predictors = predictors
+        self.rows = []
+        self.predictor_token_strings = ensure_predictor_tokens(tokenizer, predictors)
+
+        path = Path(jsonl_path)
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if "messages" not in row:
+                    continue
+                self.rows.append(row)
+                if max_docs is not None and len(self.rows) >= max_docs:
+                    break
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        messages, text_messages, code_messages = _extract_views(self.rows[index])
+        source_messages = json.loads(json.dumps(text_messages))
+        if self.predictor_token_strings:
+            source_messages[0]["content"] += "".join(self.predictor_token_strings)
+
+        full_token_ids = _render_messages(self.tokenizer, messages, add_generation_prompt=False)
+        prompt_token_ids = _render_messages(self.tokenizer, messages[:-1], add_generation_prompt=True)
+        source_token_ids = _render_messages(self.tokenizer, source_messages, add_generation_prompt=False)
+        target_token_ids = _render_messages(self.tokenizer, code_messages, add_generation_prompt=False)
+
+        input_ids, attention_mask = _pad_ids(
+            full_token_ids,
+            self.max_length,
+            self.tokenizer.pad_token_id,
+        )
+        labels = input_ids.clone()
+        labels[: min(len(prompt_token_ids), self.max_length)] = -100
+        labels[attention_mask == 0] = -100
+
+        source_input_ids, source_attention_mask = _pad_ids(
+            source_token_ids,
+            self.max_length,
+            self.tokenizer.pad_token_id,
+        )
+        target_input_ids, target_attention_mask = _pad_ids(
+            target_token_ids,
+            self.max_length,
+            self.tokenizer.pad_token_id,
+        )
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "source_input_ids": source_input_ids,
+            "source_attention_mask": source_attention_mask,
+            "source_last_index": torch.tensor(
+                _last_content_index(source_token_ids, self.tokenizer.eos_token_id, self.max_length),
+                dtype=torch.long,
+            ),
+            "target_input_ids": target_input_ids,
+            "target_attention_mask": target_attention_mask,
+            "target_last_index": torch.tensor(
+                _last_content_index(target_token_ids, self.tokenizer.eos_token_id, self.max_length),
+                dtype=torch.long,
+            ),
+        }
+
+
+def create_llm_jepa_dataloader(
+    jsonl_path,
+    tokenizer,
+    max_length,
+    batch_size,
+    predictors=1,
+    shuffle=False,
+    seed=0,
+    num_workers=0,
+    max_docs=None,
+    drop_last=False,
+):
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=jsonl_path,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        predictors=predictors,
+        max_docs=max_docs,
+    )
+    generator = None
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        generator=generator,
+    )
