@@ -2,9 +2,30 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
 
 # Keep tests importable without installing the package into the virtualenv.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+def write_test_config(path, model_name="Qwen/Qwen3-0.6B", max_length=12, mask_ratio=0.15, max_block_words=2):
+    # Share one config writer so both test files exercise the same YAML layout.
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "tokenizer": {
+                    "model_name": model_name,
+                    "max_length": max_length,
+                    "mask_token": "[MASK]",
+                },
+                "masking": {
+                    "mask_ratio": mask_ratio,
+                    "max_block_words": max_block_words,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class FakeTokenizer:

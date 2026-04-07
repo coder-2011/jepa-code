@@ -1,8 +1,12 @@
+import re
 import random
 
 import torch
 
 from .tokenization import load_yaml_config, tokenize_text
+
+
+WORD_PATTERN = re.compile(r"\w+(?:['-]\w+)*")
 
 
 def get_masking_settings(config_path):
@@ -28,23 +32,8 @@ def get_masking_settings(config_path):
 
 
 def find_word_spans(text):
-    spans = []
-    in_word = False
-    start = None
-
-    # A "word" stays intentionally simple in v1: any contiguous non-whitespace span.
-    for index, char in enumerate(text):
-        if not char.isspace() and not in_word:
-            start = index
-            in_word = True
-        elif char.isspace() and in_word:
-            spans.append((start, index))
-            in_word = False
-
-    if in_word:
-        spans.append((start, len(text)))
-
-    return spans
+    # Match word-like spans while leaving surrounding punctuation out of the masking units.
+    return [(match.start(), match.end()) for match in WORD_PATTERN.finditer(text)]
 
 
 def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_tokens_mask):
@@ -87,31 +76,63 @@ def count_maskable_tokens(attention_mask, special_tokens_mask):
     return total
 
 
+def build_candidate_blocks(word_to_tokens, max_block_words):
+    candidates = []
+
+    for start_index in range(len(word_to_tokens)):
+        token_count = 0
+        max_end_index = min(start_index + max_block_words, len(word_to_tokens))
+
+        for end_index in range(start_index + 1, max_end_index + 1):
+            token_count += (
+                word_to_tokens[end_index - 1]["token_end"] - word_to_tokens[end_index - 1]["token_start"]
+            )
+            candidates.append(
+                {
+                    "start_index": start_index,
+                    "end_index": end_index,
+                    "token_count": token_count,
+                }
+            )
+
+    return candidates
+
+
 def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng):
     selected_blocks = []
     used_word_indices = set()
     masked_token_count = 0
 
-    candidate_starts = list(range(len(word_to_tokens)))
-    # Shuffle once, then greedily take non-overlapping blocks until we hit the token budget.
-    rng.shuffle(candidate_starts)
+    # Consider all 1..max_block_words blocks so we can choose the best fit for the remaining budget.
+    candidate_blocks = build_candidate_blocks(word_to_tokens, max_block_words)
 
-    for start_index in candidate_starts:
-        if masked_token_count >= target_token_budget:
+    while masked_token_count < target_token_budget:
+        remaining_budget = target_token_budget - masked_token_count
+
+        available_blocks = [
+            candidate
+            for candidate in candidate_blocks
+            if not any(
+                word_index in used_word_indices
+                for word_index in range(candidate["start_index"], candidate["end_index"])
+            )
+        ]
+        if not available_blocks:
             break
-        if start_index in used_word_indices:
-            continue
 
-        block_size = rng.randint(1, max_block_words)
-        # Clamp the block at sequence end instead of resampling.
-        end_index = min(start_index + block_size, len(word_to_tokens))
+        # Prefer the block that gets closest to the remaining token budget.
+        # Break ties randomly so repeated runs can still explore different masks.
+        best_block = min(
+            available_blocks,
+            key=lambda candidate: (
+                abs(remaining_budget - candidate["token_count"]),
+                1 if candidate["token_count"] > remaining_budget else 0,
+                rng.random(),
+            ),
+        )
 
-        # Word overlap is disallowed in v1 so the resulting token mask stays easy to reason about.
-        if any(word_index in used_word_indices for word_index in range(start_index, end_index)):
-            continue
-
-        selected_blocks.append((start_index, end_index))
-        for word_index in range(start_index, end_index):
+        selected_blocks.append((best_block["start_index"], best_block["end_index"]))
+        for word_index in range(best_block["start_index"], best_block["end_index"]):
             used_word_indices.add(word_index)
             # Track budget in token space because subword tokenizers expand some words.
             masked_token_count += (
@@ -160,7 +181,7 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
     if total_maskable_tokens <= 0:
         raise ValueError("No maskable tokens were found in the tokenized example")
 
-    # The ratio is approximate by design because whole word blocks rarely fit the budget exactly.
+    # The ratio is still approximate, but we now try to choose blocks that fit the token budget closely.
     target_token_budget = max(1, round(total_maskable_tokens * mask_ratio))
     selected_blocks = sample_word_blocks(
         word_to_tokens,

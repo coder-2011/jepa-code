@@ -1,37 +1,15 @@
-import yaml
-
 from text_jepa.tokenization import (
     get_tokenizer_metadata,
     load_tokenizer_from_yaml,
     tokenize_text,
 )
 
-from conftest import FakeTokenizer
-
-
-def write_config(path, model_name="Qwen/Qwen3-0.6B", max_length=12):
-    # Keep test configs tiny and explicit so failures point to one setting at a time.
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "tokenizer": {
-                    "model_name": model_name,
-                    "max_length": max_length,
-                    "mask_token": "[MASK]",
-                },
-                "masking": {
-                    "mask_ratio": 0.15,
-                    "max_block_words": 2,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+from conftest import FakeTokenizer, write_test_config
 
 
 def test_loads_qwen_tokenizer_from_yaml(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
-    write_config(config_path)
+    write_test_config(config_path)
 
     class FakeAutoTokenizer:
         @staticmethod

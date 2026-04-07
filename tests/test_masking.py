@@ -1,37 +1,17 @@
 import random
 
 import torch
-import yaml
 
 from text_jepa.masking import (
     find_word_spans,
     map_words_to_tokens,
     mask_text,
     mask_text_from_yaml,
+    sample_word_blocks,
 )
 from text_jepa.tokenization import tokenize_text
 
-from conftest import FakeTokenizer
-
-
-def write_config(path, max_length=12, mask_ratio=0.4, max_block_words=2):
-    # Mirror the real config layout so the YAML entry point is tested honestly.
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "tokenizer": {
-                    "model_name": "Qwen/Qwen3-0.6B",
-                    "max_length": max_length,
-                    "mask_token": "[MASK]",
-                },
-                "masking": {
-                    "mask_ratio": mask_ratio,
-                    "max_block_words": max_block_words,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+from conftest import FakeTokenizer, write_test_config
 
 
 def test_find_word_spans_basic_sentence():
@@ -39,6 +19,13 @@ def test_find_word_spans_basic_sentence():
 
     # Word spans are half-open character ranges.
     assert spans == [(0, 3), (4, 9), (10, 15), (16, 19)]
+
+
+def test_find_word_spans_excludes_surrounding_punctuation():
+    spans = find_word_spans("Hello, world! don't-stop")
+
+    # Punctuation should not create its own words or attach to surrounding words.
+    assert spans == [(0, 5), (7, 12), (14, 24)]
 
 
 def test_map_words_to_tokens_produces_token_ranges():
@@ -196,9 +183,33 @@ def test_two_word_blocks_are_used_at_most():
     assert all(end - start <= 2 for start, end in output["masked_span_ranges_word"])
 
 
+def test_sample_word_blocks_prefers_a_closer_budget_fit():
+    word_to_tokens = [
+        {"token_start": 0, "token_end": 1},
+        {"token_start": 1, "token_end": 2},
+        {"token_start": 2, "token_end": 3},
+        {"token_start": 3, "token_end": 4},
+    ]
+
+    blocks = sample_word_blocks(
+        word_to_tokens,
+        target_token_budget=3,
+        max_block_words=2,
+        rng=random.Random(0),
+    )
+
+    # The improved sampler should be able to hit an easy exact fit here.
+    masked_tokens = sum(
+        word_to_tokens[index]["token_end"] - word_to_tokens[index]["token_start"]
+        for start, end in blocks
+        for index in range(start, end)
+    )
+    assert masked_tokens == 3
+
+
 def test_mask_text_from_yaml_uses_config_values(tmp_path):
     config_path = tmp_path / "config.yaml"
-    write_config(config_path, max_length=10, mask_ratio=0.4, max_block_words=2)
+    write_test_config(config_path, max_length=10, mask_ratio=0.4, max_block_words=2)
     tokenizer = FakeTokenizer()
 
     output = mask_text_from_yaml(

@@ -1,12 +1,7 @@
 from pathlib import Path
-
+from transformers import AutoTokenizer
 import torch
 import yaml
-
-try:
-    from transformers import AutoTokenizer
-except ImportError:
-    AutoTokenizer = None
 
 
 def load_yaml_config(config_path):
