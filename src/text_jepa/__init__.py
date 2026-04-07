@@ -1,6 +1,5 @@
 # Keep the package surface intentionally small, but expose the main utility helpers.
 from .batching import collate_masked_examples
-from .config import get_model_settings
 from .masking import (
     build_target_mask,
     find_word_spans,
@@ -19,7 +18,6 @@ __all__ = [
     "collate_masked_examples",
     "Encoder",
     "find_word_spans",
-    "get_model_settings",
     "get_masking_settings",
     "get_tokenizer_metadata",
     "load_tokenizer_from_yaml",
