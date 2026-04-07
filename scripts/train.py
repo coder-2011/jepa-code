@@ -148,10 +148,12 @@ def save_checkpoint(checkpoint_dir, step, state):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     step_path = checkpoint_dir / f"step-{step:06d}.pt"
     latest_path = checkpoint_dir / "latest.pt"
-    for path in (step_path, latest_path):
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        torch.save(state, tmp_path)
-        os.replace(tmp_path, path)
+    tmp_path = step_path.with_suffix(step_path.suffix + ".tmp")
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, step_path)
+    if latest_path.exists() or latest_path.is_symlink():
+        latest_path.unlink()
+    os.link(step_path, latest_path)
     return step_path
 
 
