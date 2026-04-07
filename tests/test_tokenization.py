@@ -2,6 +2,7 @@ from text_jepa.tokenization import (
     get_tokenizer_metadata,
     load_tokenizer_from_yaml,
     tokenize_text,
+    validate_yaml_config,
 )
 
 from conftest import FakeTokenizer, write_test_config
@@ -57,3 +58,40 @@ def test_get_tokenizer_metadata_returns_special_ids():
     assert metadata["bos_token_id"] == 2
     assert metadata["eos_token_id"] == 1
     assert metadata["vocab_size"] == 128
+
+
+def test_validate_yaml_config_rejects_missing_tokenizer_section():
+    config = {
+        "masking": {
+            "mask_ratio": 0.15,
+            "max_block_words": 2,
+        }
+    }
+
+    try:
+        validate_yaml_config(config)
+    except ValueError as exc:
+        assert "Missing 'tokenizer' section" in str(exc)
+    else:
+        raise AssertionError("Expected validate_yaml_config to reject missing tokenizer section")
+
+
+def test_validate_yaml_config_rejects_invalid_mask_ratio():
+    config = {
+        "tokenizer": {
+            "model_name": "Qwen/Qwen3-0.6B",
+            "max_length": 12,
+            "mask_token": "[MASK]",
+        },
+        "masking": {
+            "mask_ratio": 1.5,
+            "max_block_words": 2,
+        },
+    }
+
+    try:
+        validate_yaml_config(config)
+    except ValueError as exc:
+        assert "'masking.mask_ratio' must be between 0 and 1" in str(exc)
+    else:
+        raise AssertionError("Expected validate_yaml_config to reject invalid mask_ratio")
