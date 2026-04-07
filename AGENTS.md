@@ -66,6 +66,9 @@ Use this workspace to study, compare, and improve JEPA-style architectures. The 
 
 ## Build, Test, and Development Commands
 - Prefer direct Python tooling; no top-level task runner is defined yet.
+- Keep the top-level `justfile` current:
+  - add a recipe for each new test file
+  - add a recipe for new repetitive developer tasks that are likely to be run more than once
 - Useful commands:
   - `cd jepa && python -m unittest tests.test_model.TestJEPA`
   - `cd jepa && black . && isort . && flake8 && mypy jepa`
