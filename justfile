@@ -32,5 +32,5 @@ download-fineweb-sample max_bytes="5242880" name="CC-MAIN-2024-10" output="tmp/f
 train-layer steps="50" batch_size="2" data_path="tmp/fineweb-sample.jsonl":
     source {{venv}}/bin/activate && python scripts/train.py --steps {{steps}} --batch-size {{batch_size}} --data-path {{data_path}}
 
-train-llm-jepa steps="10" batch_size="2" train_file="llm-jepa/datasets/synth_train.jsonl" eval_file="llm-jepa/datasets/synth_test.jsonl":
-    source {{venv}}/bin/activate && python scripts/train_llm_jepa.py --steps {{steps}} --batch-size {{batch_size}} --train-file {{train_file}} --eval-file {{eval_file}}
+train-llm-jepa steps="10" batch_size="1" max_length="256" train_file="llm-jepa/datasets/synth_train.jsonl" eval_file="llm-jepa/datasets/synth_test.jsonl":
+    source {{venv}}/bin/activate && python scripts/train_llm_jepa.py --steps {{steps}} --batch-size {{batch_size}} --max-length {{max_length}} --save-every 0 --train-file {{train_file}} --eval-file {{eval_file}}

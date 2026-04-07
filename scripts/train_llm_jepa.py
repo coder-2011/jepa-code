@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--max-length", type=int)
     parser.add_argument("--predictors", type=int, default=1)
     parser.add_argument("--lambda-jepa", type=float, default=1.0)
     parser.add_argument("--gamma-lm", type=float, default=1.0)
@@ -96,7 +97,7 @@ def build_model(args, config, tokenizer):
     )
 
 
-def build_run_config(args, config, dataset_size):
+def build_run_config(args, config, dataset_size, max_length):
     return {
         "config_path": args.config,
         "train_file": args.train_file,
@@ -117,7 +118,7 @@ def build_run_config(args, config, dataset_size):
         "val_max_batches": args.val_max_batches,
         "seed": args.seed,
         "device": args.device,
-        "max_length": config["tokenizer"]["max_length"],
+        "max_length": max_length,
         "dataset_size": dataset_size,
     }
 
@@ -126,7 +127,6 @@ def checkpoint_state(step, model, optimizer, run_config):
     return {
         "step": step,
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
         "config": run_config,
     }
 
@@ -148,7 +148,8 @@ def save_checkpoint(checkpoint_dir, step, state):
 def load_checkpoint(path, model, optimizer, device):
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
     return int(checkpoint["step"])
 
 
@@ -189,7 +190,7 @@ def main():
 
     config = load_yaml_config(args.config)
     tokenizer = load_tokenizer_from_yaml(args.config)
-    max_length = config["tokenizer"]["max_length"]
+    max_length = args.max_length or config["tokenizer"]["max_length"]
 
     train_dataloader = create_llm_jepa_dataloader(
         jsonl_path=args.train_file,
@@ -221,7 +222,7 @@ def main():
     model = build_model(args, config, tokenizer).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     wandb_mode = choose_wandb_mode(args.wandb_mode)
-    run_config = build_run_config(args, config, dataset_size)
+    run_config = build_run_config(args, config, dataset_size, max_length)
     start_step = 0
     resume_path = resolve_resume_path(args.resume_from, args.checkpoint_dir, args.auto_resume)
     if resume_path is not None:
