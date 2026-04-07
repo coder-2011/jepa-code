@@ -191,10 +191,20 @@ def _extract_views(row):
     text_messages = row.get("text")
     code_messages = row.get("code")
     if text_messages is None or code_messages is None:
-        raise ValueError(
-            "paired LLM-JEPA examples must provide explicit `text` and `code` views; "
-            "implicit last-user/last-assistant fallback is not allowed"
-        )
+        if not messages:
+            raise ValueError("paired LLM-JEPA examples require non-empty messages")
+        if messages[-1]["role"] != "assistant":
+            raise ValueError("paired LLM-JEPA message-only rows must end with an assistant turn")
+        prefix_messages = messages[:-1]
+        if not prefix_messages:
+            raise ValueError("paired LLM-JEPA message-only rows require source context before the assistant turn")
+        if any(message["role"] == "assistant" for message in prefix_messages):
+            raise ValueError(
+                "paired LLM-JEPA message-only rows must be single-turn prompt->assistant examples; "
+                "provide explicit `text` and `code` views for multi-turn conversations"
+            )
+        text_messages = prefix_messages
+        code_messages = [messages[-1]]
     if not text_messages or not code_messages:
         raise ValueError("paired LLM-JEPA examples require user/text and assistant/code views")
     return messages, text_messages, code_messages

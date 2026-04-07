@@ -145,7 +145,7 @@ def test_llm_jepa_dataset_builds_lm_and_view_tensors(tmp_path):
     assert (example["labels"] != -100).any()
 
 
-def test_llm_jepa_dataset_requires_explicit_text_and_code_views(tmp_path):
+def test_llm_jepa_dataset_accepts_single_turn_message_only_rows(tmp_path):
     data_path = tmp_path / "paired.jsonl"
     rows = [
         {
@@ -167,12 +167,43 @@ def test_llm_jepa_dataset_requires_explicit_text_and_code_views(tmp_path):
         predictors=1,
     )
 
+    example = dataset[0]
+
+    assert example["input_ids"].shape == (24,)
+    assert example["source_input_ids"].shape == (24,)
+    assert example["target_input_ids"].shape == (24,)
+
+
+def test_llm_jepa_dataset_rejects_multi_turn_message_only_rows(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    rows = [
+        {
+            "messages": [
+                {"role": "system", "content": "You are a coding assistant."},
+                {"role": "user", "content": "Write a regex."},
+                {"role": "assistant", "content": "dog[0-9]"},
+                {"role": "user", "content": "Now explain it."},
+                {"role": "assistant", "content": "It matches dog plus a digit."},
+            ]
+        }
+    ]
+    with data_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+    dataset = LLMJEPAPairedJsonlDataset(
+        jsonl_path=data_path,
+        tokenizer=FakeChatTokenizer(),
+        max_length=32,
+        predictors=1,
+    )
+
     try:
         dataset[0]
     except ValueError as exc:
-        assert "explicit `text` and `code` views" in str(exc)
+        assert "single-turn prompt->assistant examples" in str(exc)
     else:
-        raise AssertionError("Expected the dataset to reject rows without explicit JEPA views")
+        raise AssertionError("Expected the dataset to reject ambiguous multi-turn message-only rows")
 
 
 def test_llm_jepa_dataset_rejects_truncated_text_view(tmp_path):
