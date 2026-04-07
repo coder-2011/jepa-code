@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from math import sqrt
 from pathlib import Path
 
 
@@ -49,6 +50,42 @@ def load_existing(output_path: Path) -> dict[int, dict]:
 def append_result(handle, result: dict) -> None:
     handle.write(json.dumps(result) + "\n")
     handle.flush()
+
+
+def summarize_distribution(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    ordered = [float(value) for value in values]
+    ordered.sort()
+    count = len(ordered)
+
+    mean = 0.0
+    sum_squared_deltas = 0.0
+    for index, value in enumerate(ordered, start=1):
+        delta = value - mean
+        mean += delta / index
+        sum_squared_deltas += delta * (value - mean)
+    variance = sum_squared_deltas / count
+
+    def percentile(fraction: float) -> float:
+        if count == 1:
+            return ordered[0]
+        position = fraction * (count - 1)
+        lower = int(position)
+        upper = min(lower + 1, count - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    return {
+        "count": count,
+        "mean": mean,
+        "std": sqrt(variance),
+        "p10": percentile(0.10),
+        "p20": percentile(0.20),
+        "p50": percentile(0.50),
+        "p80": percentile(0.80),
+        "p90": percentile(0.90),
+    }
 
 
 def dataset_task_name(dataset_name: str) -> str:

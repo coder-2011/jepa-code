@@ -7,6 +7,7 @@ from text_jepa.benchmarking import (
     gsm8k_final_answer,
     hellaswag_target_choice,
     score_prediction,
+    summarize_distribution,
 )
 
 
@@ -98,3 +99,22 @@ def test_score_prediction_spider_executes_sql(tmp_path):
 
     assert score_prediction("SELECT count(*) FROM city", row, "spider_test.jsonl", spider_path=db_root)
     assert not score_prediction("SELECT name FROM city", row, "spider_test.jsonl", spider_path=db_root)
+
+
+def test_summarize_distribution_returns_expected_stats():
+    summary = summarize_distribution([1.0, 2.0, 3.0, 4.0])
+
+    assert summary == {
+        "count": 4,
+        "mean": 2.5,
+        "std": (1.25**0.5),
+        "p10": 1.3,
+        "p20": 1.6,
+        "p50": 2.5,
+        "p80": 3.4000000000000004,
+        "p90": 3.7,
+    }
+
+
+def test_summarize_distribution_returns_none_for_empty_input():
+    assert summarize_distribution([]) is None

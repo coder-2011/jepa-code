@@ -26,6 +26,7 @@ from text_jepa.benchmarking import (  # noqa: E402
     load_rows,
     prompt_text,
     score_prediction,
+    summarize_distribution,
 )
 from text_jepa.data import ensure_predictor_tokens  # noqa: E402
 from text_jepa.env import load_local_env  # noqa: E402
@@ -215,6 +216,23 @@ def render_prompt(tokenizer, messages: list[dict[str, str]]) -> str:
     return "\n".join(f"{message['role']}: {message['content']}" for message in messages) + "\nassistant:"
 
 
+def render_messages(tokenizer, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> str:
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    rendered = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+    if add_generation_prompt:
+        return rendered + "\nassistant:"
+    return rendered
+
+
 def clean_generation_text(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return text.strip()
@@ -230,6 +248,89 @@ def maybe_disable_qwen_thinking(messages: list[dict[str, str]], base_model: str)
             adjusted[0]["content"] = directive + "\n" + adjusted[0]["content"]
         return adjusted
     return [{"role": "system", "content": directive}] + adjusted
+
+
+def embedding_model(model, *, is_llm_jepa_checkpoint: bool):
+    return model.backbone if is_llm_jepa_checkpoint else model
+
+
+def sequence_embedding(
+    model,
+    *,
+    is_llm_jepa_checkpoint: bool,
+    tokenizer,
+    text: str,
+    max_length: int,
+    device: str,
+    pooling: str,
+    layer: int,
+) -> torch.Tensor:
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    )
+    inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+    hidden_state_model = embedding_model(model, is_llm_jepa_checkpoint=is_llm_jepa_checkpoint)
+    with torch.no_grad():
+        outputs = hidden_state_model(
+            **inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+    hidden_states = outputs.hidden_states[layer][0]
+    attention_mask = inputs["attention_mask"][0].bool()
+
+    if pooling == "last":
+        indices = attention_mask.nonzero(as_tuple=False)
+        index = int(indices[-1].item()) if len(indices) else hidden_states.shape[0] - 1
+        return hidden_states[index]
+    if pooling == "cls":
+        return hidden_states[0]
+    if pooling == "mean":
+        valid_states = hidden_states[attention_mask]
+        if valid_states.shape[0] == 0:
+            valid_states = hidden_states
+        return valid_states.mean(dim=0)
+    raise ValueError(f"unsupported embedding pooling: {pooling}")
+
+
+def row_similarity(
+    model,
+    *,
+    is_llm_jepa_checkpoint: bool,
+    tokenizer,
+    row: dict,
+    max_length: int,
+    device: str,
+    pooling: str,
+    layer: int,
+) -> float:
+    source_text = render_messages(tokenizer, row["messages"][:-1], add_generation_prompt=True)
+    target_text = render_messages(tokenizer, [row["messages"][-1]], add_generation_prompt=False)
+    source_embedding = sequence_embedding(
+        model,
+        is_llm_jepa_checkpoint=is_llm_jepa_checkpoint,
+        tokenizer=tokenizer,
+        text=source_text,
+        max_length=max_length,
+        device=device,
+        pooling=pooling,
+        layer=layer,
+    )
+    target_embedding = sequence_embedding(
+        model,
+        is_llm_jepa_checkpoint=is_llm_jepa_checkpoint,
+        tokenizer=tokenizer,
+        text=target_text,
+        max_length=max_length,
+        device=device,
+        pooling=pooling,
+        layer=layer,
+    )
+    return float(torch.nn.functional.cosine_similarity(source_embedding, target_embedding, dim=0).item())
 
 
 def select_hellaswag_choice(
@@ -316,6 +417,9 @@ def benchmark(args: argparse.Namespace) -> dict:
     failed = 0
     samples: list[dict] = []
     stopped_reason = None
+    similarity_all: list[float] = []
+    similarity_correct: list[float] = []
+    similarity_incorrect: list[float] = []
 
     with output_path.open("a", encoding="utf-8") as sink:
         for index, row in enumerate(rows):
@@ -383,6 +487,17 @@ def benchmark(args: argparse.Namespace) -> dict:
                         result["match"] = judged
                     else:
                         result["match"] = result["match_exact"]
+                    if args.similarity:
+                        result["similarity"] = row_similarity(
+                            model,
+                            tokenizer=tokenizer,
+                            row=row,
+                            is_llm_jepa_checkpoint=is_llm_jepa_checkpoint,
+                            max_length=args.max_length,
+                            device=args.device,
+                            pooling=args.embedding_pooling,
+                            layer=args.embedding_layer,
+                        )
                 except RateLimitExceeded as error:
                     stopped_reason = f"rate_limited: {error}"
                     break
@@ -397,6 +512,7 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "match_relaxed": None,
                         "closeness": None,
                         "judge_reason": None,
+                        "similarity": None,
                         "error": f"{type(error).__name__}: {error}",
                     }
                 append_result(sink, result)
@@ -410,6 +526,13 @@ def benchmark(args: argparse.Namespace) -> dict:
             if result.get("closeness") is not None:
                 closeness_scored += 1
                 closeness_total += int(result["closeness"])
+            if result.get("similarity") is not None:
+                similarity = float(result["similarity"])
+                similarity_all.append(similarity)
+                if result.get("match"):
+                    similarity_correct.append(similarity)
+                else:
+                    similarity_incorrect.append(similarity)
             if result.get("error"):
                 failed += 1
             if len(samples) < 5:
@@ -432,6 +555,15 @@ def benchmark(args: argparse.Namespace) -> dict:
         "closeness_scored": closeness_scored,
         "failed": failed,
         "stopped_reason": stopped_reason,
+        "similarity": {
+            "pooling": args.embedding_pooling,
+            "layer": args.embedding_layer,
+            "overall": summarize_distribution(similarity_all),
+            "matched": summarize_distribution(similarity_correct),
+            "unmatched": summarize_distribution(similarity_incorrect),
+        }
+        if args.similarity
+        else None,
         "output_file": str(output_path),
         "samples": samples,
     }
@@ -457,6 +589,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-strict-answer-only", action="store_true")
     parser.add_argument("--spider-path", default=str(ROOT / "llm-jepa" / "spider_data" / "database"))
     parser.add_argument("--startswith", action="store_true")
+    parser.add_argument("--similarity", action="store_true")
+    parser.add_argument("--embedding-layer", type=int, default=-1)
+    parser.add_argument("--embedding-pooling", choices=("last", "mean", "cls"), default="last")
     return parser.parse_args()
 
 
