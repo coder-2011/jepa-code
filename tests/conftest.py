@@ -8,7 +8,20 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
-def write_test_config(path, model_name="Qwen/Qwen3-0.6B", max_length=12, mask_ratio=0.15, max_block_words=2):
+def write_test_config(
+    path,
+    model_name="Qwen/Qwen3-0.6B",
+    max_length=12,
+    mask_ratio=0.15,
+    max_block_words=2,
+    hidden_dim=8,
+    num_heads=2,
+    num_layers=2,
+    ffn_dim=32,
+    dropout=0.0,
+    norm="rms",
+    ema_momentum=0.996,
+):
     # Share one config writer so both test files exercise the same YAML layout.
     path.write_text(
         yaml.safe_dump(
@@ -21,6 +34,15 @@ def write_test_config(path, model_name="Qwen/Qwen3-0.6B", max_length=12, mask_ra
                 "masking": {
                     "mask_ratio": mask_ratio,
                     "max_block_words": max_block_words,
+                },
+                "model": {
+                    "hidden_dim": hidden_dim,
+                    "num_heads": num_heads,
+                    "num_layers": num_layers,
+                    "ffn_dim": ffn_dim,
+                    "dropout": dropout,
+                    "norm": norm,
+                    "ema_momentum": ema_momentum,
                 },
             }
         ),
