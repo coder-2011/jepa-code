@@ -27,7 +27,11 @@ class Encoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(
+            layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
         self.final_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, attention_mask=None):
