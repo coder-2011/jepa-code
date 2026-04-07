@@ -27,13 +27,15 @@ from text_jepa.env import load_local_env  # noqa: E402
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "qwen/qwen3.5-397b-a17b"
+DEFAULT_MODEL = "qwen/qwen3.5-9b"
 DEFAULT_DATASET = ROOT / "llm-jepa" / "datasets" / "synth_test.jsonl"
 DEFAULT_OUTPUT = ROOT / "tmp" / "openrouter_benchmark_results.jsonl"
 SYNTH_JUDGE_PROMPT = (
     "You are grading a regex answer. Decide whether the candidate regex is functionally correct for "
     "the natural-language request. Ignore formatting differences and minor syntax variation if the "
-    "candidate expresses the same condition. Return JSON with keys correct (boolean) and reason (string)."
+    "candidate expresses the same condition. Also score how close the candidate is overall on a 0-100 scale, "
+    "where 100 means functionally equivalent to the intended regex and 0 means unrelated or unusable. "
+    "Return JSON with keys correct (boolean), closeness (integer 0-100), and reason (string)."
 )
 
 
@@ -59,14 +61,16 @@ def request_prediction(
     retries: int,
     retry_sleep: float,
     response_format: dict | None = None,
+    disable_reasoning: bool = True,
 ) -> str:
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
-        "reasoning": {"effort": "none", "exclude": True},
     }
+    if disable_reasoning:
+        payload["reasoning"] = {"effort": "none", "exclude": True}
     if response_format is not None:
         payload["response_format"] = response_format
 
@@ -127,14 +131,23 @@ def judge_synth_prediction(
         retries=retries,
         retry_sleep=retry_sleep,
         response_format={"type": "json_object"},
+        disable_reasoning=False,
     )
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return None, f"judge_invalid_json: {raw}"
+        return None, None, f"judge_invalid_json: {raw}"
     correct = parsed.get("correct")
+    closeness = parsed.get("closeness")
     reason = parsed.get("reason")
-    return (bool(correct) if isinstance(correct, bool) else None), reason if isinstance(reason, str) else None
+    normalized_closeness = None
+    if isinstance(closeness, (int, float)):
+        normalized_closeness = max(0, min(100, int(round(closeness))))
+    return (
+        bool(correct) if isinstance(correct, bool) else None,
+        normalized_closeness,
+        reason if isinstance(reason, str) else None,
+    )
 
 
 def benchmark(args: argparse.Namespace) -> dict:
@@ -155,6 +168,8 @@ def benchmark(args: argparse.Namespace) -> dict:
     exact_correct = 0
     relaxed_correct = 0
     relaxed_scored = 0
+    closeness_total = 0
+    closeness_scored = 0
     failed = 0
     samples: list[dict] = []
     stopped_reason = None
@@ -193,11 +208,12 @@ def benchmark(args: argparse.Namespace) -> dict:
                         ),
                         "match": None,
                         "match_relaxed": None,
+                        "closeness": None,
                         "judge_reason": None,
                         "error": None,
                     }
                     if task_name == "synth":
-                        judged, reason = judge_synth_prediction(
+                        judged, closeness, reason = judge_synth_prediction(
                             session,
                             api_key=api_key,
                             judge_model=args.judge_model or args.model,
@@ -208,6 +224,7 @@ def benchmark(args: argparse.Namespace) -> dict:
                             retry_sleep=args.retry_sleep,
                         )
                         result["match_relaxed"] = judged
+                        result["closeness"] = closeness
                         result["judge_reason"] = reason
                         result["match"] = judged
                     else:
@@ -224,6 +241,7 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "match_exact": False,
                         "match": False,
                         "match_relaxed": None,
+                        "closeness": None,
                         "judge_reason": None,
                         "error": f"{type(error).__name__}: {error}",
                     }
@@ -235,6 +253,9 @@ def benchmark(args: argparse.Namespace) -> dict:
             if result.get("match_relaxed") is not None:
                 relaxed_scored += 1
                 relaxed_correct += int(bool(result.get("match_relaxed")))
+            if result.get("closeness") is not None:
+                closeness_scored += 1
+                closeness_total += int(result["closeness"])
             if result.get("error"):
                 failed += 1
             if len(samples) < 5:
@@ -251,6 +272,8 @@ def benchmark(args: argparse.Namespace) -> dict:
         "correct_relaxed": relaxed_correct if relaxed_scored else None,
         "accuracy_relaxed": (relaxed_correct / relaxed_scored) if relaxed_scored else None,
         "relaxed_scored": relaxed_scored,
+        "avg_closeness": (closeness_total / closeness_scored) if closeness_scored else None,
+        "closeness_scored": closeness_scored,
         "failed": failed,
         "stopped_reason": stopped_reason,
         "output_file": str(output_path),
