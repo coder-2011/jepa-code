@@ -8,6 +8,7 @@ from .tokenization import load_yaml_config, tokenize_text
 def get_masking_settings(config_path):
     config = load_yaml_config(config_path)
     tokenizer_config = config.get("tokenizer") or {}
+    # Keep masking config separate so tokenizer loading and masking can evolve independently.
     masking_config = config.get("masking") or {}
 
     max_length = tokenizer_config.get("max_length")
@@ -22,6 +23,7 @@ def get_masking_settings(config_path):
     if not isinstance(max_block_words, int) or max_block_words <= 0:
         raise ValueError("masking.max_block_words must be a positive integer")
 
+    # Return plain values instead of another config object to keep the API compact.
     return max_length, float(mask_ratio), max_block_words
 
 
@@ -30,6 +32,7 @@ def find_word_spans(text):
     in_word = False
     start = None
 
+    # A "word" stays intentionally simple in v1: any contiguous non-whitespace span.
     for index, char in enumerate(text):
         if not char.isspace() and not in_word:
             start = index
@@ -53,6 +56,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
         for token_index, ((token_start, token_end), attn, is_special) in enumerate(
             zip(offset_mapping, attention_mask, special_tokens_mask)
         ):
+            # Skip padding, special tokens, and zero-width offsets before overlap checks.
             if attn == 0 or is_special == 1 or token_start == token_end:
                 continue
 
@@ -65,6 +69,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
                 {
                     "word_index": word_index,
                     "char_span": (word_start, word_end),
+                    # Store token spans half-open so they can be sliced directly.
                     "token_start": min(token_indices),
                     "token_end": max(token_indices) + 1,
                 }
@@ -76,6 +81,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
 def count_maskable_tokens(attention_mask, special_tokens_mask):
     total = 0
     for attn, is_special in zip(attention_mask, special_tokens_mask):
+        # The mask ratio is defined over real sequence tokens, not pads or special markers.
         if attn == 1 and is_special == 0:
             total += 1
     return total
@@ -87,6 +93,7 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
     masked_token_count = 0
 
     candidate_starts = list(range(len(word_to_tokens)))
+    # Shuffle once, then greedily take non-overlapping blocks until we hit the token budget.
     rng.shuffle(candidate_starts)
 
     for start_index in candidate_starts:
@@ -96,14 +103,17 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
             continue
 
         block_size = rng.randint(1, max_block_words)
+        # Clamp the block at sequence end instead of resampling.
         end_index = min(start_index + block_size, len(word_to_tokens))
 
+        # Word overlap is disallowed in v1 so the resulting token mask stays easy to reason about.
         if any(word_index in used_word_indices for word_index in range(start_index, end_index)):
             continue
 
         selected_blocks.append((start_index, end_index))
         for word_index in range(start_index, end_index):
             used_word_indices.add(word_index)
+            # Track budget in token space because subword tokenizers expand some words.
             masked_token_count += (
                 word_to_tokens[word_index]["token_end"] - word_to_tokens[word_index]["token_start"]
             )
@@ -113,11 +123,13 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
 
 def apply_mask(input_ids, target_mask, mask_token_id):
     input_ids_ctx = input_ids.clone()
+    # Preserve sequence length and only swap the hidden positions to mask_token_id.
     input_ids_ctx[target_mask] = mask_token_id
     return input_ids_ctx
 
 
 def extract_target_positions(input_ids_full, target_mask):
+    # Keep both positions and original ids so later code can supervise only masked slots.
     target_positions = torch.nonzero(target_mask, as_tuple=False).squeeze(-1).to(torch.long)
     target_token_ids = input_ids_full[target_positions]
     return target_positions, target_token_ids
@@ -125,6 +137,7 @@ def extract_target_positions(input_ids_full, target_mask):
 
 def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None):
     if rng is None:
+        # Local RNG keeps call sites deterministic when they pass an explicit seeded Random.
         rng = random.Random()
 
     tokenized = tokenize_text(tokenizer, text, max_length)
@@ -147,6 +160,7 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
     if total_maskable_tokens <= 0:
         raise ValueError("No maskable tokens were found in the tokenized example")
 
+    # The ratio is approximate by design because whole word blocks rarely fit the budget exactly.
     target_token_budget = max(1, round(total_maskable_tokens * mask_ratio))
     selected_blocks = sample_word_blocks(
         word_to_tokens,
@@ -161,11 +175,13 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
 
     for block_start, block_end in selected_blocks:
         block = word_to_tokens[block_start:block_end]
+        # Collapse each chosen word block into one contiguous token span for masking.
         token_start = min(item["token_start"] for item in block)
         token_end = max(item["token_end"] for item in block)
         word_start = min(item["word_index"] for item in block)
         word_end = max(item["word_index"] for item in block) + 1
 
+        # Keep both word-space and token-space ranges for debugging and future inspections.
         target_mask[token_start:token_end] = True
         masked_span_ranges_word.append((word_start, word_end))
         masked_span_ranges_token.append((token_start, token_end))
@@ -186,5 +202,6 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
 
 
 def mask_text_from_yaml(tokenizer, text, config_path, rng=None):
+    # This is the convenience entry point most callers should use.
     max_length, mask_ratio, max_block_words = get_masking_settings(config_path)
     return mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=rng)
