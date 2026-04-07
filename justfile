@@ -22,3 +22,6 @@ all-tests:
 
 download-fineweb-sample max_bytes="5242880" name="CC-MAIN-2024-10" output="tmp/fineweb-sample.jsonl":
     source {{venv}}/bin/activate && python scripts/download_fineweb_sample.py --name {{name}} --max-bytes {{max_bytes}} --output {{output}}
+
+train-layer steps="10" batch_size="2" data_path="tmp/fineweb-sample.jsonl":
+    source {{venv}}/bin/activate && python scripts/train.py --steps {{steps}} --batch-size {{batch_size}} --data-path {{data_path}}
