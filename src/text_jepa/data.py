@@ -117,6 +117,8 @@ def ensure_predictor_tokens(tokenizer, predictors):
 def _normalize_token_ids(token_ids):
     if isinstance(token_ids, torch.Tensor):
         return token_ids.tolist()
+    if hasattr(token_ids, "encodings") and token_ids.encodings:
+        return list(token_ids.encodings[0].ids)
     if hasattr(token_ids, "ids"):
         return list(token_ids.ids)
     if isinstance(token_ids, dict):
