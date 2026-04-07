@@ -44,3 +44,36 @@ def test_checkpoint_roundtrip_restores_model_optimizer_and_step(tmp_path):
     for before, after in zip(model.parameters(), restored_model.parameters()):
         assert torch.equal(before, after)
     assert restored_optimizer.state_dict()["state"]
+
+
+def test_resolve_resume_path_prefers_explicit_path_and_supports_auto_resume(tmp_path):
+    explicit = tmp_path / "explicit.pt"
+    explicit.write_text("x", encoding="utf-8")
+    latest = tmp_path / "latest.pt"
+    latest.write_text("y", encoding="utf-8")
+
+    assert train_script.resolve_resume_path(explicit, tmp_path, auto_resume=True) == explicit
+    assert train_script.resolve_resume_path(None, tmp_path, auto_resume=True) == latest
+    assert train_script.resolve_resume_path(None, tmp_path, auto_resume=False) is None
+
+
+def test_evaluate_averages_loss_and_restores_train_mode():
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._losses = iter([torch.tensor(2.0), torch.tensor(4.0)])
+
+        def forward(self, **_batch):
+            return {"loss": next(self._losses)}
+
+    dataloader = [
+        {"x": torch.tensor([1.0])},
+        {"x": torch.tensor([2.0])},
+    ]
+    model = DummyModel()
+    model.train()
+
+    loss = train_script.evaluate(model, dataloader, "cpu", max_batches=2)
+
+    assert loss == 3.0
+    assert model.training
