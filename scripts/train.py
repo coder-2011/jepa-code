@@ -127,35 +127,33 @@ def main():
     model = build_model(config, tokenizer, args.predictor_num_layers).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    run = wandb.init(
+    with wandb.init(
         project=args.wandb_project,
         name=args.wandb_name,
         mode=choose_wandb_mode(args.wandb_mode),
         config=build_run_config(args, config, dataset_size),
-    )
+    ) as run:
+        step = 0
+        while step < args.steps:
+            for batch in dataloader:
+                batch = move_batch_to_device(batch, args.device)
+                outputs = train_step(model, optimizer, batch)
+                loss_value = outputs["loss"].item()
 
-    step = 0
-    while step < args.steps:
-        for batch in dataloader:
-            batch = move_batch_to_device(batch, args.device)
-            outputs = train_step(model, optimizer, batch)
-            loss_value = outputs["loss"].item()
+                step += 1
+                run.log(
+                    {
+                        "train/loss": loss_value,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/step": step,
+                        "train/batch_size": batch["input_ids_full"].shape[0],
+                    },
+                    step=step,
+                )
+                print(f"step={step} loss={loss_value:.6f}")
 
-            step += 1
-            run.log(
-                {
-                    "train/loss": loss_value,
-                    "train/step": step,
-                    "train/batch_size": batch["input_ids_full"].shape[0],
-                },
-                step=step,
-            )
-            print(f"step={step} loss={loss_value:.6f}")
-
-            if step >= args.steps:
-                break
-
-    run.finish()
+                if step >= args.steps:
+                    break
 
 
 if __name__ == "__main__":
