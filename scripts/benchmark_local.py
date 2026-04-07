@@ -21,6 +21,7 @@ from text_jepa.benchmarking import (  # noqa: E402
     benchmark_messages,
     dataset_task_name,
     gold_text,
+    is_synth_like_dataset,
     load_existing,
     load_rows,
     prompt_text,
@@ -302,7 +303,7 @@ def benchmark(args: argparse.Namespace) -> dict:
     existing = {} if args.force else load_existing(output_path)
     model, tokenizer, is_llm_jepa_checkpoint = load_local_model(args)
     task_name = dataset_task_name(dataset_path.name)
-    api_key = require_openrouter_api_key() if task_name == "synth" else None
+    api_key = require_openrouter_api_key() if is_synth_like_dataset(dataset_path.name) else None
     session = requests.Session()
 
     completed = 0
@@ -365,7 +366,7 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "judge_reason": None,
                         "error": None,
                     }
-                    if task_name == "synth":
+                    if is_synth_like_dataset(dataset_path.name):
                         judged, closeness, reason = judge_synth_prediction(
                             session,
                             api_key=api_key,

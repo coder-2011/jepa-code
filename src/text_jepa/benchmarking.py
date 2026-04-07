@@ -59,6 +59,11 @@ def dataset_task_name(dataset_name: str) -> str:
     return stem
 
 
+def is_synth_like_dataset(dataset_name: str) -> bool:
+    task_name = dataset_task_name(dataset_name)
+    return task_name == "synth" or task_name.endswith("_synth")
+
+
 def benchmark_messages(
     messages: list[dict[str, str]],
     *,
@@ -70,7 +75,7 @@ def benchmark_messages(
         return prompt_messages
 
     instructions = [ANSWER_ONLY]
-    if dataset_task_name(dataset_name) == "synth":
+    if is_synth_like_dataset(dataset_name):
         instructions.append(SYNTH_STYLE)
 
     if prompt_messages and prompt_messages[0]["role"] == "system":
@@ -153,4 +158,3 @@ def score_prediction(
         return any(answer in target for answer in prediction.split("; "))
 
     return prediction == target
-
