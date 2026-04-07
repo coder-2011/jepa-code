@@ -1,4 +1,5 @@
 from .batching import collate_masked_examples
+from .benchmarking import benchmark_messages, score_prediction
 from .data import (
     FineWebJsonlDataset,
     LLMJEPAPairedJsonlDataset,
@@ -28,6 +29,7 @@ from .utils.ema import update_ema
 
 __all__ = [
     "build_target_mask",
+    "benchmark_messages",
     "collate_masked_examples",
     "Encoder",
     "EncoderTower",
@@ -44,6 +46,7 @@ __all__ = [
     "mask_text_from_yaml",
     "masked_latent_mse",
     "Predictor",
+    "score_prediction",
     "sample_word_blocks",
     "create_fineweb_dataloader",
     "create_llm_jepa_dataloader",

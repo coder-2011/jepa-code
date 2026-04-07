@@ -5,6 +5,9 @@ venv := ".venv"
 test-batching:
     source {{venv}}/bin/activate && pytest tests/test_batching.py
 
+test-benchmarking:
+    source {{venv}}/bin/activate && pytest tests/test_benchmarking.py
+
 test-embeddings:
     source {{venv}}/bin/activate && pytest tests/test_embeddings.py
 
@@ -24,7 +27,7 @@ test-train-checkpointing:
     source {{venv}}/bin/activate && pytest tests/test_train_checkpointing.py
 
 all-tests:
-    source {{venv}}/bin/activate && pytest tests/test_batching.py tests/test_embeddings.py tests/test_fineweb_dataloader.py tests/test_llm_jepa.py tests/test_masking.py tests/test_tokenization.py tests/test_train_checkpointing.py
+    source {{venv}}/bin/activate && pytest tests/test_batching.py tests/test_benchmarking.py tests/test_embeddings.py tests/test_fineweb_dataloader.py tests/test_llm_jepa.py tests/test_masking.py tests/test_tokenization.py tests/test_train_checkpointing.py
 
 download-fineweb-sample max_bytes="5242880" name="CC-MAIN-2024-10" output="tmp/fineweb-sample.jsonl":
     source {{venv}}/bin/activate && python scripts/download_fineweb_sample.py --name {{name}} --max-bytes {{max_bytes}} --output {{output}}

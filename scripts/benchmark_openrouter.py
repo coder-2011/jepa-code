@@ -11,23 +11,25 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "llm-jepa"))
+sys.path.insert(0, str(ROOT / "src"))
 
-from evaluate import eval as official_eval  # noqa: E402
+from text_jepa.benchmarking import (  # noqa: E402
+    append_result,
+    benchmark_messages,
+    dataset_task_name,
+    gold_text,
+    load_existing,
+    load_rows,
+    prompt_text,
+    score_prediction,
+)
+from text_jepa.env import load_local_env  # noqa: E402
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "qwen/qwen3.5-397b-a17b"
 DEFAULT_DATASET = ROOT / "llm-jepa" / "datasets" / "synth_test.jsonl"
 DEFAULT_OUTPUT = ROOT / "tmp" / "openrouter_benchmark_results.jsonl"
-ANSWER_ONLY = (
-    "Return only the final answer. Do not explain. Do not use markdown. "
-    "Do not include code fences. Do not include any extra text."
-)
-SYNTH_STYLE = (
-    "Use the dataset's regex notation. Use ~ for negation and & for conjunction when needed. "
-    "Do not add anchors like ^ or $. Return only the regex expression."
-)
 SYNTH_JUDGE_PROMPT = (
     "You are grading a regex answer. Decide whether the candidate regex is functionally correct for "
     "the natural-language request. Ignore formatting differences and minor syntax variation if the "
@@ -39,70 +41,11 @@ class RateLimitExceeded(RuntimeError):
     pass
 
 
-def load_env(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
-
-
 def require_api_key() -> str:
-    load_env(ROOT / ".env.local")
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is required in the environment or .env.local")
     return api_key
-
-
-def load_rows(dataset_path: Path, max_examples: int | None) -> list[dict]:
-    rows = []
-    with dataset_path.open("r", encoding="utf-8") as handle:
-        for index, line in enumerate(handle):
-            if max_examples is not None and index >= max_examples:
-                break
-            rows.append(json.loads(line))
-    if not rows:
-        raise ValueError(f"No rows loaded from {dataset_path}")
-    return rows
-
-
-def load_existing(output_path: Path) -> dict[int, dict]:
-    if not output_path.exists():
-        return {}
-    existing = {}
-    with output_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "index" in row:
-                existing[int(row["index"])] = row
-    return existing
-
-
-def benchmark_messages(
-    messages: list[dict[str, str]],
-    *,
-    dataset_name: str,
-    strict_answer_only: bool,
-) -> list[dict[str, str]]:
-    prompt_messages = [dict(message) for message in messages[:-1]]
-    instructions = []
-    if not strict_answer_only:
-        return prompt_messages
-    instructions.append(ANSWER_ONLY)
-    if dataset_name.startswith("synth"):
-        instructions.append(SYNTH_STYLE)
-    if prompt_messages and prompt_messages[0]["role"] == "system":
-        prompt_messages[0]["content"] = prompt_messages[0]["content"].rstrip() + "\n\n" + "\n".join(instructions)
-    else:
-        prompt_messages.insert(0, {"role": "system", "content": "\n".join(instructions)})
-    return prompt_messages
 
 
 def request_prediction(
@@ -122,13 +65,11 @@ def request_prediction(
         "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
-        "reasoning": {
-            "effort": "none",
-            "exclude": True,
-        },
+        "reasoning": {"effort": "none", "exclude": True},
     }
     if response_format is not None:
         payload["response_format"] = response_format
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -152,19 +93,6 @@ def request_prediction(
     raise RateLimitExceeded("OpenRouter rate limit retries exhausted")
 
 
-def evaluate_prediction(prediction: str, row: dict, dataset_name: str) -> bool:
-    return bool(
-        official_eval(
-            prediction,
-            row["messages"],
-            dataset_name,
-            spider_path="",
-            startswith=False,
-            debug=0,
-        )
-    )
-
-
 def judge_synth_prediction(
     session: requests.Session,
     *,
@@ -176,25 +104,24 @@ def judge_synth_prediction(
     retries: int,
     retry_sleep: float,
 ) -> tuple[bool | None, str | None]:
-    messages = [
-        {"role": "system", "content": SYNTH_JUDGE_PROMPT},
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "instruction": row["messages"][1]["content"],
-                    "gold_regex": row["messages"][2]["content"],
-                    "candidate_regex": prediction,
-                },
-                ensure_ascii=True,
-            ),
-        },
-    ]
     raw = request_prediction(
         session,
         api_key=api_key,
         model=judge_model,
-        messages=messages,
+        messages=[
+            {"role": "system", "content": SYNTH_JUDGE_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "instruction": row["messages"][1]["content"],
+                        "gold_regex": row["messages"][2]["content"],
+                        "candidate_regex": prediction,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
         max_tokens=128,
         timeout=timeout,
         retries=retries,
@@ -210,11 +137,6 @@ def judge_synth_prediction(
     return (bool(correct) if isinstance(correct, bool) else None), reason if isinstance(reason, str) else None
 
 
-def append_result(handle, result: dict) -> None:
-    handle.write(json.dumps(result) + "\n")
-    handle.flush()
-
-
 def benchmark(args: argparse.Namespace) -> dict:
     dataset_path = Path(args.dataset)
     output_path = Path(args.output)
@@ -225,6 +147,7 @@ def benchmark(args: argparse.Namespace) -> dict:
     rows = load_rows(dataset_path, args.max_examples)
     existing = {} if args.force else load_existing(output_path)
     api_key = require_api_key()
+    task_name = dataset_task_name(dataset_path.name)
     session = requests.Session()
 
     completed = 0
@@ -258,16 +181,22 @@ def benchmark(args: argparse.Namespace) -> dict:
                     )
                     result = {
                         "index": index,
-                        "prompt": row["messages"][1]["content"],
-                        "gold": row["messages"][2]["content"],
+                        "prompt": prompt_text(row),
+                        "gold": gold_text(row),
                         "prediction": prediction,
-                        "match_exact": evaluate_prediction(prediction, row, dataset_path.name),
+                        "match_exact": score_prediction(
+                            prediction,
+                            row,
+                            dataset_path.name,
+                            spider_path=args.spider_path,
+                            startswith=args.startswith,
+                        ),
                         "match": None,
                         "match_relaxed": None,
                         "judge_reason": None,
                         "error": None,
                     }
-                    if dataset_path.name.startswith("synth"):
+                    if task_name == "synth":
                         judged, reason = judge_synth_prediction(
                             session,
                             api_key=api_key,
@@ -289,8 +218,8 @@ def benchmark(args: argparse.Namespace) -> dict:
                 except Exception as error:  # noqa: BLE001
                     result = {
                         "index": index,
-                        "prompt": row["messages"][1]["content"],
-                        "gold": row["messages"][2]["content"],
+                        "prompt": prompt_text(row),
+                        "gold": gold_text(row),
                         "prediction": "",
                         "match_exact": False,
                         "match": False,
@@ -330,7 +259,7 @@ def benchmark(args: argparse.Namespace) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark an OpenRouter model on llm-jepa datasets.")
+    parser = argparse.ArgumentParser(description="Benchmark an OpenRouter model on local LLM-JEPA datasets.")
     parser.add_argument("--dataset", default=str(DEFAULT_DATASET))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -342,11 +271,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no-strict-answer-only", action="store_true")
     parser.add_argument("--judge-model")
+    parser.add_argument("--spider-path", default=str(ROOT / "llm-jepa" / "spider_data" / "database"))
+    parser.add_argument("--startswith", action="store_true")
     parser.add_argument("--include-exact", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
+    load_local_env(ROOT)
     print(json.dumps(benchmark(parse_args()), indent=2))
 
 
