@@ -9,3 +9,4 @@
 - Prefer RMSNorm over LayerNorm for the Layer encoder stack; when using `nn.TransformerEncoderLayer`, replace the built-in norms with `nn.RMSNorm` and keep the final encoder norm consistent.
 - Keep EMA compact as a single `update_ema(target_module, source_module, momentum)` function; `momentum=0.0` acts as the initialization copy and ongoing updates should read `model.ema_momentum` from YAML.
 - For tiny FineWeb experiments, use a local JSONL sample and filter by `token_count` / `language_score` before training; the dataset path should mask deterministically per example via `Random(seed + index)` so dataloader shuffling does not change the masking contract.
+- Keep the Layer batch boundary aligned with the collated dataset output: `LayerModel.forward` should accept the full batch dict shape, including currently unused `target_mask` and `target_token_ids`, so `model(**batch)` works in the trainer without special filtering.

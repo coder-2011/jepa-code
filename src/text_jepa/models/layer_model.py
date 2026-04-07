@@ -53,7 +53,16 @@ class LayerModel(nn.Module):
         )
         update_ema(self.target_tower, self.context_tower, momentum=0.0)
 
-    def forward(self, input_ids_full, input_ids_ctx, attention_mask, target_positions, target_valid_mask):
+    def forward(
+        self,
+        input_ids_full,
+        input_ids_ctx,
+        attention_mask,
+        target_positions,
+        target_valid_mask,
+        target_mask=None,
+        target_token_ids=None,
+    ):
         for name, tensor, shape_name in (
             ("input_ids_full", input_ids_full, "(B, L)"),
             ("input_ids_ctx", input_ids_ctx, "(B, L)"),

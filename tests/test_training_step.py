@@ -24,7 +24,9 @@ def make_batch():
         "input_ids_full": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long),
         "input_ids_ctx": torch.tensor([[1, 9, 3, 4], [5, 6, 9, 0]], dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.long),
+        "target_mask": torch.tensor([[False, True, False, True], [False, False, True, False]]),
         "target_positions": torch.tensor([[1, 3], [2, 0]], dtype=torch.long),
+        "target_token_ids": torch.tensor([[2, 4], [7, 0]], dtype=torch.long),
         "target_valid_mask": torch.tensor([[True, False], [True, False]]),
     }
 
