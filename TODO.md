@@ -1,1 +1,1 @@
-- [ ] Change masking strategy to parallel that of the LLM-JEPA
+- [ ] Add LLM-JEPA-style custom attention masking in a later pass; keep the first pass span-based without that mask logic

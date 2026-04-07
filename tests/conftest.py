@@ -1,0 +1,73 @@
+import re
+import sys
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+class FakeTokenizer:
+    def __init__(self, has_mask_token=True):
+        self.is_fast = True
+        self.pad_token = "<pad>"
+        self.pad_token_id = 0
+        self.eos_token = "<eos>"
+        self.eos_token_id = 1
+        self.bos_token_id = 2
+        self.mask_token = "[MASK]" if has_mask_token else None
+        self.mask_token_id = 99 if has_mask_token else None
+
+    def add_special_tokens(self, mapping):
+        self.mask_token = mapping["mask_token"]
+        self.mask_token_id = 99
+        return 1
+
+    def __len__(self):
+        return 128
+
+    def __call__(
+        self,
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=32,
+        return_attention_mask=True,
+        return_offsets_mapping=True,
+        return_special_tokens_mask=True,
+    ):
+        if isinstance(text, list):
+            raise NotImplementedError("FakeTokenizer only supports single examples in tests")
+
+        input_ids = [self.bos_token_id]
+        attention_mask = [1]
+        offset_mapping = [(0, 0)]
+        special_tokens_mask = [1]
+
+        for index, match in enumerate(re.finditer(r"\S+", text)):
+            input_ids.append(10 + index)
+            attention_mask.append(1)
+            offset_mapping.append((match.start(), match.end()))
+            special_tokens_mask.append(0)
+
+        input_ids.append(self.eos_token_id)
+        attention_mask.append(1)
+        offset_mapping.append((0, 0))
+        special_tokens_mask.append(1)
+
+        input_ids = input_ids[:max_length]
+        attention_mask = attention_mask[:max_length]
+        offset_mapping = offset_mapping[:max_length]
+        special_tokens_mask = special_tokens_mask[:max_length]
+
+        while len(input_ids) < max_length:
+            input_ids.append(self.pad_token_id)
+            attention_mask.append(0)
+            offset_mapping.append((0, 0))
+            special_tokens_mask.append(1)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "offset_mapping": offset_mapping,
+            "special_tokens_mask": special_tokens_mask,
+        }
