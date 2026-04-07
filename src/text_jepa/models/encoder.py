@@ -27,12 +27,14 @@ class Encoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        layer.norm1 = nn.RMSNorm(hidden_dim)
+        layer.norm2 = nn.RMSNorm(hidden_dim)
         self.encoder = nn.TransformerEncoder(
             layer,
             num_layers=num_layers,
             enable_nested_tensor=False,
         )
-        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.final_norm = nn.RMSNorm(hidden_dim)
 
     def forward(self, x, attention_mask=None):
         if x.ndim != 3:

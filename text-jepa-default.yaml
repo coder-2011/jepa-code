@@ -9,3 +9,8 @@ masking:
 
 model:
   hidden_dim: 768
+  num_heads: 12
+  num_layers: 6
+  ffn_dim: 3072
+  dropout: 0.0
+  norm: rms
