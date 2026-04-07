@@ -7,6 +7,7 @@ from datasets import load_dataset
 
 def parse_args():
     parser = ArgumentParser()
+    # Default values target a tiny local sample rather than a full dataset mirror.
     parser.add_argument("--name", default="CC-MAIN-2024-10")
     parser.add_argument("--split", default="train")
     parser.add_argument("--max-bytes", type=int, default=5 * 1024 * 1024)
@@ -20,6 +21,7 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Stream the dataset so sample creation does not require downloading a full FineWeb shard first.
     dataset = load_dataset(
         "HuggingFaceFW/fineweb",
         name=args.name,
@@ -35,6 +37,7 @@ def main():
             if not text:
                 continue
 
+            # Keep enough metadata for later filtering while still writing a compact JSONL format.
             record = {
                 "text": text,
                 "id": example.get("id"),
@@ -50,6 +53,7 @@ def main():
             written_bytes += len(encoded)
             written_docs += 1
 
+            # Stop as soon as either budget is exhausted so the output remains bounded.
             if written_bytes >= args.max_bytes or written_docs >= args.max_docs:
                 break
 
