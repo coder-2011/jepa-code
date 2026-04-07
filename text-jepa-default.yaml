@@ -6,3 +6,6 @@ tokenizer:
 masking:
   mask_ratio: 0.15
   max_block_words: 2
+
+model:
+  hidden_dim: 768
