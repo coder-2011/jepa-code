@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--predictors", type=int, default=1)
     parser.add_argument("--lambda-jepa", type=float, default=1.0)
     parser.add_argument("--gamma-lm", type=float, default=1.0)
+    parser.add_argument("--ema-momentum", type=float, default=0.996)
     parser.add_argument("--jepa-metric", default="cosine")
     parser.add_argument("--max-docs", type=int)
     parser.add_argument("--seed", type=int, default=0)
@@ -94,6 +95,7 @@ def build_model(args, config, tokenizer):
         lambda_jepa=args.lambda_jepa,
         gamma_lm=args.gamma_lm,
         jepa_metric=args.jepa_metric,
+        ema_momentum=args.ema_momentum,
     )
 
 
@@ -109,6 +111,7 @@ def build_run_config(args, config, dataset_size, max_length):
         "predictors": args.predictors,
         "lambda_jepa": args.lambda_jepa,
         "gamma_lm": args.gamma_lm,
+        "ema_momentum": args.ema_momentum,
         "jepa_metric": args.jepa_metric,
         "checkpoint_dir": args.checkpoint_dir,
         "save_every": args.save_every,

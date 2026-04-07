@@ -194,7 +194,7 @@ def test_llm_jepa_model_combines_lm_and_jepa_losses(tmp_path):
             pad_token_id=tokenizer.pad_token_id,
         )
     )
-    model = LLMJEPAModel(backbone, lambda_jepa=0.5, gamma_lm=1.0)
+    model = LLMJEPAModel(backbone, lambda_jepa=0.5, gamma_lm=1.0, ema_momentum=0.9)
 
     outputs = model(**batch)
 
@@ -202,6 +202,44 @@ def test_llm_jepa_model_combines_lm_and_jepa_losses(tmp_path):
     assert outputs["lm_loss"].ndim == 0
     assert outputs["jepa_loss"].ndim == 0
     assert torch.allclose(outputs["loss"], outputs["lm_loss"] + 0.5 * outputs["jepa_loss"])
+    assert not outputs["target_embeddings"].requires_grad
+
+
+def test_llm_jepa_target_backbone_is_gradient_free(tmp_path):
+    data_path = tmp_path / "paired.jsonl"
+    write_messages_jsonl(data_path)
+    tokenizer = FakeChatTokenizer()
+    dataloader = create_llm_jepa_dataloader(
+        jsonl_path=data_path,
+        tokenizer=tokenizer,
+        max_length=24,
+        batch_size=2,
+        predictors=1,
+    )
+    batch = next(iter(dataloader))
+
+    backbone = GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=len(tokenizer),
+            n_positions=24,
+            n_ctx=24,
+            n_embd=16,
+            n_layer=2,
+            n_head=2,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    )
+    model = LLMJEPAModel(backbone, ema_momentum=0.5)
+
+    for parameter in model.target_backbone.parameters():
+        assert not parameter.requires_grad
+
+    outputs = model(**batch)
+    outputs["loss"].backward()
+
+    assert any(parameter.grad is not None for parameter in model.backbone.parameters())
+    assert all(parameter.grad is None for parameter in model.target_backbone.parameters())
 
 
 def test_train_llm_jepa_step_updates_parameters(tmp_path):
@@ -229,14 +267,19 @@ def test_train_llm_jepa_step_updates_parameters(tmp_path):
             pad_token_id=tokenizer.pad_token_id,
         )
     )
-    model = LLMJEPAModel(backbone)
+    model = LLMJEPAModel(backbone, ema_momentum=0.5)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    before = [parameter.detach().clone() for parameter in model.parameters()]
+    before = [parameter.detach().clone() for parameter in model.backbone.parameters()]
+    target_before = [parameter.detach().clone() for parameter in model.target_backbone.parameters()]
 
     outputs = train_llm_jepa_step(model, optimizer, batch)
 
     assert outputs["loss"].ndim == 0
     assert any(
         not torch.equal(previous, current)
-        for previous, current in zip(before, model.parameters())
+        for previous, current in zip(before, model.backbone.parameters())
+    )
+    assert any(
+        not torch.equal(previous, current)
+        for previous, current in zip(target_before, model.target_backbone.parameters())
     )
