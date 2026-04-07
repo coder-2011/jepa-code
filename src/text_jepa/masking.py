@@ -82,9 +82,13 @@ def count_maskable_tokens(attention_mask, special_tokens_mask):
     return total
 
 
-def build_candidate_blocks(word_to_tokens, max_block_words):
-    candidates = []
+def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng):
+    selected_blocks = []
+    used_word_indices = set()
+    masked_token_count = 0
 
+    # Consider all 1..max_block_words blocks so we can choose the best fit for the remaining budget.
+    candidate_blocks = []
     for start_index in range(len(word_to_tokens)):
         token_count = 0
         max_end_index = min(start_index + max_block_words, len(word_to_tokens))
@@ -93,24 +97,13 @@ def build_candidate_blocks(word_to_tokens, max_block_words):
             token_count += (
                 word_to_tokens[end_index - 1]["token_end"] - word_to_tokens[end_index - 1]["token_start"]
             )
-            candidates.append(
+            candidate_blocks.append(
                 {
                     "start_index": start_index,
                     "end_index": end_index,
                     "token_count": token_count,
                 }
             )
-
-    return candidates
-
-
-def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng):
-    selected_blocks = []
-    used_word_indices = set()
-    masked_token_count = 0
-
-    # Consider all 1..max_block_words blocks so we can choose the best fit for the remaining budget.
-    candidate_blocks = build_candidate_blocks(word_to_tokens, max_block_words)
 
     while masked_token_count < target_token_budget:
         remaining_budget = target_token_budget - masked_token_count
@@ -162,6 +155,27 @@ def extract_target_positions(input_ids_full, target_mask):
     return target_positions, target_token_ids
 
 
+def build_target_mask(word_to_tokens, selected_blocks, sequence_length):
+    target_mask = torch.zeros(sequence_length, dtype=torch.bool)
+    masked_span_ranges_word = []
+    masked_span_ranges_token = []
+
+    for block_start, block_end in selected_blocks:
+        block = word_to_tokens[block_start:block_end]
+        # Collapse each chosen word block into one contiguous token span for masking.
+        token_start = min(item["token_start"] for item in block)
+        token_end = max(item["token_end"] for item in block)
+        word_start = min(item["word_index"] for item in block)
+        word_end = max(item["word_index"] for item in block) + 1
+
+        # Keep both word-space and token-space ranges for debugging and future inspections.
+        target_mask[token_start:token_end] = True
+        masked_span_ranges_word.append((word_start, word_end))
+        masked_span_ranges_token.append((token_start, token_end))
+
+    return target_mask, masked_span_ranges_word, masked_span_ranges_token
+
+
 def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None):
     if rng is None:
         # Local RNG keeps call sites deterministic when they pass an explicit seeded Random.
@@ -196,23 +210,11 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
         rng,
     )
 
-    target_mask = torch.zeros(input_ids_full.shape[0], dtype=torch.bool)
-    masked_span_ranges_word = []
-    masked_span_ranges_token = []
-
-    for block_start, block_end in selected_blocks:
-        block = word_to_tokens[block_start:block_end]
-        # Collapse each chosen word block into one contiguous token span for masking.
-        token_start = min(item["token_start"] for item in block)
-        token_end = max(item["token_end"] for item in block)
-        word_start = min(item["word_index"] for item in block)
-        word_end = max(item["word_index"] for item in block) + 1
-
-        # Keep both word-space and token-space ranges for debugging and future inspections.
-        target_mask[token_start:token_end] = True
-        masked_span_ranges_word.append((word_start, word_end))
-        masked_span_ranges_token.append((token_start, token_end))
-
+    target_mask, masked_span_ranges_word, masked_span_ranges_token = build_target_mask(
+        word_to_tokens,
+        selected_blocks,
+        input_ids_full.shape[0],
+    )
     input_ids_ctx = apply_mask(input_ids_full, target_mask, tokenizer.mask_token_id)
     target_positions, target_token_ids = extract_target_positions(input_ids_full, target_mask)
 
