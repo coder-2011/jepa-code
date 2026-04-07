@@ -13,6 +13,7 @@ def gather_target_states(target_states, target_positions):
     if torch.any(target_positions < 0) or torch.any(target_positions >= sequence_length):
         raise ValueError("target_positions must be within [0, sequence_length)")
 
+    # Expand positions across D so gather returns one latent vector per requested target slot.
     gather_index = target_positions.unsqueeze(-1).expand(-1, -1, hidden_dim)
     return torch.gather(target_states, dim=1, index=gather_index)
 
@@ -33,7 +34,9 @@ def masked_latent_mse(predictions, targets, target_valid_mask):
     if not torch.any(valid_mask):
         raise ValueError("target_valid_mask must include at least one valid target")
 
+    # Squared error is computed densely first, then padded slots are zeroed out.
     squared_error = (predictions - targets).pow(2)
     expanded_mask = valid_mask.unsqueeze(-1).to(squared_error.dtype)
     masked_squared_error = squared_error * expanded_mask
+    # Average over valid target vectors, not over padded slots.
     return masked_squared_error.sum() / expanded_mask.sum().mul(predictions.shape[-1])

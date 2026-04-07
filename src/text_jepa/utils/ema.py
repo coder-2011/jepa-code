@@ -6,6 +6,7 @@ def update_ema(target_module, source_module, momentum):
     if not isinstance(momentum, (int, float)) or not 0.0 <= momentum <= 1.0:
         raise ValueError("momentum must be in the range [0.0, 1.0]")
 
+    # Match parameters by name so architectural drift fails loudly instead of silently misaligning tensors.
     target_parameters = dict(target_module.named_parameters())
     source_parameters = dict(source_module.named_parameters())
     if target_parameters.keys() != source_parameters.keys():
@@ -15,6 +16,7 @@ def update_ema(target_module, source_module, momentum):
         source_parameter = source_parameters[name]
         if target_parameter.shape != source_parameter.shape:
             raise ValueError(f"parameter shape mismatch for {name}")
+        # momentum=0.0 becomes a hard copy; larger momentum turns this into the usual EMA interpolation.
         target_parameter.mul_(momentum).add_(source_parameter, alpha=1.0 - momentum)
 
     target_buffers = dict(target_module.named_buffers())
@@ -26,4 +28,5 @@ def update_ema(target_module, source_module, momentum):
         source_buffer = source_buffers[name]
         if target_buffer.shape != source_buffer.shape:
             raise ValueError(f"buffer shape mismatch for {name}")
+        # Buffers are copied exactly because running stats should not lag behind through EMA mixing.
         target_buffer.copy_(source_buffer)

@@ -62,7 +62,7 @@ def test_encoder_state_dict_load_round_trip():
     x = torch.randn(2, 5, 8)
     attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]], dtype=torch.long)
 
-    # A load round-trip should preserve the encoder's exact computation.
+    # Exact equality is expected here because both encoders run in eval-like deterministic conditions.
     reloaded.load_state_dict(encoder.state_dict())
 
     original_output = encoder(x, attention_mask=attention_mask)

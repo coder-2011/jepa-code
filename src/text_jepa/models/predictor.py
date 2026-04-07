@@ -33,9 +33,12 @@ class Predictor(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.max_length = max_length
+        # One learned seed vector gives every target slot a shared latent starting point.
         self.query_seed = nn.Parameter(torch.zeros(hidden_dim))
+        # Absolute position embeddings tell the predictor which token slot each query refers to.
         self.position_embedding = nn.Embedding(max_length, hidden_dim)
 
+        # The predictor is decoder-shaped because target queries attend into context memory.
         layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -45,6 +48,7 @@ class Predictor(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        # Keep normalization style aligned with the encoder towers.
         layer.norm1 = make_rms_norm(hidden_dim)
         layer.norm2 = make_rms_norm(hidden_dim)
         layer.norm3 = make_rms_norm(hidden_dim)
@@ -76,12 +80,15 @@ class Predictor(nn.Module):
         if torch.any(target_positions < 0) or torch.any(target_positions >= self.max_length):
             raise ValueError("target_positions must be within [0, max_length)")
 
+        # Queries are position-conditioned rather than copied from masked context states.
         target_queries = self.position_embedding(target_positions)
         target_queries = target_queries + self.query_seed.view(1, 1, -1)
 
+        # Both masks are inverted here because PyTorch decoder masks mark positions to suppress.
         memory_key_padding_mask = attention_mask == 0
         target_key_padding_mask = ~target_valid_mask.to(torch.bool)
 
+        # Output stays aligned with padded target slots so the loss can apply target_valid_mask directly.
         predicted_states = self.decoder(
             tgt=target_queries,
             memory=context_states,

@@ -13,6 +13,7 @@ class TextEmbeddings(nn.Module):
         if hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive")
 
+        # Keep token and position tables separate so later encoder changes do not affect input semantics.
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_length, hidden_dim)
 
@@ -21,13 +22,15 @@ class TextEmbeddings(nn.Module):
             raise ValueError("input_ids must have shape (B, L)")
 
         batch_size, sequence_length = input_ids.shape
+        # Position embeddings are learned only up to the configured training length.
         if sequence_length > self.position_embedding.num_embeddings:
             raise ValueError("sequence length exceeds the configured max_length")
 
-        # Build one position index per token slot, then broadcast it across the batch.
+        # Build the same absolute position grid for every example in the batch.
         position_ids = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0)
         position_ids = position_ids.expand(batch_size, sequence_length)
 
+        # The embedding contract is shape-preserving on the batch and sequence axes.
         token_embeddings = self.token_embedding(input_ids)
         position_embeddings = self.position_embedding(position_ids)
         return token_embeddings + position_embeddings

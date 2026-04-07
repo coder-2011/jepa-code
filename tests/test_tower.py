@@ -18,6 +18,7 @@ def test_encoder_tower_returns_bld_shape():
 
     output = tower(input_ids, attention_mask=attention_mask)
 
+    # The tower is just embeddings plus encoder, so it should preserve the sequence axis.
     assert output.shape == (2, 3, 8)
 
 
@@ -59,6 +60,7 @@ def test_encoder_tower_matches_embedding_then_encoder_contract():
     )
     tower_output = tower(input_ids, attention_mask=attention_mask)
 
+    # This checks the tower adds no hidden behavior beyond composing its two submodules.
     assert torch.equal(tower_output, manual_output)
 
 
@@ -80,6 +82,7 @@ def test_update_ema_can_hard_sync_two_towers():
         ffn_dim=32,
     )
 
+    # momentum=0.0 should make the target tower an exact copy of the context tower.
     update_ema(target_tower, context_tower, momentum=0.0)
 
     for target_parameter, context_parameter in zip(

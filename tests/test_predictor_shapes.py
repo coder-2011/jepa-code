@@ -27,6 +27,7 @@ def test_predictor_returns_btd_shape():
 
     output = predictor(context_states, attention_mask, target_positions, target_valid_mask)
 
+    # Predictor output is indexed by padded target slots, not full sequence length.
     assert output.shape == (2, 3, 8)
 
 
@@ -37,6 +38,7 @@ def test_predictor_accepts_padded_target_slots():
 
     output = predictor(context_states, attention_mask, target_positions, target_valid_mask)
 
+    # Invalid target slots remain present in shape and are masked semantically rather than structurally removed.
     assert output.shape == (2, 3, 8)
 
 
@@ -75,6 +77,7 @@ def test_predictor_output_depends_on_target_positions():
     output_a = predictor(context_states, attention_mask, target_positions, target_valid_mask)
     output_b = predictor(context_states, attention_mask, shifted_positions, target_valid_mask)
 
+    # Query position embeddings should make the same context produce different outputs at different slots.
     assert not torch.allclose(output_a, output_b)
 
 
@@ -87,4 +90,5 @@ def test_predictor_output_depends_on_context_states():
     output_a = predictor(context_states, attention_mask, target_positions, target_valid_mask)
     output_b = predictor(shifted_context, attention_mask, target_positions, target_valid_mask)
 
+    # Decoder cross-attention should make predictions responsive to context-side latent changes.
     assert not torch.allclose(output_a, output_b)

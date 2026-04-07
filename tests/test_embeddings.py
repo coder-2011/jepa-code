@@ -9,7 +9,7 @@ def test_text_embeddings_returns_bld_shape():
 
     output = embeddings(input_ids)
 
-    # The embedding layer should turn integer token ids (B, L) into dense token vectors (B, L, D).
+    # Embeddings should add features while preserving batch and sequence axes.
     assert output.shape == (2, 3, 8)
 
 
@@ -19,5 +19,5 @@ def test_text_embeddings_use_position_information():
 
     output = embeddings(input_ids)
 
-    # Repeated token ids at different positions should still differ after adding position embeddings.
+    # Repeated token ids should still separate once absolute position embeddings are added.
     assert not torch.equal(output[0, 0], output[0, 1])

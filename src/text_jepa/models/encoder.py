@@ -20,6 +20,7 @@ class Encoder(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in the range [0.0, 1.0)")
 
+        # v1 deliberately wraps PyTorch's stock encoder stack instead of introducing a custom attention block.
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -29,11 +30,13 @@ class Encoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        # Replace the built-in LayerNorms so the stack matches the repo's RMSNorm decision.
         layer.norm1 = make_rms_norm(hidden_dim)
         layer.norm2 = make_rms_norm(hidden_dim)
         self.encoder = nn.TransformerEncoder(
             layer,
             num_layers=num_layers,
+            # Nested tensor mode can rewrite padding behavior in ways that complicate shape debugging.
             enable_nested_tensor=False,
         )
         self.final_norm = make_rms_norm(hidden_dim)
@@ -48,7 +51,9 @@ class Encoder(nn.Module):
                 raise ValueError("attention_mask must have shape (B, L)")
             if attention_mask.shape != x.shape[:2]:
                 raise ValueError("attention_mask must match the first two dimensions of x")
+            # TransformerEncoder expects True at padded positions rather than visible positions.
             src_key_padding_mask = attention_mask == 0
 
+        # The encoder keeps the sequence dense: input and output stay (B, L, D).
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
         return self.final_norm(x)
