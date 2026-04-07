@@ -17,14 +17,14 @@ from conftest import FakeTokenizer, write_test_config
 def test_find_word_spans_basic_sentence():
     spans = find_word_spans("The quick brown fox")
 
-    # Word spans are half-open character ranges.
+    # Spans are half-open so they compose naturally with Python slicing conventions.
     assert spans == [(0, 3), (4, 9), (10, 15), (16, 19)]
 
 
 def test_find_word_spans_excludes_surrounding_punctuation():
     spans = find_word_spans("Hello, world! don't-stop")
 
-    # Punctuation should not create its own words or attach to surrounding words.
+    # The regex should keep punctuation outside the maskable units.
     assert spans == [(0, 5), (7, 12), (14, 24)]
 
 
@@ -40,7 +40,7 @@ def test_map_words_to_tokens_produces_token_ranges():
         encoded["special_tokens_mask"],
     )
 
-    # Each raw word should map to at least one token span in this simple tokenizer.
+    # Every visible word should map to a non-empty token span in this simple tokenizer.
     assert len(word_to_tokens) == 4
     assert all(item["token_start"] < item["token_end"] for item in word_to_tokens)
 
@@ -57,7 +57,7 @@ def test_mask_text_returns_required_contract():
         rng=random.Random(0),
     )
 
-    # Keep the top-level masking contract stable because later JEPA modules will depend on it.
+    # This key set is the top-level contract consumed by batching and training.
     assert set(output) == {
         "input_ids_full",
         "input_ids_ctx",
@@ -81,7 +81,7 @@ def test_masked_positions_are_replaced_in_context():
         rng=random.Random(0),
     )
 
-    # Every target position should be swapped to the mask token id on the context side.
+    # Target positions in the context view must actually hold the mask token id.
     assert torch.all(output["input_ids_ctx"][output["target_mask"]] == tokenizer.mask_token_id)
 
 
@@ -96,7 +96,7 @@ def test_unmasked_positions_are_unchanged():
         rng=random.Random(0),
     )
 
-    # The masker should not perturb visible context tokens.
+    # Visible context tokens should survive masking unchanged.
     assert torch.equal(
         output["input_ids_ctx"][~output["target_mask"]],
         output["input_ids_full"][~output["target_mask"]],
@@ -114,7 +114,7 @@ def test_target_positions_match_target_mask():
         rng=random.Random(0),
     )
 
-    # Positions are just the sparse form of the dense boolean target mask.
+    # target_positions is just the sparse encoding of the dense boolean target mask.
     expected = torch.nonzero(output["target_mask"], as_tuple=False).squeeze(-1)
     assert torch.equal(output["target_positions"], expected)
 
@@ -131,7 +131,7 @@ def test_no_special_tokens_are_masked():
         rng=random.Random(0),
     )
 
-    # Special tokens are marked explicitly and should never leak into the target mask.
+    # Special tokens should never participate in JEPA supervision.
     special_positions = torch.tensor(encoded["special_tokens_mask"], dtype=torch.bool)
     assert not torch.any(output["target_mask"] & special_positions)
 
@@ -147,7 +147,7 @@ def test_no_padding_tokens_are_masked():
         rng=random.Random(0),
     )
 
-    # Padding should be excluded even when max_length is larger than the text.
+    # Padding should also stay outside the target set even when max_length is larger than the text.
     padding_positions = output["attention_mask"] == 0
     assert not torch.any(output["target_mask"] & padding_positions)
 
@@ -163,7 +163,7 @@ def test_mask_ratio_is_approximate_not_exact():
         rng=random.Random(0),
     )
 
-    # Block masking is discrete, so we only expect a reasonable neighborhood around the target.
+    # Block masking is discrete, so the sampled count only needs to land near the requested ratio.
     masked_count = int(output["target_mask"].sum().item())
     assert 2 <= masked_count <= 5
 
@@ -179,7 +179,7 @@ def test_two_word_blocks_are_used_at_most():
         rng=random.Random(0),
     )
 
-    # The sampled word-space blocks should respect the configured upper bound.
+    # Word-space blocks should honor the configured upper bound on merged words.
     assert all(end - start <= 2 for start, end in output["masked_span_ranges_word"])
 
 
@@ -198,7 +198,7 @@ def test_sample_word_blocks_prefers_a_closer_budget_fit():
         rng=random.Random(0),
     )
 
-    # The improved sampler should be able to hit an easy exact fit here.
+    # This synthetic case has an exact three-token fit, so the sampler should find it.
     masked_tokens = sum(
         word_to_tokens[index]["token_end"] - word_to_tokens[index]["token_start"]
         for start, end in blocks
@@ -219,5 +219,5 @@ def test_mask_text_from_yaml_uses_config_values(tmp_path):
         rng=random.Random(0),
     )
 
-    # The YAML path should propagate max_length through the convenience wrapper.
+    # The YAML-driven convenience wrapper should forward masking settings unchanged.
     assert output["input_ids_full"].shape[0] == 10

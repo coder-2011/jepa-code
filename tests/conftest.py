@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-# Keep tests importable without installing the package into the virtualenv.
+# Keep tests importable from the repo root without depending on an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
@@ -22,7 +22,7 @@ def write_test_config(
     norm="rms",
     ema_momentum=0.996,
 ):
-    # Share one config writer so both test files exercise the same YAML layout.
+    # One shared writer keeps every config-driven test on the same YAML contract.
     path.write_text(
         yaml.safe_dump(
             {
@@ -52,7 +52,7 @@ def write_test_config(
 
 class FakeTokenizer:
     def __init__(self, has_mask_token=True):
-        # Mirror the small subset of Hugging Face tokenizer attributes our code touches.
+        # Mirror only the HF attributes our code actually reads so tests stay lightweight.
         self.is_fast = True
         self.pad_token = "<pad>"
         self.pad_token_id = 0
@@ -63,7 +63,7 @@ class FakeTokenizer:
         self.mask_token_id = 99 if has_mask_token else None
 
     def add_special_tokens(self, mapping):
-        # Behave like a tokenizer that successfully appended a missing mask token.
+        # Simulate the side effect that matters to the repo: a new mask token id becomes available.
         self.mask_token = mapping["mask_token"]
         self.mask_token_id = 99
         return 1
@@ -84,20 +84,20 @@ class FakeTokenizer:
         if isinstance(text, list):
             raise NotImplementedError("FakeTokenizer only supports single examples in tests")
 
-        # Mirror the real shape contract closely enough that masking logic can be tested offline.
+        # Start with an explicit BOS-like special token so special-token exclusion gets exercised.
         input_ids = [self.bos_token_id]
         attention_mask = [1]
         offset_mapping = [(0, 0)]
         special_tokens_mask = [1]
 
         for index, match in enumerate(re.finditer(r"\S+", text)):
-            # Give each surface word one token id so mask tests stay easy to reason about.
+            # Give each visible surface token one learned id so word-to-token mapping stays easy to inspect.
             input_ids.append(10 + index)
             attention_mask.append(1)
             offset_mapping.append((match.start(), match.end()))
             special_tokens_mask.append(0)
 
-        # Add an eos token so tests also exercise special-token exclusion.
+        # Add EOS so the tokenizer output includes both leading and trailing special tokens.
         input_ids.append(self.eos_token_id)
         attention_mask.append(1)
         offset_mapping.append((0, 0))
@@ -108,7 +108,7 @@ class FakeTokenizer:
         offset_mapping = offset_mapping[:max_length]
         special_tokens_mask = special_tokens_mask[:max_length]
 
-        # Pad with zero-width offsets so padding can never be selected as a mask target.
+        # Zero-width offsets make padding impossible to confuse with maskable text tokens.
         while len(input_ids) < max_length:
             input_ids.append(self.pad_token_id)
             attention_mask.append(0)

@@ -33,6 +33,7 @@ class FineWebJsonlDataset(torch.utils.data.Dataset):
                     continue
 
                 token_count = row.get("token_count")
+                # Missing token_count is only tolerated when the caller does not request a lower bound.
                 if isinstance(token_count, int) and token_count < min_token_count:
                     continue
                 if min_token_count > 0 and not isinstance(token_count, int):
@@ -40,6 +41,7 @@ class FineWebJsonlDataset(torch.utils.data.Dataset):
 
                 language_score = row.get("language_score")
                 if min_language_score is not None:
+                    # Keep filtering strict so low-confidence language rows never silently pass through.
                     if not isinstance(language_score, (int, float)) or language_score < min_language_score:
                         continue
 
@@ -51,6 +53,7 @@ class FineWebJsonlDataset(torch.utils.data.Dataset):
         return len(self.texts)
 
     def __getitem__(self, index):
+        # Seed per example so dataloader shuffling does not change which spans get masked.
         rng = random.Random(self.seed + index)
         return mask_text_from_yaml(
             self.tokenizer,
@@ -73,6 +76,7 @@ def create_fineweb_dataloader(
     max_docs=None,
     drop_last=False,
 ):
+    # Dataset construction owns text filtering; DataLoader owns shuffling and batch assembly.
     dataset = FineWebJsonlDataset(
         jsonl_path=jsonl_path,
         tokenizer=tokenizer,
@@ -84,6 +88,7 @@ def create_fineweb_dataloader(
     )
     generator = None
     if shuffle:
+        # Seed the loader generator so document order changes are reproducible across runs.
         generator = torch.Generator()
         generator.manual_seed(seed)
 

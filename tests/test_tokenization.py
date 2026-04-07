@@ -18,12 +18,12 @@ def test_loads_qwen_tokenizer_from_yaml(tmp_path, monkeypatch):
             assert use_fast is True
             return FakeTokenizer(has_mask_token=False)
 
-    # Patch the boundary we own instead of relying on network access in tests.
+    # Patch the loading boundary we own so the test stays offline and deterministic.
     monkeypatch.setattr("text_jepa.tokenization.AutoTokenizer", FakeAutoTokenizer)
 
     tokenizer = load_tokenizer_from_yaml(config_path)
 
-    # The loader should repair a missing mask token using the YAML default.
+    # The loader should synthesize a usable mask token when the pretrained tokenizer lacks one.
     assert tokenizer.mask_token == "[MASK]"
     assert tokenizer.mask_token_id == 99
 
@@ -33,7 +33,7 @@ def test_tokenize_text_returns_required_fields():
 
     encoded = tokenize_text(tokenizer, "The quick brown fox", max_length=8)
 
-    # This is the exact shape contract the masker relies on.
+    # The masking code depends on this exact field set.
     assert set(encoded) == {
         "input_ids",
         "attention_mask",
@@ -51,7 +51,7 @@ def test_get_tokenizer_metadata_returns_special_ids():
 
     metadata = get_tokenizer_metadata(tokenizer)
 
-    # Metadata stays small on purpose; this checks the public boundary does not drift.
+    # Metadata should stay intentionally small and stable.
     assert metadata["pad_token_id"] == 0
     assert metadata["mask_token_id"] == 99
     assert metadata["bos_token_id"] == 2

@@ -12,7 +12,7 @@ WORD_PATTERN = re.compile(r"\w+(?:['-]\w+)*")
 def get_masking_settings(config_path):
     config = load_yaml_config(config_path)
     tokenizer_config = config.get("tokenizer") or {}
-    # Keep masking config separate so tokenizer loading and masking can evolve independently.
+    # Masking stays separately configurable so experiments can vary corruption without changing tokenization.
     masking_config = config.get("masking") or {}
 
     max_length = tokenizer_config.get("max_length")
@@ -27,12 +27,12 @@ def get_masking_settings(config_path):
     if not isinstance(max_block_words, int) or max_block_words <= 0:
         raise ValueError("masking.max_block_words must be a positive integer")
 
-    # Return plain values instead of another config object to keep the API compact.
+    # The rest of the pipeline only needs scalar masking knobs, not the full nested config object.
     return max_length, float(mask_ratio), max_block_words
 
 
 def find_word_spans(text):
-    # Match word-like spans while leaving surrounding punctuation out of the masking units.
+    # Masking units are word-like spans, not punctuation characters or raw byte ranges.
     return [(match.start(), match.end()) for match in WORD_PATTERN.finditer(text)]
 
 
@@ -46,7 +46,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
         for token_index, ((char_start, char_end), attn, is_special) in enumerate(
             zip(offset_mapping, attention_mask, special_tokens_mask)
         ):
-            # Skip padding, special tokens, and zero-width offsets before overlap checks.
+            # Zero-width offsets correspond to special tokens or padding in the tokenizers we support.
             if attn == 0 or is_special == 1 or char_start == char_end:
                 continue
 
@@ -64,7 +64,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
                 {
                     "word_index": word_index,
                     "char_span": (word_start, word_end),
-                    # Store token spans half-open so they can be sliced directly.
+                    # Half-open token spans compose cleanly when we later merge words into contiguous blocks.
                     "token_start": token_start,
                     "token_end": token_end,
                 }
@@ -76,7 +76,7 @@ def map_words_to_tokens(word_spans, offset_mapping, attention_mask, special_toke
 def count_maskable_tokens(attention_mask, special_tokens_mask):
     total = 0
     for attn, is_special in zip(attention_mask, special_tokens_mask):
-        # The mask ratio is defined over real sequence tokens, not pads or special markers.
+        # The masking budget excludes pads and explicit special tokens.
         if attn == 1 and is_special == 0:
             total += 1
     return total
@@ -87,7 +87,7 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
     used_word_indices = set()
     masked_token_count = 0
 
-    # Consider all 1..max_block_words blocks so we can choose the best fit for the remaining budget.
+    # Materialize all candidate blocks up front so the sampler can choose by fit quality instead of local greed.
     candidate_blocks = []
     for start_index in range(len(word_to_tokens)):
         token_count = 0
@@ -119,8 +119,7 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
         if not available_blocks:
             break
 
-        # Prefer the block that gets closest to the remaining token budget.
-        # Break ties randomly so repeated runs can still explore different masks.
+        # Prefer a close token-budget fit and only then break ties randomly to preserve variability.
         best_block = min(
             available_blocks,
             key=lambda candidate: (
@@ -133,7 +132,7 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
         selected_blocks.append((best_block["start_index"], best_block["end_index"]))
         for word_index in range(best_block["start_index"], best_block["end_index"]):
             used_word_indices.add(word_index)
-            # Track budget in token space because subword tokenizers expand some words.
+            # Budget is tracked in token space because one "word" may expand to multiple subword tokens.
             masked_token_count += (
                 word_to_tokens[word_index]["token_end"] - word_to_tokens[word_index]["token_start"]
             )
@@ -143,13 +142,13 @@ def sample_word_blocks(word_to_tokens, target_token_budget, max_block_words, rng
 
 def apply_mask(input_ids, target_mask, mask_token_id):
     input_ids_ctx = input_ids.clone()
-    # Preserve sequence length and only swap the hidden positions to mask_token_id.
+    # JEPA keeps sequence length fixed and replaces only the supervised positions.
     input_ids_ctx[target_mask] = mask_token_id
     return input_ids_ctx
 
 
 def extract_target_positions(input_ids_full, target_mask):
-    # Keep both positions and original ids so later code can supervise only masked slots.
+    # Keep the sparse supervision view alongside the dense mask so later modules can choose either form.
     target_positions = torch.nonzero(target_mask, as_tuple=False).squeeze(-1).to(torch.long)
     target_token_ids = input_ids_full[target_positions]
     return target_positions, target_token_ids
@@ -162,13 +161,13 @@ def build_target_mask(word_to_tokens, selected_blocks, sequence_length):
 
     for block_start, block_end in selected_blocks:
         block = word_to_tokens[block_start:block_end]
-        # Collapse each chosen word block into one contiguous token span for masking.
+        # Adjacent words in a block collapse into one token interval so masking stays contiguous.
         token_start = min(item["token_start"] for item in block)
         token_end = max(item["token_end"] for item in block)
         word_start = min(item["word_index"] for item in block)
         word_end = max(item["word_index"] for item in block) + 1
 
-        # Keep both word-space and token-space ranges for debugging and future inspections.
+        # Keep both coordinate systems because word-space is easier to inspect while token-space drives the model.
         target_mask[token_start:token_end] = True
         masked_span_ranges_word.append((word_start, word_end))
         masked_span_ranges_token.append((token_start, token_end))
@@ -178,7 +177,7 @@ def build_target_mask(word_to_tokens, selected_blocks, sequence_length):
 
 def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None):
     if rng is None:
-        # Local RNG keeps call sites deterministic when they pass an explicit seeded Random.
+        # Callers can pass a seeded RNG for deterministic tests or dataset indexing.
         rng = random.Random()
 
     tokenized = tokenize_text(tokenizer, text, max_length)
@@ -201,7 +200,7 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
     if total_maskable_tokens <= 0:
         raise ValueError("No maskable tokens were found in the tokenized example")
 
-    # The ratio is still approximate, but we now try to choose blocks that fit the token budget closely.
+    # The ratio is approximate because masking operates on contiguous token spans, not independent tokens.
     target_token_budget = max(1, round(total_maskable_tokens * mask_ratio))
     selected_blocks = sample_word_blocks(
         word_to_tokens,
@@ -216,6 +215,7 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
         input_ids_full.shape[0],
     )
     input_ids_ctx = apply_mask(input_ids_full, target_mask, tokenizer.mask_token_id)
+    # Positions and original token ids are the predictor-facing supervision contract.
     target_positions, target_token_ids = extract_target_positions(input_ids_full, target_mask)
 
     return {
@@ -231,6 +231,6 @@ def mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=None
 
 
 def mask_text_from_yaml(tokenizer, text, config_path, rng=None):
-    # This is the convenience entry point most callers should use.
+    # Most production call sites should depend on config-driven masking rather than threading three scalars around.
     max_length, mask_ratio, max_block_words = get_masking_settings(config_path)
     return mask_text(tokenizer, text, max_length, mask_ratio, max_block_words, rng=rng)
