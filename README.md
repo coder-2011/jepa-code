@@ -104,7 +104,8 @@ python scripts/train_llm_jepa.py \
 
 ## Notes on Local Runs
 
-- On Apple Silicon, the trainers should prefer `mps` over `cpu`.
+- The training and local benchmarking CLIs now default to `cuda`. On Macs, pass `--device mps` explicitly if you want to run the PyTorch path there.
+- For conventional Hugging Face fine-tuning on macOS, treat `mps` as opt-in rather than the default path. The repo's mac-native fine-tune workflow is the separate `mlx-lm` LoRA path in [`scripts/finetune_gsm8k.py`](/workspace/jepa-code/scripts/finetune_gsm8k.py).
 - The default LLM-JEPA smoke recipe uses `hf-internal-testing/tiny-random-gpt2` because `sshleifer/tiny-gpt2` has hidden size `2`, which makes cosine JEPA degenerate.
 - Keep `Qwen/Qwen3-0.6B` as the intended real backbone for non-smoke runs unless you explicitly override it.
 - W&B defaults to offline mode unless online auth is available.
