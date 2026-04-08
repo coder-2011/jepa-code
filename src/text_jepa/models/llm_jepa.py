@@ -138,6 +138,7 @@ class LLMJEPAModel(nn.Module):
         packed_attention_mask,
         *,
         packed_mode,
+        dtype,
     ):
         sequence_length = attention_mask.shape[1]
         masks = []
@@ -148,6 +149,7 @@ class LLMJEPAModel(nn.Module):
                     sequence_length,
                     valid_length=int(full_length),
                     device=device,
+                    dtype=dtype,
                 )
             )
 
@@ -158,6 +160,7 @@ class LLMJEPAModel(nn.Module):
                         [int(source_length), int(target_length)],
                         sequence_length=sequence_length,
                         device=device,
+                        dtype=dtype,
                     )
                 )
         elif packed_mode == "tube":
@@ -167,12 +170,13 @@ class LLMJEPAModel(nn.Module):
                         sequence_length,
                         valid_length=int(packed_length),
                         device=device,
+                        dtype=dtype,
                     )
                 )
         else:
             raise ValueError(f"unsupported packed_mode: {packed_mode}")
 
-        return stack_additive_attention_masks(masks, device=device)
+        return stack_additive_attention_masks(masks, device=device, dtype=dtype)
 
     def _require_packed_views(self, packed_valid, *, mode_name):
         if packed_valid is None:
@@ -203,6 +207,7 @@ class LLMJEPAModel(nn.Module):
             packed_target_length,
             packed_attention_mask,
             packed_mode=packed_mode,
+            dtype=next(self.backbone.parameters()).dtype,
         )
         batch_size = input_ids.shape[0]
         outputs = self.backbone(
