@@ -177,6 +177,79 @@ def _pad_ids(token_ids, max_length, pad_token_id, *, field_name, allow_truncatio
     )
 
 
+def _empty_packed_example(max_length, pad_token_id):
+    packed_input_ids = torch.full((max_length,), pad_token_id, dtype=torch.long)
+    packed_attention_mask = torch.zeros((max_length,), dtype=torch.long)
+    packed_labels = torch.full((max_length,), -100, dtype=torch.long)
+    zero = torch.tensor(0, dtype=torch.long)
+    return {
+        "packed_input_ids": packed_input_ids,
+        "packed_attention_mask": packed_attention_mask,
+        "packed_labels": packed_labels,
+        "packed_source_length": zero.clone(),
+        "packed_target_length": zero.clone(),
+        "packed_source_last_index": zero.clone(),
+        "packed_target_last_index": zero.clone(),
+        "packed_source_span_start": zero.clone(),
+        "packed_source_span_end": zero.clone(),
+        "packed_target_span_start": zero.clone(),
+        "packed_target_span_end": zero.clone(),
+        "packed_valid": torch.tensor(False),
+    }
+
+
+def _build_packed_example(
+    tokenizer,
+    source_token_ids,
+    target_token_ids,
+    max_length,
+    pad_token_id,
+    *,
+    preferred_source_tokens=None,
+):
+    source_length = len(source_token_ids)
+    target_length = len(target_token_ids)
+    packed_length = source_length + target_length
+    if packed_length > max_length:
+        return _empty_packed_example(max_length, pad_token_id)
+
+    packed_token_ids = list(source_token_ids) + list(target_token_ids)
+    packed_input_ids, packed_attention_mask = _pad_ids(
+        packed_token_ids,
+        max_length,
+        pad_token_id,
+        field_name="packed semantic tube",
+        allow_truncation=False,
+    )
+    packed_labels = torch.full_like(packed_input_ids, -100)
+
+    source_last_index = _content_readout_index(
+        tokenizer,
+        source_token_ids,
+        max_length,
+        preferred_tokens=preferred_source_tokens,
+    )
+    target_last_index = source_length + _content_readout_index(
+        tokenizer,
+        target_token_ids,
+        max_length,
+    )
+    return {
+        "packed_input_ids": packed_input_ids,
+        "packed_attention_mask": packed_attention_mask,
+        "packed_labels": packed_labels,
+        "packed_source_length": torch.tensor(source_length, dtype=torch.long),
+        "packed_target_length": torch.tensor(target_length, dtype=torch.long),
+        "packed_source_last_index": torch.tensor(source_last_index, dtype=torch.long),
+        "packed_target_last_index": torch.tensor(target_last_index, dtype=torch.long),
+        "packed_source_span_start": torch.tensor(0, dtype=torch.long),
+        "packed_source_span_end": torch.tensor(source_length, dtype=torch.long),
+        "packed_target_span_start": torch.tensor(source_length, dtype=torch.long),
+        "packed_target_span_end": torch.tensor(packed_length, dtype=torch.long),
+        "packed_valid": torch.tensor(True),
+    }
+
+
 def _token_id(tokenizer, token):
     if hasattr(tokenizer, "convert_tokens_to_ids"):
         token_id = tokenizer.convert_tokens_to_ids(token)
@@ -307,8 +380,16 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
             field_name="code view",
             allow_truncation=False,
         )
+        packed_example = _build_packed_example(
+            self.tokenizer,
+            source_token_ids,
+            target_token_ids,
+            self.max_length,
+            self.tokenizer.pad_token_id,
+            preferred_source_tokens=self.predictor_token_strings,
+        )
 
-        return {
+        example = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -334,6 +415,8 @@ class LLMJEPAPairedJsonlDataset(torch.utils.data.Dataset):
                 dtype=torch.long,
             ),
         }
+        example.update(packed_example)
+        return example
 
 
 def create_llm_jepa_dataloader(
@@ -345,6 +428,7 @@ def create_llm_jepa_dataloader(
     shuffle=False,
     seed=0,
     num_workers=0,
+    pin_memory=False,
     max_docs=None,
     drop_last=False,
 ):
@@ -365,6 +449,8 @@ def create_llm_jepa_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=bool(num_workers > 0),
         drop_last=drop_last,
         generator=generator,
     )
