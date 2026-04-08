@@ -1,3 +1,5 @@
 - [ ] Add LLM-JEPA-style custom attention masking in a later pass; keep the first pass span-based without that mask logic
 - [ ] Test system if we load embedding weights from some pretrained transformer
 - [ ] Test is query_seed is redundant
+- [ ] Implement SIGReg
+- [ ] Study the scaling laws of JEPA
