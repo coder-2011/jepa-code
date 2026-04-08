@@ -240,6 +240,7 @@ def main():
         config=run_config,
     ) as run:
         step = start_step
+        last_saved_step = start_step if start_step > 0 and resume_path is not None else 0
         try:
             while step < args.steps:
                 for batch in train_dataloader:
@@ -281,6 +282,7 @@ def main():
                             step,
                             checkpoint_state(step, model, optimizer, run_config),
                         )
+                        last_saved_step = step
                     if eval_dataloader is not None and step % args.val_every == 0:
                         metrics = evaluate(model, eval_dataloader, args.device, args.val_max_batches)
                         run.log(
@@ -300,7 +302,7 @@ def main():
 
                     if step >= args.steps:
                         break
-            if step > 0:
+            if step > 0 and step != last_saved_step:
                 save_checkpoint(
                     args.checkpoint_dir,
                     step,
