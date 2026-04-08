@@ -225,8 +225,8 @@ def infer_lora_target_modules(model):
         if name and hasattr(module, "weight")
     }
     preferred_groups = (
-        ("q_proj", "v_proj"),
         ("q_proj", "k_proj", "v_proj", "o_proj"),
+        ("q_proj", "v_proj"),
         ("c_attn", "c_proj"),
         ("query_key_value", "dense"),
     )
