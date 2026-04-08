@@ -83,9 +83,11 @@ def move_batch_to_device(batch, device):
 
 def build_model(args, config, tokenizer):
     model_name = args.model_name or config["tokenizer"]["model_name"]
+    torch_dtype = torch.float32 if args.device == "cpu" else None
     backbone = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
+        torch_dtype=torch_dtype,
     )
     backbone.resize_token_embeddings(len(tokenizer))
     return LLMJEPAModel(
