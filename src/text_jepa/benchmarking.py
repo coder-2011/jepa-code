@@ -11,11 +11,13 @@ ANSWER_ONLY = (
     "Return only the final answer. Do not explain. Do not use markdown. "
     "Do not include code fences. Do not include any extra text."
 )
+GSM8K_STYLE = "For GSM8K, return the final numeric answer exactly as `#### <answer>`."
 SYNTH_STYLE = (
     "Use the dataset's regex notation. Use ~ for negation and & for conjunction when needed. "
     "Do not add anchors like ^ or $. Return only the regex expression."
 )
-GSM8K_FINAL_ANSWER = re.compile(r"\n#### (.+)$")
+GSM8K_FINAL_ANSWER = re.compile(r"(?:^|\n)####\s*(.+)$")
+GSM8K_FALLBACK_NUMBER = re.compile(r"(?<![\w.])-?\$?\d[\d,]*(?:\.\d+)?%?")
 SPIDER_DB_ID = re.compile(r"For db_id:\[(.+)\]")
 HELLASWAG_CHOICE = re.compile(r"\b([ABCD])\b")
 
@@ -112,6 +114,8 @@ def benchmark_messages(
         return prompt_messages
 
     instructions = [ANSWER_ONLY]
+    if dataset_task_name(dataset_name) == "gsm8k":
+        instructions.append(GSM8K_STYLE)
     if is_synth_like_dataset(dataset_name):
         instructions.append(SYNTH_STYLE)
 
@@ -142,8 +146,20 @@ def hellaswag_target_choice(text: str) -> str | None:
 
 
 def gsm8k_final_answer(text: str) -> str | None:
+    def extract_last_number(candidate: str) -> str | None:
+        matches = GSM8K_FALLBACK_NUMBER.findall(candidate)
+        if not matches:
+            return None
+        return matches[-1].replace("$", "").replace(",", "").strip()
+
     match = re.search(GSM8K_FINAL_ANSWER, text)
-    return None if match is None else match.group(1)
+    if match is not None:
+        extracted = extract_last_number(match.group(1))
+        if extracted is not None:
+            return extracted
+        return match.group(1).strip()
+
+    return extract_last_number(text)
 
 
 def spider_db_path(messages: list[dict[str, str]], spider_path: str | Path) -> Path:

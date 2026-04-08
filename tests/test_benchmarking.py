@@ -36,6 +36,13 @@ def test_benchmark_messages_adds_answer_only_instructions():
     assert "Use the dataset's regex notation." in prompt_messages[0]["content"]
 
 
+def test_benchmark_messages_adds_gsm8k_format_instruction():
+    messages = make_row("question", "#### 18")["messages"]
+    prompt_messages = benchmark_messages(messages, dataset_name="gsm8k_test.jsonl", strict_answer_only=True)
+
+    assert "For GSM8K, return the final numeric answer exactly as `#### <answer>`." in prompt_messages[0]["content"]
+
+
 def test_benchmark_messages_can_leave_prompt_unmodified():
     messages = make_row("question", "answer")["messages"]
     prompt_messages = benchmark_messages(messages, dataset_name="gsm8k_test.jsonl", strict_answer_only=False)
@@ -45,6 +52,10 @@ def test_benchmark_messages_can_leave_prompt_unmodified():
 
 def test_gsm8k_final_answer_extracts_final_hash_answer():
     assert gsm8k_final_answer("work\n#### 18") == "18"
+    assert gsm8k_final_answer("#### 18") == "18"
+    assert gsm8k_final_answer("#### <answer> 18</answer>") == "18"
+    assert gsm8k_final_answer("The final answer is 18.") == "18"
+    assert gsm8k_final_answer("Answer: $1,234") == "1234"
     assert gsm8k_final_answer("no final marker") is None
 
 
