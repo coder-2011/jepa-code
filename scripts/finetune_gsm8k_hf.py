@@ -27,7 +27,7 @@ from text_jepa.utils.repro import configure_reproducibility
 
 load_local_env(ROOT)
 
-from text_jepa.data import LLMJEPAPairedJsonlDataset
+from text_jepa.data import _normalize_token_ids, _pad_ids
 
 
 DEFAULT_TRAIN_FILE = ROOT / "tmp" / "gsm8k" / "gsm8k_train.jsonl"
@@ -119,26 +119,97 @@ def dtype_flags(dtype_name, device):
     return False, False
 
 
-class CausalLMViewDataset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
+def render_token_ids(tokenizer, messages, *, add_generation_prompt, enable_thinking=None):
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        kwargs = {
+            "tokenize": True,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        return _normalize_token_ids(tokenizer.apply_chat_template(messages, **kwargs))
+
+    rendered = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+    if add_generation_prompt:
+        rendered += "\nassistant:"
+    if hasattr(tokenizer, "encode"):
+        return tokenizer.encode(rendered, add_special_tokens=True)
+    encoded = tokenizer(rendered, truncation=False, padding=False, return_attention_mask=False)
+    return _normalize_token_ids(encoded["input_ids"])
+
+
+def prompt_token_ids_for_full_prefix(tokenizer, messages, full_token_ids):
+    prefix_messages = messages[:-1]
+    prompt_token_ids = render_token_ids(
+        tokenizer,
+        prefix_messages,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if full_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
+        return prompt_token_ids
+
+    prompt_token_ids = render_token_ids(
+        tokenizer,
+        prefix_messages,
+        add_generation_prompt=True,
+    )
+    if full_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
+        return prompt_token_ids
+
+    raise ValueError(
+        "Rendered prompt is not a prefix of the rendered full conversation; "
+        "refusing to build ambiguous SFT labels."
+    )
+
+
+class GSM8KSFTJsonlDataset(torch.utils.data.Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length, max_docs=None):
         self.examples = []
         skipped = 0
-        for index in range(len(base_dataset)):
-            example = base_dataset[index]
-            labels = example["labels"]
-            if torch.all(labels == -100):
-                skipped += 1
-                continue
-            self.examples.append(
-                {
-                    "input_ids": example["input_ids"],
-                    "attention_mask": example["attention_mask"],
-                    "labels": labels,
-                }
-            )
+        path = Path(jsonl_path)
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if "messages" not in row:
+                    continue
+                example = self._build_example(row, tokenizer, max_length)
+                if example is None:
+                    skipped += 1
+                    continue
+                self.examples.append(example)
+                if max_docs is not None and len(self.examples) >= max_docs:
+                    break
         if not self.examples:
             raise ValueError("No superviseable assistant targets remain after applying max_length")
         self.skipped = skipped
+
+    @staticmethod
+    def _build_example(row, tokenizer, max_length):
+        messages = row["messages"]
+        if not messages or messages[-1].get("role") != "assistant":
+            raise ValueError("GSM8K SFT rows must contain messages ending with an assistant answer")
+
+        full_token_ids = render_token_ids(tokenizer, messages, add_generation_prompt=False)
+        prompt_token_ids = prompt_token_ids_for_full_prefix(tokenizer, messages, full_token_ids)
+
+        input_ids, attention_mask = _pad_ids(
+            full_token_ids,
+            max_length,
+            tokenizer.pad_token_id,
+            field_name="messages",
+            allow_truncation=True,
+        )
+        labels = input_ids.clone()
+        labels[: min(len(prompt_token_ids), max_length)] = -100
+        labels[attention_mask == 0] = -100
+        if torch.all(labels == -100):
+            return None
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
     def __len__(self):
         return len(self.examples)
@@ -205,27 +276,21 @@ def load_model_and_tokenizer(args):
 
 
 def build_datasets(args, tokenizer):
-    train_dataset = CausalLMViewDataset(
-        LLMJEPAPairedJsonlDataset(
-            jsonl_path=args.train_file,
-            tokenizer=tokenizer,
-            max_length=args.max_length,
-            predictors=0,
-            max_docs=args.max_docs,
-        )
+    train_dataset = GSM8KSFTJsonlDataset(
+        jsonl_path=args.train_file,
+        tokenizer=tokenizer,
+        max_length=args.max_length,
+        max_docs=args.max_docs,
     )
     if len(train_dataset) == 0:
         raise ValueError(f"No rows loaded from {args.train_file}")
     eval_dataset = None
     if args.eval_file:
-        eval_dataset = CausalLMViewDataset(
-            LLMJEPAPairedJsonlDataset(
-                jsonl_path=args.eval_file,
-                tokenizer=tokenizer,
-                max_length=args.max_length,
-                predictors=0,
-                max_docs=args.eval_max_docs,
-            )
+        eval_dataset = GSM8KSFTJsonlDataset(
+            jsonl_path=args.eval_file,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            max_docs=args.eval_max_docs,
         )
         if len(eval_dataset) == 0:
             raise ValueError(f"No rows loaded from {args.eval_file}")
