@@ -114,8 +114,8 @@ def install_training_patches(monkeypatch, config_path):
 
     class FakeAutoModelForCausalLM:
         @staticmethod
-        def from_pretrained(model_name, trust_remote_code=True, torch_dtype=None):
-            del model_name, trust_remote_code, torch_dtype
+        def from_pretrained(model_name, trust_remote_code=True, dtype=None):
+            del model_name, trust_remote_code, dtype
             return make_fake_backbone(tokenizer)
 
     monkeypatch.setattr(train_llm_jepa_script, "AutoModelForCausalLM", FakeAutoModelForCausalLM)
