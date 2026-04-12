@@ -194,55 +194,27 @@ def load_local_model(args: argparse.Namespace):
         backbone.eval()
         return backbone, tokenizer, False
 
-    model = LLMJEPAModel(
-        backbone,
-        lambda_jepa=float(checkpoint_config.get("lambda_jepa", 1.0)),
-        gamma_lm=float(checkpoint_config.get("gamma_lm", 1.0)),
-        jepa_metric=checkpoint_config.get("jepa_metric", "cosine"),
-        objective_mode=str(checkpoint_config.get("objective_mode", "paired")).replace("-", "_"),
-        student_packing=checkpoint_config.get("student_packing", "separate"),
-        stp_samples=int(checkpoint_config.get("stp_samples", 1)),
-        stp_max_span_length=checkpoint_config.get("stp_max_span_length"),
-        stp_min_span_length=int(checkpoint_config.get("stp_min_span_length", 1)),
-        stp_length_adjustment=checkpoint_config.get("stp_length_adjustment"),
-        stp_layer=int(checkpoint_config.get("stp_layer", -1)),
-        stp_linear_predictor=bool(checkpoint_config.get("stp_linear_predictor", False)),
-    )
+    model = LLMJEPAModel(backbone)
     model.load_state_dict(checkpoint["model"])
     model.to(args.device)
     model.eval()
     return model, tokenizer, True
 
 
-def render_prompt(tokenizer, messages: list[dict[str, str]], *, disable_thinking: bool = False) -> str:
+def render_prompt(tokenizer, messages: list[dict[str, str]]) -> str:
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        kwargs = {"tokenize": False, "add_generation_prompt": True}
-        if disable_thinking:
-            kwargs["enable_thinking"] = False
-        try:
-            return tokenizer.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("enable_thinking", None)
-            return tokenizer.apply_chat_template(messages, **kwargs)
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return "\n".join(f"{message['role']}: {message['content']}" for message in messages) + "\nassistant:"
 
 
-def render_messages(
-    tokenizer,
-    messages: list[dict[str, str]],
-    *,
-    add_generation_prompt: bool,
-    disable_thinking: bool = False,
-) -> str:
+def render_messages(tokenizer, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> str:
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        kwargs = {"tokenize": False, "add_generation_prompt": add_generation_prompt}
-        if disable_thinking:
-            kwargs["enable_thinking"] = False
         try:
-            return tokenizer.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("enable_thinking", None)
-            return tokenizer.apply_chat_template(messages, **kwargs)
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -380,10 +352,9 @@ def select_hellaswag_choice(
     messages: list[dict[str, str]],
     max_length: int,
     device: str,
-    disable_thinking: bool = False,
 ) -> str:
     inputs = tokenizer(
-        render_prompt(tokenizer, messages, disable_thinking=disable_thinking),
+        render_prompt(tokenizer, messages),
         return_tensors="pt",
         truncation=True,
         max_length=max_length,
@@ -412,10 +383,9 @@ def local_generate(
     max_length: int,
     max_new_tokens: int,
     device: str,
-    disable_thinking: bool = False,
 ) -> str:
     inputs = tokenizer(
-        render_prompt(tokenizer, messages, disable_thinking=disable_thinking),
+        render_prompt(tokenizer, messages),
         return_tensors="pt",
         truncation=True,
         max_length=max_length,
@@ -446,7 +416,6 @@ def benchmark(args: argparse.Namespace) -> dict:
     existing = {} if args.force else load_existing(output_path)
     model, tokenizer, is_llm_jepa_checkpoint = load_local_model(args)
     task_name = dataset_task_name(dataset_path.name)
-    disable_thinking = is_qwen3_model(args.base_model)
     api_key = require_openrouter_api_key() if is_synth_like_dataset(dataset_path.name) else None
     session = requests.Session()
 
@@ -484,7 +453,6 @@ def benchmark(args: argparse.Namespace) -> dict:
                             is_llm_jepa_checkpoint=is_llm_jepa_checkpoint,
                             max_length=args.max_length,
                             device=args.device,
-                            disable_thinking=disable_thinking,
                         )
                     else:
                         prediction = local_generate(
@@ -495,7 +463,6 @@ def benchmark(args: argparse.Namespace) -> dict:
                             max_length=args.max_length,
                             max_new_tokens=args.max_new_tokens,
                             device=args.device,
-                            disable_thinking=disable_thinking,
                         )
                     result = {
                         "index": index,

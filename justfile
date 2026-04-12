@@ -11,9 +11,6 @@ test-attention-masks:
 test-benchmarking:
     source {{venv}}/bin/activate && pytest tests/test_benchmarking.py
 
-test-benchmark-local:
-    source {{venv}}/bin/activate && pytest tests/test_benchmark_local.py
-
 test-embeddings:
     source {{venv}}/bin/activate && pytest tests/test_embeddings.py
 
