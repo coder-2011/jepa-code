@@ -229,28 +229,8 @@ def clean_generation_text(text: str) -> str:
     return text.strip()
 
 
-def is_qwen3_model(base_model: str) -> bool:
-    if "Qwen/Qwen3" in base_model:
-        return True
-
-    config_path = Path(base_model) / "config.json"
-    if not config_path.exists():
-        return False
-
-    try:
-        with config_path.open("r", encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return False
-
-    model_type = str(config.get("model_type", "")).lower()
-    architectures = [str(name).lower() for name in config.get("architectures", [])]
-    base_path = str(config.get("_name_or_path", "")).lower()
-    return model_type == "qwen3" or any("qwen3" in name for name in architectures) or "qwen/qwen3" in base_path
-
-
 def maybe_disable_qwen_thinking(messages: list[dict[str, str]], base_model: str) -> list[dict[str, str]]:
-    if not is_qwen3_model(base_model):
+    if "Qwen/Qwen3" not in base_model:
         return messages
     adjusted = [dict(message) for message in messages]
     directive = "/no_think"
@@ -510,13 +490,6 @@ def benchmark(args: argparse.Namespace) -> dict:
                             pooling=args.embedding_pooling,
                             layer=args.embedding_layer,
                         )
-                    if args.verbose:
-                        print(f"example={index}")
-                        print("prompt_messages=" + json.dumps(prompt_messages, ensure_ascii=False))
-                        print("prediction=" + json.dumps(prediction, ensure_ascii=False))
-                        print("gold=" + json.dumps(gold_text(row), ensure_ascii=False))
-                        print(f"match_exact={result['match_exact']} match={result['match']}")
-                        print()
                 except RateLimitExceeded as error:
                     stopped_reason = f"rate_limited: {error}"
                     break
@@ -534,12 +507,6 @@ def benchmark(args: argparse.Namespace) -> dict:
                         "similarity": None,
                         "error": f"{type(error).__name__}: {error}",
                     }
-                    if args.verbose:
-                        print(f"example={index}")
-                        print("prompt_messages=" + json.dumps(prompt_messages, ensure_ascii=False))
-                        print("gold=" + json.dumps(gold_text(row), ensure_ascii=False))
-                        print("error=" + json.dumps(result["error"], ensure_ascii=False))
-                        print()
                 append_result(sink, result)
 
             completed += 1
@@ -617,7 +584,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--similarity", action="store_true")
     parser.add_argument("--embedding-layer", type=int, default=-1)
     parser.add_argument("--embedding-pooling", choices=("last", "mean", "cls"), default="last")
-    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
