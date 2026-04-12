@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from decimal import Decimal, InvalidOperation
 from math import sqrt
 from pathlib import Path
 
@@ -12,12 +11,12 @@ ANSWER_ONLY = (
     "Return only the final answer. Do not explain. Do not use markdown. "
     "Do not include code fences. Do not include any extra text."
 )
-GSM8K_STYLE = "For GSM8K, you may show reasoning, but end with the final numeric answer as `#### <answer>`."
+GSM8K_STYLE = "For GSM8K, return the final numeric answer exactly as `#### <answer>`."
 SYNTH_STYLE = (
     "Use the dataset's regex notation. Use ~ for negation and & for conjunction when needed. "
     "Do not add anchors like ^ or $. Return only the regex expression."
 )
-GSM8K_FINAL_ANSWER = re.compile(r"####\s*([^\n]+)")
+GSM8K_FINAL_ANSWER = re.compile(r"(?:^|\n)####\s*(.+)$")
 GSM8K_FALLBACK_NUMBER = re.compile(r"(?<![\w.])-?\$?\d[\d,]*(?:\.\d+)?%?")
 SPIDER_DB_ID = re.compile(r"For db_id:\[(.+)\]")
 HELLASWAG_CHOICE = re.compile(r"\b([ABCD])\b")
@@ -114,10 +113,9 @@ def benchmark_messages(
     if not strict_answer_only:
         return prompt_messages
 
+    instructions = [ANSWER_ONLY]
     if dataset_task_name(dataset_name) == "gsm8k":
-        instructions = [GSM8K_STYLE]
-    else:
-        instructions = [ANSWER_ONLY]
+        instructions.append(GSM8K_STYLE)
     if is_synth_like_dataset(dataset_name):
         instructions.append(SYNTH_STYLE)
 
@@ -164,23 +162,6 @@ def gsm8k_final_answer(text: str) -> str | None:
     return extract_last_number(text)
 
 
-def normalize_gsm8k_answer(answer: str | None) -> str | None:
-    if answer is None:
-        return None
-    normalized = answer.strip().replace("$", "").replace(",", "")
-    normalized = normalized.removesuffix("%").strip()
-    if not normalized:
-        return None
-    try:
-        decimal = Decimal(normalized)
-        rendered = format(decimal.normalize(), "f")
-        if "." in rendered:
-            rendered = rendered.rstrip("0").rstrip(".")
-        return rendered
-    except InvalidOperation:
-        return normalized
-
-
 def spider_db_path(messages: list[dict[str, str]], spider_path: str | Path) -> Path:
     if not spider_path:
         raise ValueError("spider_path is required for Spider evaluation")
@@ -212,9 +193,7 @@ def score_prediction(
         return prediction.startswith(target)
 
     if task_name == "gsm8k":
-        return normalize_gsm8k_answer(gsm8k_final_answer(prediction)) == normalize_gsm8k_answer(
-            gsm8k_final_answer(target)
-        )
+        return gsm8k_final_answer(prediction) == gsm8k_final_answer(target)
 
     if task_name == "hellaswag":
         return hellaswag_target_choice(prediction) == hellaswag_target_choice(target)

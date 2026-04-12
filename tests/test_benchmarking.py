@@ -6,7 +6,6 @@ from text_jepa.benchmarking import (
     dataset_task_name,
     gsm8k_final_answer,
     hellaswag_target_choice,
-    normalize_gsm8k_answer,
     score_prediction,
     summarize_distribution,
 )
@@ -41,8 +40,7 @@ def test_benchmark_messages_adds_gsm8k_format_instruction():
     messages = make_row("question", "#### 18")["messages"]
     prompt_messages = benchmark_messages(messages, dataset_name="gsm8k_test.jsonl", strict_answer_only=True)
 
-    assert "For GSM8K, you may show reasoning" in prompt_messages[0]["content"]
-    assert "Return only the final answer." not in prompt_messages[0]["content"]
+    assert "For GSM8K, return the final numeric answer exactly as `#### <answer>`." in prompt_messages[0]["content"]
 
 
 def test_benchmark_messages_can_leave_prompt_unmodified():
@@ -55,16 +53,10 @@ def test_benchmark_messages_can_leave_prompt_unmodified():
 def test_gsm8k_final_answer_extracts_final_hash_answer():
     assert gsm8k_final_answer("work\n#### 18") == "18"
     assert gsm8k_final_answer("#### 18") == "18"
-    assert gsm8k_final_answer("Therefore the answer is #### 18.") == "18"
     assert gsm8k_final_answer("#### <answer> 18</answer>") == "18"
     assert gsm8k_final_answer("The final answer is 18.") == "18"
     assert gsm8k_final_answer("Answer: $1,234") == "1234"
     assert gsm8k_final_answer("no final marker") is None
-
-
-def test_normalize_gsm8k_answer_compares_numeric_equivalents():
-    assert normalize_gsm8k_answer("18.0") == normalize_gsm8k_answer("18")
-    assert normalize_gsm8k_answer("$1,234") == normalize_gsm8k_answer("1234")
 
 
 def test_hellaswag_target_choice_normalizes_embedded_choice():
@@ -82,7 +74,6 @@ def test_score_prediction_exact_match_task():
 def test_score_prediction_gsm8k_uses_final_answer():
     row = make_row("math", "steps\n#### 18")
     assert score_prediction("other steps\n#### 18", row, "gsm8k_test.jsonl")
-    assert score_prediction("other steps\n#### 18.0", row, "gsm8k_test.jsonl")
     assert not score_prediction("other steps\n#### 19", row, "gsm8k_test.jsonl")
 
 
