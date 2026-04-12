@@ -47,15 +47,15 @@ train-llm-jepa-qwen steps="1" batch_size="1" max_length="64" max_docs="1" device
 benchmark-openrouter dataset="llm-jepa/datasets/synth_test.jsonl" model="qwen/qwen3.5-9b" judge_model="openai/gpt-5.4" max_examples="10" output="tmp/openrouter-benchmark.jsonl":
     source {{venv}}/bin/activate && python scripts/benchmark_openrouter.py --dataset {{dataset}} --model {{model}} --judge-model {{judge_model}} --max-examples {{max_examples}} --output {{output}} --force
 
-benchmark-local-qwen dataset="llm-jepa/datasets/synth_test.jsonl" base_model="Qwen/Qwen3-0.6B" checkpoint="path/to/qwen-0.6b-checkpoint.pt" judge_model="openai/gpt-5.4" max_examples="10" device="cuda" output="tmp/local-qwen-benchmark.jsonl":
+benchmark-local-qwen dataset="llm-jepa/datasets/synth_test.jsonl" base_model="Qwen/Qwen3-0.6B" checkpoint="path/to/qwen-0.6b-checkpoint.pt" judge_model="openai/gpt-5.4" max_examples="10" device="mps" output="tmp/local-qwen-benchmark.jsonl":
     source {{venv}}/bin/activate && python scripts/benchmark_local.py --dataset {{dataset}} --base-model {{base_model}} --checkpoint {{checkpoint}} --judge-model {{judge_model}} --max-examples {{max_examples}} --device {{device}} --output {{output}} --force
 
-benchmark-local-qwen-base dataset="llm-jepa/datasets/synth_test.jsonl" judge_model="openai/gpt-5.4" max_examples="10" device="cuda" output="tmp/local-qwen-base-benchmark.jsonl":
+benchmark-local-qwen-base dataset="llm-jepa/datasets/synth_test.jsonl" judge_model="openai/gpt-5.4" max_examples="10" device="mps" output="tmp/local-qwen-base-benchmark.jsonl":
     source {{venv}}/bin/activate && python scripts/benchmark_local.py --dataset {{dataset}} --base-model Qwen/Qwen3-0.6B --checkpoint '' --judge-model {{judge_model}} --max-examples {{max_examples}} --device {{device}} --output {{output}} --force
 
-benchmark-local-qwen-tuned dataset="llm-jepa/datasets/synth_test.jsonl" checkpoint="checkpoints/llm-jepa-qwen/latest.pt" judge_model="openai/gpt-5.4" max_examples="10" device="cuda" output="tmp/local-qwen-tuned-benchmark.jsonl":
+benchmark-local-qwen-tuned dataset="llm-jepa/datasets/synth_test.jsonl" checkpoint="checkpoints/llm-jepa-qwen/latest.pt" judge_model="openai/gpt-5.4" max_examples="10" device="mps" output="tmp/local-qwen-tuned-benchmark.jsonl":
     source {{venv}}/bin/activate && python scripts/benchmark_local.py --dataset {{dataset}} --base-model Qwen/Qwen3-0.6B --checkpoint {{checkpoint}} --judge-model {{judge_model}} --max-examples {{max_examples}} --device {{device}} --output {{output}} --force
 
-benchmark-local-qwen-compare dataset="llm-jepa/datasets/synth_test.jsonl" checkpoint="checkpoints/llm-jepa-qwen/latest.pt" judge_model="openai/gpt-5.4" max_examples="10" device="cuda" base_output="tmp/local-qwen-base-benchmark.jsonl" tuned_output="tmp/local-qwen-tuned-benchmark.jsonl":
+benchmark-local-qwen-compare dataset="llm-jepa/datasets/synth_test.jsonl" checkpoint="checkpoints/llm-jepa-qwen/latest.pt" judge_model="openai/gpt-5.4" max_examples="10" device="mps" base_output="tmp/local-qwen-base-benchmark.jsonl" tuned_output="tmp/local-qwen-tuned-benchmark.jsonl":
     source {{venv}}/bin/activate && python scripts/benchmark_local.py --dataset {{dataset}} --base-model Qwen/Qwen3-0.6B --checkpoint '' --judge-model {{judge_model}} --max-examples {{max_examples}} --device {{device}} --output {{base_output}} --force
     source {{venv}}/bin/activate && python scripts/benchmark_local.py --dataset {{dataset}} --base-model Qwen/Qwen3-0.6B --checkpoint {{checkpoint}} --judge-model {{judge_model}} --max-examples {{max_examples}} --device {{device}} --output {{tuned_output}} --force
