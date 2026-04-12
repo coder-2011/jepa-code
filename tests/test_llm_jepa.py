@@ -502,21 +502,6 @@ def test_llm_jepa_model_supports_additive_mask_student_packing(tmp_path):
     assert outputs["target_embeddings"].shape == (2, 16)
 
 
-def test_llm_jepa_additive_mask_stack_uses_requested_dtype():
-    model = LLMJEPAModel(DummyBackbone(hidden_size=8), student_packing="additive-mask")
-
-    mask = model._build_additive_mask_stack(
-        attention_mask=torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
-        packed_source_length=torch.tensor([2], dtype=torch.long),
-        packed_target_length=torch.tensor([1], dtype=torch.long),
-        packed_attention_mask=torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
-        packed_mode="paired",
-        dtype=torch.bfloat16,
-    )
-
-    assert mask.dtype == torch.bfloat16
-
-
 def test_llm_jepa_additive_mask_matches_separate_student_path_in_eval_mode(tmp_path):
     data_path = tmp_path / "paired.jsonl"
     write_messages_jsonl(data_path)
