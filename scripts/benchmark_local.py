@@ -31,7 +31,6 @@ from text_jepa.benchmarking import (  # noqa: E402
 from text_jepa.data import ensure_predictor_tokens  # noqa: E402
 from text_jepa.env import load_local_env  # noqa: E402
 from text_jepa.models.llm_jepa import LLMJEPAModel  # noqa: E402
-from text_jepa.runtime import default_device, validate_device  # noqa: E402
 from text_jepa.tokenization import load_tokenizer_from_yaml, load_yaml_config  # noqa: E402
 
 
@@ -53,6 +52,16 @@ SYNTH_JUDGE_PROMPT = (
 
 class RateLimitExceeded(RuntimeError):
     pass
+
+
+def default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def request_openrouter(
     session: requests.Session,
     *,
@@ -385,7 +394,6 @@ def local_generate(
 
 
 def benchmark(args: argparse.Namespace) -> dict:
-    args.device = validate_device(args.device)
     dataset_path = Path(args.dataset)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

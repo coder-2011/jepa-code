@@ -17,12 +17,19 @@ sys.path.insert(0, str(ROOT / "src"))
 from text_jepa.env import load_local_env
 from text_jepa.data import create_fineweb_dataloader
 from text_jepa.models.layer_model import LayerModel
-from text_jepa.runtime import default_device, validate_device
 from text_jepa.tokenization import load_tokenizer_from_yaml
 from text_jepa.train.step import train_step
 from text_jepa.utils.repro import configure_reproducibility, resolve_deterministic, resolve_seed
 
 load_local_env(ROOT)
+
+
+def default_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def parse_args():
@@ -183,7 +190,6 @@ def evaluate(model, dataloader, device, max_batches):
 
 def main():
     args = parse_args()
-    args.device = validate_device(args.device)
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     args.seed = resolve_seed(config, args.seed)
