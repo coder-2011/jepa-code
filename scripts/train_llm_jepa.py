@@ -29,17 +29,14 @@ def parse_args():
     parser.add_argument("--config", default=str(ROOT / "text-jepa-default.yaml"))
     parser.add_argument(
         "--train-file",
-        default=str(ROOT / "tests" / "fixtures" / "llm_jepa_smoke_train.jsonl"),
+        default=str(ROOT / "llm-jepa" / "datasets" / "synth_train.jsonl"),
     )
     parser.add_argument(
         "--eval-file",
-        default=str(ROOT / "tests" / "fixtures" / "llm_jepa_smoke_eval.jsonl"),
+        default=str(ROOT / "llm-jepa" / "datasets" / "synth_test.jsonl"),
     )
     parser.add_argument("--model-name")
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--pin-memory", dest="pin_memory", action="store_true")
-    parser.add_argument("--no-pin-memory", dest="pin_memory", action="store_false")
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max-length", type=int)
@@ -47,32 +44,17 @@ def parse_args():
     parser.add_argument("--lambda-jepa", type=float, default=1.0)
     parser.add_argument("--gamma-lm", type=float, default=1.0)
     parser.add_argument("--jepa-metric", default="cosine")
-    parser.add_argument("--objective-mode", choices=("paired", "stp-random-span"), default="paired")
-    parser.add_argument("--student-packing", choices=("separate", "additive-mask"), default="separate")
-    parser.add_argument("--stp-samples", type=int, default=1)
-    parser.add_argument("--stp-max-span-length", type=int)
-    parser.add_argument("--stp-min-span-length", type=int, default=1)
-    parser.add_argument("--stp-length-adjustment", choices=("cosine_like", "jaccard_like"))
-    parser.add_argument("--stp-layer", type=int, default=-1)
-    parser.add_argument("--stp-linear-predictor", action="store_true")
     parser.add_argument("--max-docs", type=int)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
-    parser.add_argument("--grad-checkpointing", dest="grad_checkpointing", action="store_true")
-    parser.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false")
-    parser.add_argument("--tf32", dest="tf32", action="store_true")
-    parser.add_argument("--no-tf32", dest="tf32", action="store_false")
     parser.add_argument("--deterministic", dest="deterministic", action="store_true")
     parser.add_argument("--no-deterministic", dest="deterministic", action="store_false")
-    parser.set_defaults(deterministic=None, pin_memory=None, grad_checkpointing=True, tf32=True, save_final=True)
+    parser.set_defaults(deterministic=None)
     parser.add_argument("--device", default=default_device())
     parser.add_argument("--wandb-project", default="llm-jepa")
     parser.add_argument("--wandb-name")
     parser.add_argument("--wandb-mode", default=None)
     parser.add_argument("--checkpoint-dir", default=str(ROOT / "checkpoints" / "llm-jepa"))
     parser.add_argument("--save-every", type=int, default=10)
-    parser.add_argument("--save-final", dest="save_final", action="store_true")
-    parser.add_argument("--no-save-final", dest="save_final", action="store_false")
     parser.add_argument("--resume-from")
     parser.add_argument("--auto-resume", action="store_true")
     parser.add_argument("--val-every", type=int, default=0)
@@ -89,50 +71,24 @@ def choose_wandb_mode(requested_mode):
 
 
 def move_batch_to_device(batch, device):
-    return {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
-
-
-def resolve_torch_dtype(dtype_name, device):
-    if dtype_name == "float32":
-        return torch.float32
-    if dtype_name == "float16":
-        return torch.float16
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-    if device == "cuda":
-        return torch.bfloat16
-    return torch.float32
+    return {name: tensor.to(device) for name, tensor in batch.items()}
 
 
 def build_model(args, config, tokenizer):
     model_name = args.model_name or config["tokenizer"]["model_name"]
-    torch_dtype = resolve_torch_dtype(args.dtype, args.device)
+    torch_dtype = torch.float32 if args.device == "cpu" else None
     backbone = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
         torch_dtype=torch_dtype,
     )
-    backbone.config.use_cache = False
-    if args.grad_checkpointing and hasattr(backbone, "gradient_checkpointing_enable"):
-        backbone.gradient_checkpointing_enable()
     backbone.resize_token_embeddings(len(tokenizer))
-    model = LLMJEPAModel(
+    return LLMJEPAModel(
         backbone,
         lambda_jepa=args.lambda_jepa,
         gamma_lm=args.gamma_lm,
         jepa_metric=args.jepa_metric,
-        objective_mode=args.objective_mode.replace("-", "_"),
-        student_packing=args.student_packing,
-        stp_samples=args.stp_samples,
-        stp_max_span_length=args.stp_max_span_length,
-        stp_min_span_length=args.stp_min_span_length,
-        stp_length_adjustment=args.stp_length_adjustment,
-        stp_layer=args.stp_layer,
-        stp_linear_predictor=args.stp_linear_predictor,
     )
-    if model.target_backbone is not None:
-        model.target_backbone.config.use_cache = False
-    return model
 
 
 def build_run_config(args, config, dataset_size, max_length):
@@ -145,22 +101,9 @@ def build_run_config(args, config, dataset_size, max_length):
         "steps": args.steps,
         "lr": args.lr,
         "predictors": args.predictors,
-        "objective_mode": args.objective_mode,
-        "student_packing": args.student_packing,
-        "num_workers": args.num_workers,
-        "pin_memory": args.pin_memory,
         "lambda_jepa": args.lambda_jepa,
         "gamma_lm": args.gamma_lm,
         "jepa_metric": args.jepa_metric,
-        "stp_samples": args.stp_samples,
-        "stp_max_span_length": args.stp_max_span_length,
-        "stp_min_span_length": args.stp_min_span_length,
-        "stp_length_adjustment": args.stp_length_adjustment,
-        "stp_layer": args.stp_layer,
-        "stp_linear_predictor": args.stp_linear_predictor,
-        "dtype": args.dtype,
-        "grad_checkpointing": args.grad_checkpointing,
-        "tf32": args.tf32,
         "checkpoint_dir": args.checkpoint_dir,
         "save_every": args.save_every,
         "resume_from": args.resume_from,
@@ -239,18 +182,10 @@ def evaluate(model, dataloader, device, max_batches):
 def main():
     args = parse_args()
     args.device = validate_device(args.device)
-    if args.objective_mode == "stp-random-span" and args.predictors != 0:
-        print("objective_mode=stp-random-span ignores predictor tokens; forcing --predictors 0")
-        args.predictors = 0
     config = load_yaml_config(args.config)
     args.seed = resolve_seed(config, args.seed)
     args.deterministic = resolve_deterministic(config, args.deterministic)
     configure_reproducibility(args.seed, deterministic=args.deterministic)
-    if args.pin_memory is None:
-        args.pin_memory = args.device == "cuda"
-    if args.device == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = args.tf32
-        torch.backends.cudnn.allow_tf32 = args.tf32
     tokenizer = load_tokenizer_from_yaml(args.config)
     max_length = args.max_length or config["tokenizer"]["max_length"]
 
@@ -262,8 +197,6 @@ def main():
         predictors=args.predictors,
         shuffle=True,
         seed=args.seed,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
         max_docs=args.max_docs,
     )
     eval_dataloader = None
@@ -276,8 +209,6 @@ def main():
             predictors=args.predictors,
             shuffle=False,
             seed=args.seed + 10_000,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_memory,
             max_docs=args.max_docs,
         )
 
@@ -367,7 +298,7 @@ def main():
 
                     if step >= args.steps:
                         break
-            if args.save_final and step > 0 and step != last_saved_step:
+            if step > 0 and step != last_saved_step:
                 save_checkpoint(
                     args.checkpoint_dir,
                     step,
