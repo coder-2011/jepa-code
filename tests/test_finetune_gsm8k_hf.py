@@ -211,17 +211,15 @@ def test_gsm8k_sft_dataset_respects_max_docs(tmp_path):
     assert len(dataset) == 1
 
 
-def test_infer_lora_target_modules_prefers_full_qkvo_projection_set():
+def test_infer_lora_target_modules_prefers_q_and_v_projection_pair():
     class TinyAttention(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.q_proj = torch.nn.Linear(4, 4)
-            self.k_proj = torch.nn.Linear(4, 4)
             self.v_proj = torch.nn.Linear(4, 4)
-            self.o_proj = torch.nn.Linear(4, 4)
             self.mlp = torch.nn.Linear(4, 4)
 
     model = torch.nn.Module()
     model.attn = TinyAttention()
 
-    assert finetune_script.infer_lora_target_modules(model) == ["q_proj", "k_proj", "v_proj", "o_proj"]
+    assert finetune_script.infer_lora_target_modules(model) == ["q_proj", "v_proj"]
