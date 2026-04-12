@@ -110,7 +110,7 @@ def build_model(args, config, tokenizer):
     backbone = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
     )
     backbone.config.use_cache = False
     if args.grad_checkpointing and hasattr(backbone, "gradient_checkpointing_enable"):
@@ -171,7 +171,6 @@ def build_run_config(args, config, dataset_size, max_length):
         "deterministic": args.deterministic,
         "device": args.device,
         "max_length": max_length,
-        "max_docs": args.max_docs,
         "dataset_size": dataset_size,
     }
 
