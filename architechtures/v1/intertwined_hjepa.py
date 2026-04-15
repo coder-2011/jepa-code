@@ -314,10 +314,10 @@ class IntertwinedHJEPA(nn.Module):
         layer_index: int,
         post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
-        # SIGReg regularizes the local CE path only; detach the residual state so
-        # this loss does not backpropagate through attention or earlier layers.
+        # SIGReg regularizes the layer representation directly, so gradients are
+        # allowed to flow through the post-attention state and earlier computation.
         block = self.blocks[layer_index]
-        return block.compressor(block.ce_norm(post_attn_states[layer_index].detach()))
+        return block.compressor(block.ce_norm(post_attn_states[layer_index]))
 
     def forward(
         self,

@@ -120,7 +120,7 @@ def test_total_loss_includes_local_sigreg_when_enabled():
     assert outputs["loss_sigreg"] > 0
 
 
-def test_sigreg_loss_only_updates_local_ce_path():
+def test_sigreg_loss_updates_layer_representation_path():
     model = IntertwinedHJEPA(
         replace(
             YAML_CONFIG,
@@ -144,16 +144,27 @@ def test_sigreg_loss_only_updates_local_ce_path():
     outputs = model(input_ids=input_ids)
     outputs["loss"].backward()
 
-    for block in model.blocks[:-1]:
-        assert any(parameter.grad is not None for parameter in block.ce_norm.parameters())
-        assert any(parameter.grad is not None for parameter in block.compressor.parameters())
-        assert all(parameter.grad is None for parameter in block.attn.parameters())
-        assert all(parameter.grad is None for parameter in block.predictor.parameters())
-        assert all(parameter.grad is None for parameter in block.projector.parameters())
+    first_block = model.blocks[0]
+    assert any(parameter.grad is not None for parameter in first_block.attn.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.ce_norm.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.compressor.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.predictor.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.projector.parameters())
+
+    second_block = model.blocks[1]
+    assert any(parameter.grad is not None for parameter in second_block.attn.parameters())
+    assert any(parameter.grad is not None for parameter in second_block.ce_norm.parameters())
+    assert any(parameter.grad is not None for parameter in second_block.compressor.parameters())
+    assert all(parameter.grad is None for parameter in second_block.predictor.parameters())
+    assert all(parameter.grad is None for parameter in second_block.projector.parameters())
 
     final_block = model.blocks[-1]
-    assert all(parameter.grad is None for parameter in final_block.parameters())
-    assert all(parameter.grad is None for parameter in model.embeddings.parameters())
+    assert all(parameter.grad is None for parameter in final_block.attn.parameters())
+    assert all(parameter.grad is None for parameter in final_block.ce_norm.parameters())
+    assert all(parameter.grad is None for parameter in final_block.compressor.parameters())
+    assert all(parameter.grad is None for parameter in final_block.predictor.parameters())
+    assert all(parameter.grad is None for parameter in final_block.projector.parameters())
+    assert any(parameter.grad is not None for parameter in model.embeddings.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
 
 
