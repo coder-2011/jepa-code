@@ -1,10 +1,13 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import yaml
 from torch import nn
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
+from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
 
 """
@@ -26,19 +29,31 @@ Core v1 contract:
 
 @dataclass
 class IntertwinedConfig:
-    # Keep the v1 config narrow: only the knobs used by the pseudocode path.
+    # No defaults here: architecture/loss values should come from YAML explicitly.
     vocab_size: int
     max_length: int
     residual_dim: int
     compressed_dim: int
     depth: int
-    num_heads: int = 1
-    predictor_hidden_dim: int | None = None
-    dropout: float = 0.0
-    ema_momentum: float = 0.996
-    lambda_jepa: float = 0.1
-    jepa_warmup_steps: int = 0
-    tie_weights: bool = True
+    num_heads: int
+    predictor_hidden_dim: int
+    dropout: float
+    ema_momentum: float
+    lambda_jepa: float
+    jepa_warmup_steps: int
+    beta_sigreg: float
+    sigreg_warmup_steps: int
+    sigreg_num_slices: int
+    sigreg_t_max: float
+    sigreg_n_points: int
+    tie_weights: bool
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "IntertwinedConfig":
+        with Path(path).open("r", encoding="utf-8") as handle:
+            values = yaml.safe_load(handle)
+        assert isinstance(values, dict), f"Expected mapping config in {path}"
+        return cls(**values)
 
 
 class SimpleCompressor(nn.Module):
@@ -223,7 +238,6 @@ class IntertwinedHJEPA(nn.Module):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
 
-        predictor_hidden_dim = config.predictor_hidden_dim or config.compressed_dim
         self.config = config
         self.ema_momentum = float(config.ema_momentum)
 
@@ -239,7 +253,7 @@ class IntertwinedHJEPA(nn.Module):
                 IntertwinedBlock(
                     residual_dim=config.residual_dim,
                     compressed_dim=config.compressed_dim,
-                    predictor_hidden_dim=predictor_hidden_dim,
+                    predictor_hidden_dim=config.predictor_hidden_dim,
                     num_heads=config.num_heads,
                     dropout=config.dropout,
                 )
@@ -259,6 +273,11 @@ class IntertwinedHJEPA(nn.Module):
             # into another hard copy instead of the EMA blend we want after optimizer.step().
             ema_compressor.n_averaged.fill_(1)
         self.final_norm = nn.RMSNorm(config.residual_dim)
+        self.sigreg = SlicedEppsPulleySIGReg(
+            num_slices=config.sigreg_num_slices,
+            t_max=config.sigreg_t_max,
+            n_points=config.sigreg_n_points,
+        )
         self.lm_head = LMHead(
             residual_dim=config.residual_dim,
             vocab_size=config.vocab_size,
@@ -290,6 +309,16 @@ class IntertwinedHJEPA(nn.Module):
         )
         return target_z_l.detach()
 
+    def compute_sigreg_input_for_layer(
+        self,
+        layer_index: int,
+        post_attn_states: list[torch.Tensor],
+    ) -> torch.Tensor:
+        # SIGReg regularizes the local CE path only; detach the residual state so
+        # this loss does not backpropagate through attention or earlier layers.
+        block = self.blocks[layer_index]
+        return block.compressor(block.ce_norm(post_attn_states[layer_index].detach()))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -311,6 +340,7 @@ class IntertwinedHJEPA(nn.Module):
             z:                 depth compressed states, each (B, L, K)
             deltas:            depth predicted deltas, each (B, L, K)
             targets:           depth - 1 EMA targets, each (B, L, K)
+            loss_sigreg_layers: depth - 1 local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
         h = self.embed(input_ids)
@@ -334,6 +364,7 @@ class IntertwinedHJEPA(nn.Module):
 
         targets = []
         jepa_losses = []
+        sigreg_losses = []
         # Only layers 0..depth-2 receive JEPA loss because the final layer has no l+1 teacher target.
         for layer_index in range(self.config.depth - 1):
             target_z_l = self.compute_jepa_target_for_layer(layer_index, post_attn_states)
@@ -346,18 +377,41 @@ class IntertwinedHJEPA(nn.Module):
                     valid_mask=valid_mask,
                 )
             )
+            if self.config.beta_sigreg > 0:
+                sigreg_input_l = self.compute_sigreg_input_for_layer(layer_index, post_attn_states)
+                if valid_mask is not None:
+                    assert valid_mask.shape == sigreg_input_l.shape[:-1], (
+                        "valid_mask must match the leading shape of SIGReg inputs"
+                    )
+                    sigreg_input_l = sigreg_input_l[valid_mask.to(torch.bool)]
+                sigreg_losses.append(self.sigreg(sigreg_input_l))
 
-        # Average JEPA equally across all non-final layers.
-        loss_jepa = torch.stack(jepa_losses).mean()
+        # Keep per-layer JEPA losses explicit and sum them into the total objective.
+        loss_jepa = torch.stack(jepa_losses).sum()
+        if not sigreg_losses:
+            sigreg_losses = [logits.new_zeros(()) for _ in range(self.config.depth - 1)]
+        loss_sigreg = torch.stack(sigreg_losses).sum()
         lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps)
+        beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps)
         loss_main = next_token_loss(logits, labels, valid_mask) if labels is not None else None
-        loss = lambda_eff * loss_jepa if loss_main is None else loss_main + lambda_eff * loss_jepa
+        loss = logits.new_zeros(())
+        if loss_main is not None:
+            loss = loss + loss_main
+        if lambda_eff != 0:
+            loss = loss + lambda_eff * loss_jepa
+        if beta_eff != 0:
+            loss = loss + beta_eff * loss_sigreg
 
         # Keep a few cheap summaries around for smoke tests and debugging.
+        z_stds = [z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in compressed]
         diagnostics = {
             "lambda_jepa": lambda_eff,
+            "beta_sigreg": beta_eff,
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
+            "loss_sigreg_layers": [loss.detach() for loss in sigreg_losses],
             "z_variance": [z.detach().float().var() for z in compressed],
+            "z_std_mean": [std.mean() for std in z_stds],
+            "z_std_min": [std.min() for std in z_stds],
             "delta_norm": [delta.detach().float().norm() for delta in deltas],
         }
 
@@ -365,6 +419,9 @@ class IntertwinedHJEPA(nn.Module):
             "loss": loss,
             "loss_main": loss_main,
             "loss_jepa": loss_jepa,
+            "loss_jepa_layers": jepa_losses,
+            "loss_sigreg": loss_sigreg,
+            "loss_sigreg_layers": sigreg_losses,
             "logits": logits,
             "final_states": h,
             "states": states,
