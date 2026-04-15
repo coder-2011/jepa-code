@@ -222,7 +222,7 @@ Consequences:
 - Training and inference must use the same delta-injected residual dynamics.
 - The target state depends on a future internal activation from the same forward pass.
 - The model needs explicit storage of residual states and compressed states at every layer.
-- The JEPA loss supervises the predictor as a true delta function: `d_l ~= y_l - sg(z_l)`.
+- The JEPA loss supervises the predictor as a true delta function: `d_l ~= target_z_l - sg(z_l)`.
 
 ## First Tensor Contract
 
@@ -255,7 +255,7 @@ Manual checks should be limited to architecture invariants where a later failure
 
 ```text
 depth >= 2
-delta_l, z_l, and y_l have the same compressed dimension K
+delta_l, z_l, and target_z_l have the same compressed dimension K
 valid_mask selects at least one position if it is used in a masked loss
 EMA compressor structure matches the student compressor structure during EMA update
 ```
@@ -815,7 +815,7 @@ Minimum diagnostics:
 
 1. Should the EMA teacher be only `CEbar_{l+1}`, or should it include a larger learned target transform?
 2. Should the teacher consume raw `h_{l+1}` or a normalized version of `h_{l+1}`?
-3. Should `pred_l = c_l + d_l`, or should the target loss supervise only `d_l ~= y_l - stopgrad(c_l)`?
+3. Should `pred_l = z_l + d_l`, or should the target loss supervise only `d_l ~= target_z_l - stopgrad(z_l)`? Baseline answer: supervise the delta directly.
 4. Should `z_l` be detached in the delta target? Baseline answer: yes for the target-delta term, while `z_l` still receives gradients through `Pred_l(z_l)`, `Proj_l(z_l + d_l)`, and `L_main`.
 5. Should delta injection happen directly on the residual stream or after a future external mixing module? Baseline answer: directly on the residual stream for the first pass.
 6. Should target projections be EMA copies too? Baseline answer: no. For first pass, use `Identity` by keeping one shared compressed dim `K`.
