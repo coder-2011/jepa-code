@@ -9,7 +9,7 @@ dropout: 0.0
 ema_momentum: 0.996
 lambda_jepa: 1.0
 jepa_warmup_steps: 100
-beta_sigreg: 0.001
+beta_sigreg: 0.0
 sigreg_warmup_steps: 100
 sigreg_num_slices: 256
 sigreg_t_max: 3.0
