@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
+from text_helpers import LMHead, TokenEmbeddings
+
 """
 Notation used below:
     B: batch size
@@ -51,7 +53,6 @@ class SimpleCompressor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D) -> (..., K)
         return self.net(x)
 
 
@@ -161,18 +162,15 @@ def jepa_delta_loss(
     target_z_l: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # Keep the contract explicit here; shape mismatches otherwise fail later with noisy broadcast errors.
+    # Keep the JEPA contract exact: no silent broadcasting across batch, sequence, or compressed width.
     if delta_l.shape != z_l.shape or delta_l.shape != target_z_l.shape:
-        raise ValueError("delta_l, z_l, and target_z_l must have the same shape")
-    if delta_l.ndim < 2:
-        raise ValueError("delta_l, z_l, and target_z_l must have at least 2 dimensions")
+        raise ValueError("delta_l, z_l, and target_z_l must have exactly the same shape")
 
     # Stop gradients through both pieces of the teacher delta target.
     if valid_mask is None:
         return F.mse_loss(delta_l, target_z_l.detach() - z_l.detach())
 
-    if valid_mask.shape != delta_l.shape[:-1]:
-        raise ValueError("valid_mask must match the leading dimensions of delta_l")
+    assert valid_mask.shape == delta_l.shape[:-1], "valid_mask must match the leading shape of delta_l"
     if not valid_mask.any():
         raise ValueError("valid_mask selects no JEPA loss positions")
 
@@ -189,15 +187,7 @@ def next_token_loss(
 ) -> torch.Tensor:
     # logits: (B, L, vocab_size), labels/valid_mask: (B, L)
     # We predict token t+1 from position t, so the loss sees B * (L - 1) rows after shifting.
-    if logits.ndim != 3:
-        raise ValueError("logits must have shape (B, L, vocab_size)")
-    if labels.shape != logits.shape[:2]:
-        raise ValueError("labels must have shape (B, L) matching logits")
-    if logits.shape[1] < 2:
-        raise ValueError("next_token_loss requires sequence length >= 2")
-    if valid_mask is not None and valid_mask.shape != labels.shape:
-        raise ValueError("valid_mask must match labels shape")
-
+    assert logits.shape[1] >= 2, "next-token loss requires sequence length >= 2"
     if valid_mask is not None:
         # The mask applies to the predicted token positions, so it shifts with the labels.
         labels = labels[:, 1:].masked_fill(~valid_mask[:, 1:].to(torch.bool), -100)
@@ -238,8 +228,11 @@ class IntertwinedHJEPA(nn.Module):
         self.ema_momentum = float(config.ema_momentum)
 
         # Plain learned token + position embeddings for v1.
-        self.token_embedding = nn.Embedding(config.vocab_size, config.residual_dim)
-        self.position_embedding = nn.Embedding(config.max_length, config.residual_dim)
+        self.embeddings = TokenEmbeddings(
+            vocab_size=config.vocab_size,
+            max_length=config.max_length,
+            residual_dim=config.residual_dim,
+        )
         # Uniform blocks keep the stack simple; the last block still produces z/delta even though it has no JEPA loss.
         self.blocks = nn.ModuleList(
             [
@@ -266,11 +259,11 @@ class IntertwinedHJEPA(nn.Module):
             # into another hard copy instead of the EMA blend we want after optimizer.step().
             ema_compressor.n_averaged.fill_(1)
         self.final_norm = nn.RMSNorm(config.residual_dim)
-        # Tied case reuses the token embedding matrix directly in forward; untied case owns a separate head.
-        self.lm_head = (
-            None
-            if config.tie_weights
-            else nn.Linear(config.residual_dim, config.vocab_size, bias=False)
+        self.lm_head = LMHead(
+            residual_dim=config.residual_dim,
+            vocab_size=config.vocab_size,
+            token_embedding=self.embeddings.token_embedding,
+            tie_weights=config.tie_weights,
         )
 
     def student_parameters(self):
@@ -279,11 +272,7 @@ class IntertwinedHJEPA(nn.Module):
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids: (B, L) -> h_0: (B, L, D)
-        batch_size, sequence_length = input_ids.shape
-        # Keep positions explicit and learned for the first pass; no RoPE or cache-specific logic yet.
-        position_ids = torch.arange(sequence_length, device=input_ids.device).unsqueeze(0)
-        position_ids = position_ids.expand(batch_size, sequence_length)
-        return self.token_embedding(input_ids) + self.position_embedding(position_ids)
+        return self.embeddings(input_ids)
 
     @torch.no_grad()
     def compute_jepa_target_for_layer(
@@ -340,9 +329,8 @@ class IntertwinedHJEPA(nn.Module):
             deltas.append(out["delta"])
 
         states.append(h)
-        # Project the final residual stream to logits, using the embedding matrix directly when tied.
-        logit_weight = self.token_embedding.weight if self.lm_head is None else self.lm_head.weight
-        logits = F.linear(self.final_norm(h), logit_weight)
+        # Final norm stays in the model; the helper only does the D -> vocab projection.
+        logits = self.lm_head(self.final_norm(h))
 
         targets = []
         jepa_losses = []

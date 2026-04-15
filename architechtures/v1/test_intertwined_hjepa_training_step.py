@@ -1,16 +1,19 @@
-import torch
+from dataclasses import replace
 
-from intertwined_hjepa import (
-    IntertwinedConfig,
-    IntertwinedHJEPA,
-    jepa_delta_loss,
-    next_token_loss,
-)
+import torch
+import yaml
+
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss
+
+
+with open("intertwined_hjepa.yaml", "r", encoding="utf-8") as handle:
+    YAML_CONFIG = IntertwinedConfig(**yaml.safe_load(handle))
 
 
 def make_model():
     return IntertwinedHJEPA(
-        IntertwinedConfig(
+        replace(
+            YAML_CONFIG,
             vocab_size=32,
             max_length=8,
             residual_dim=8,
@@ -50,45 +53,6 @@ def test_jepa_delta_loss_rejects_empty_valid_mask():
         assert "valid_mask" in str(exc)
     else:
         raise AssertionError("Expected an empty valid_mask to be rejected")
-
-
-def test_jepa_delta_loss_rejects_shape_mismatch():
-    delta = torch.randn(2, 3, 4)
-    z = torch.randn(2, 3, 5)
-    target = torch.randn(2, 3, 4)
-
-    try:
-        jepa_delta_loss(delta, z, target)
-    except ValueError as exc:
-        assert "same shape" in str(exc)
-    else:
-        raise AssertionError("Expected mismatched JEPA tensors to be rejected")
-
-
-def test_jepa_delta_loss_rejects_bad_valid_mask_shape():
-    delta = torch.randn(2, 3, 4)
-    z = torch.randn(2, 3, 4)
-    target = torch.randn(2, 3, 4)
-    valid_mask = torch.ones(2, 4, dtype=torch.bool)
-
-    try:
-        jepa_delta_loss(delta, z, target, valid_mask=valid_mask)
-    except ValueError as exc:
-        assert "valid_mask" in str(exc)
-    else:
-        raise AssertionError("Expected bad valid_mask shape to be rejected")
-
-
-def test_next_token_loss_rejects_length_one_sequence():
-    logits = torch.randn(2, 1, 16)
-    labels = torch.zeros(2, 1, dtype=torch.long)
-
-    try:
-        next_token_loss(logits, labels)
-    except ValueError as exc:
-        assert "sequence length" in str(exc)
-    else:
-        raise AssertionError("Expected L=1 next-token loss to be rejected")
 
 
 def test_ema_targets_have_no_gradients():

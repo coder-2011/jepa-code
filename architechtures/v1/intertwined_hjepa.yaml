@@ -1,0 +1,12 @@
+vocab_size: 256
+max_length: 128
+residual_dim: 256
+compressed_dim: 128
+depth: 4
+num_heads: 4
+predictor_hidden_dim: 256
+dropout: 0.0
+ema_momentum: 0.996
+lambda_jepa: 0.1
+jepa_warmup_steps: 0
+tie_weights: true
