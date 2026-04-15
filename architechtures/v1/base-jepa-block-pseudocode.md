@@ -4,37 +4,50 @@
 
 This file sketches only the base Intertwined H-JEPA block.
 
-Tokenizer and embeddings are outside this block. They can be borrowed from existing repo code. The base JEPA block itself should be simple:
+Tokenizer and embeddings are outside this block. They can be borrowed from existing repo code. The base JEPA block itself should stay compact:
 
 ```text
-compress current state -> predict delta -> project enriched state -> add to residual stream
+pre-norm attention -> compress post-attention state -> predict delta -> project enriched state -> add to residual stream
 ```
 
-The first pass contains only the JEPA transform.
+The first pass contains:
 
-## Current Gimmicks
+- pre-norm self-attention
+- compressor
+- predictor
+- projector
+
+Out of scope for the first pass:
+
+- FFN residual sublayer
+- SIGReg / VICReg
+- tokenizer implementation work
+- caching
+
+## Current Mechanics
 
 These are the deliberate mechanisms currently in the design:
 
-1. **Compressed JEPA space**
+1. **Pre-norm attention**
+   `Attention_L` runs on `LayerNorm(h_L)`, and its residual output defines the post-attention state.
+
+2. **Compressed JEPA space**
    `CE_L` maps residual width `D` into compressed width `K`.
 
-2. **Delta prediction**
+3. **Delta prediction**
    `Pred_L` predicts `delta_L`, not the full target representation.
 
-3. **Enriched residual update**
+4. **Enriched residual update**
    The residual update uses `Proj_L(z_L + delta_L)`, not just `Proj_L(delta_L)`.
 
-4. **One-layer-future EMA compressor target**
-   The target for layer `L` comes from the EMA compressor copy of layer `L + 1`.
+5. **One-layer-future EMA compressor target**
+   The target for layer `L` comes from the EMA compressor copy of layer `L + 1`, applied to the next layer's normalized post-attention state.
 
-5. **Stop-gradient delta target**
+6. **Stop-gradient delta target**
    The JEPA loss compares `delta_L` to `target_z_L - sg(z_L)`.
 
-6. **LM head outside the block**
+7. **LM head outside the block**
    The final model still has an LM head, but the base JEPA block does not know about vocabulary logits.
-
-Out of scope for the first pass: FFN residual sublayers and custom tokenizer work.
 
 ## Contract
 
@@ -42,23 +55,26 @@ For layer `L` inside one generation/training forward:
 
 ```text
 input:
-  x_L: residual stream entering this JEPA block
+  h_L: residual stream entering this JEPA block
        generation shape: (B, 1, D) or (B, D)
        teacher-forced training shape: (B, T, D)
 
 student forward:
-  z_L      = CE_L(x_L)
-  delta_L  = Pred_L(z_L)
-  update_L = Proj_L(z_L + delta_L)
-  x_{L+1}  = x_L + update_L
+  h_L_normed     = LayerNorm(h_L)
+  h_L_post_attn  = h_L + Attention_L(h_L_normed)
+  z_L            = CE_L(LayerNorm(h_L_post_attn))
+  delta_L        = Pred_L(z_L)
+  update_L       = Proj_L(z_L + delta_L)
+  h_{L+1}        = h_L_post_attn + update_L
 
 stored for later:
-  x_L
+  h_L
+  h_L_post_attn
   z_L
   delta_L
 
 target/loss later, after full forward:
-  target_z_L   = sg(CEbar_{L+1}(x_{L+1}))
+  target_z_L   = sg(CEbar_{L+1}(LayerNorm(h_{L+1}_post_attn)))
   target_delta = target_z_L - sg(z_L)
   L_jepa_L     = MSE(delta_L, target_delta)
 ```
@@ -66,15 +82,15 @@ target/loss later, after full forward:
 Autoregressive usage:
 
 ```text
-1. Embed the current generated prefix or current token state.
+1. Embed the current prefix.
 2. Run the JEPA stack once.
 3. LM head emits logits for the next token.
-4. Sample/choose one token.
-5. Append that token to the generated sequence.
-6. Run the model again for the next token.
+4. Sample or choose one token.
+5. Append that token.
+6. Run the model again.
 ```
 
-The first pass does not implement caching. It can simply rerun the full prefix each generation step if using prefix-shaped tensors.
+The first pass does not implement caching. It can rerun the full prefix each generation step.
 
 ## Error Handling Policy
 
@@ -84,7 +100,7 @@ Only add manual checks for invariants that would otherwise fail later with a con
 
 ```text
 depth must be at least 2
-compressed dims must match between delta, z, and target
+delta, z, and target_z must have the same shape in JEPA loss
 valid_mask must not select zero elements when used for a loss
 ```
 
@@ -97,13 +113,22 @@ class BaseJEPABlock(nn.Module):
         residual_dim: int,     # D
         compressed_dim: int,   # K
         predictor_hidden_dim: int,
+        num_heads: int,
         dropout: float = 0.0,
     ):
         super().__init__()
 
-        # CE_L: compress residual stream into JEPA space.
+        self.attn_norm = RMSNorm(residual_dim)
+        self.attn = CausalSelfAttention(
+            residual_dim=residual_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+
+        self.ce_norm = RMSNorm(residual_dim)
+
+        # CE_L: compress normalized post-attention state into JEPA space.
         self.compressor = Sequential(
-            RMSNorm(residual_dim),
             Linear(residual_dim, compressed_dim),
             GELU(),
             Dropout(dropout),
@@ -129,17 +154,22 @@ class BaseJEPABlock(nn.Module):
 ## Student Forward
 
 ```python
-def forward_student(self, x_l):
-    # x_l: (B, T, D), or (B, D) for a single-token generation step
+def forward_student(self, h_l):
+    # h_l: (B, T, D), or (B, D) for a single-token generation step
 
-    z_l = self.compressor(x_l)
+    h_l_normed = self.attn_norm(h_l)
+    attn_out = self.attn(h_l_normed)
+    h_l_post_attn = h_l + attn_out
+
+    z_l = self.compressor(self.ce_norm(h_l_post_attn))
     delta_l = self.predictor(z_l)
     update_l = self.projector(z_l + delta_l)
-    x_next = x_l + update_l
+    h_next = h_l_post_attn + update_l
 
     return {
-        "x_next": x_next,
-        "x": x_l,
+        "h_next": h_next,
+        "h": h_l,
+        "post_attn": h_l_post_attn,
         "z": z_l,
         "delta": delta_l,
     }
@@ -175,7 +205,7 @@ Targets are computed under torch.no_grad().
 The EMA update runs only after optimizer.step().
 ```
 
-Do not EMA the predictor or projector in the first pass. The EMA branch is only a target-value branch.
+Do not EMA the predictor or projector in the first pass.
 
 Clean helper:
 
@@ -193,42 +223,25 @@ Usage:
 self.ema_compressors = make_ema_copy(self.compressors)
 ```
 
-Prefer this over a manual parameter loop:
-
-```python
-for p in self.ema_compressors.parameters():
-    p.requires_grad_(False)
-```
-
 ## Teacher Target Forward
 
-The teacher target for block `L` is computed by the EMA compressor copy of the **next** JEPA block, using the next layer's student state.
+The teacher target for block `L` is computed by the EMA compressor copy of the **next** JEPA block, using the next layer's normalized student post-attention state.
 
 ```python
 @torch.no_grad()
 def compute_jepa_target_for_layer(
     layer_index,
     ema_compressors,
-    stored_x_next,
-    target_projectors,
+    ce_norms,
+    stored_post_attn,
 ):
-    # For L, use EMA compressor L+1 and x_{L+1}.
     next_ema_compressor = ema_compressors[layer_index + 1]
-    x_next = stored_x_next[layer_index]
+    next_post_attn = stored_post_attn[layer_index + 1]
 
-    target_z_l = next_ema_compressor(x_next)
-
-    # If compressed dims differ by layer, project to this layer's K.
-    # For v1 with one K everywhere, this can be Identity.
-    target_z_l = target_projectors[layer_index](target_z_l)
+    target_z_l = next_ema_compressor(
+        ce_norms[layer_index + 1](next_post_attn)
+    )
     return target_z_l.detach()
-```
-
-Inside each block:
-
-```python
-def forward_target_compression(self, x):
-    return self.compressor(x)
 ```
 
 Important implementation choice:
@@ -242,17 +255,14 @@ layers 0 through depth-2, because layer depth-1 has no future layer target.
 
 ```python
 def jepa_delta_loss(delta_l, z_l, target_z_l, valid_mask=None):
-    # delta_l: (B, T, K)
-    # z_l:     (B, T, K)
-    # target_z_l: (B, T, K)
+    if delta_l.shape != z_l.shape or delta_l.shape != target_z_l.shape:
+        raise ValueError("delta_l, z_l, and target_z_l must have the same shape")
 
     target_delta = target_z_l.detach() - z_l.detach()
     error = (delta_l - target_delta).pow(2)
 
     if valid_mask is not None:
-        # valid_mask: (B, T), True where loss is active.
         mask = valid_mask.unsqueeze(-1).to(error.dtype)
-        # Explicit check is useful here; silently dividing by zero hides bad batches.
         if mask.sum() == 0:
             raise ValueError("valid_mask selects no JEPA loss positions")
         denom = mask.sum().mul(error.shape[-1])
@@ -261,134 +271,37 @@ def jepa_delta_loss(delta_l, z_l, target_z_l, valid_mask=None):
     return error.mean()
 ```
 
-## Full Model Loop Using The Block
-
-This is a stack of JEPA blocks only.
-
-```python
-def forward(input_ids, labels=None, valid_mask=None, step=None):
-    x = borrowed_embeddings(input_ids)
-
-    stored = {
-        "x_in": [],
-        "x_next": [],
-        "z": [],
-        "delta": [],
-    }
-
-    # Student forward first.
-    for layer_index, block in enumerate(student_blocks):
-        out = block.forward_student(x)
-        x = out["x_next"]
-
-        stored["x_in"].append(out["x"])
-        stored["x_next"].append(out["x_next"])
-        stored["z"].append(out["z"])
-        stored["delta"].append(out["delta"])
-
-    logits = lm_head(final_norm(x))
-    loss_main = next_token_loss(logits, labels, valid_mask)
-
-    # Targets and local JEPA losses second.
-    jepa_losses = []
-    for layer_index in range(num_layers - 1):
-        target_z = compute_jepa_target_for_layer(
-            layer_index=layer_index,
-            ema_compressors=ema_compressors,
-            stored_x_next=stored["x_next"],
-            target_projectors=target_projectors,
-        )
-
-        jepa_losses.append(
-            jepa_delta_loss(
-                delta_l=stored["delta"][layer_index],
-                z_l=stored["z"][layer_index],
-                target_z_l=target_z,
-                valid_mask=valid_mask,
-            )
-        )
-
-    lambda_eff = warmup(config.lambda_jepa, step, config.jepa_warmup_steps)
-
-    loss_jepa = weighted_sum(jepa_losses)
-    loss = loss_main + lambda_eff * loss_jepa
-
-    return {
-        "loss": loss,
-        "loss_main": loss_main,
-        "loss_jepa": loss_jepa,
-        "logits": logits,
-        "diagnostics": build_diagnostics(stored, jepa_losses),
-    }
-```
-
-LM-head weight tying, if compatible:
-
-```python
-if tie_weights:
-    lm_head.weight = token_embedding.weight
-```
-
-Only do this when both weights are shaped `(vocab_size, residual_dim)`. If the borrowed embedding path does not expose a compatible token embedding table, keep the LM head untied.
-
-Initial config:
+For v1, use plain MSE only:
 
 ```text
-lambda_jepa = 0.1
-jepa_warmup_steps = small nonzero warmup for real training, 0 for shape tests
+L_jepa_L = MSE(delta_L, target_z_L.detach() - z_L.detach())
 ```
 
-## Training Step Pseudocode
+## Integration In A Full Model
 
-```python
-optimizer.zero_grad(set_to_none=True)
+The outer model is responsible for:
 
-out = model(
-    input_ids=batch["input_ids"],
-    labels=batch["labels"],
-    valid_mask=batch.get("valid_mask"),
-    step=global_step,
-)
+- token + position embeddings
+- stacking JEPA blocks
+- storing post-attention states
+- LM head
+- next-token CE loss
+- EMA updates
 
-out["loss"].backward()
-clip_grad_norm_(model.student_parameters(), max_norm)
-optimizer.step()
-
-# EMA compressor update always happens after optimizer.step().
-model.update_ema()
-```
-
-EMA update helper:
-
-```python
-@torch.no_grad()
-def update_ema(self):
-    for ema_param, param in zip(
-        self.ema_compressors.parameters(),
-        self.compressors.parameters(),
-    ):
-        ema_param.mul_(self.ema_momentum).add_(
-            param,
-            alpha=1.0 - self.ema_momentum,
-        )
-```
-
-## First Tests
+The simplest full-model contract is:
 
 ```text
-test_block_student_forward_shapes
-  x_next: (B, T, D)
-  z:      (B, T, K)
-  delta:  (B, T, K)
+input_ids -> embeddings -> h_0
+h_0 -> block_0 -> h_1
+h_1 -> block_1 -> h_2
+...
+h_last -> final_norm -> lm_head -> logits
+```
 
-test_jepa_delta_loss_detaches_target
-  target_z and z do not receive gradients through target_delta
-  delta receives gradients
+And later:
 
-test_ema_target_no_grad
-  target computation creates no graph
-
-test_ema_updates_only_after_optimizer
-  EMA compressor parameters change after model.update_ema()
-  EMA compressor parameters do not have optimizer gradients
+```text
+for each layer L < depth - 1:
+  target_z_L = EMA compressor at L+1 applied to next post-attention state
+  loss_jepa_L = MSE(delta_L, target_z_L - sg(z_L))
 ```
