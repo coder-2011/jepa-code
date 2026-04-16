@@ -332,10 +332,11 @@ class IntertwinedHJEPA(nn.Module):
         layer_index: int,
         post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
-        # SIGReg regularizes the layer representation directly, so gradients are
-        # allowed to flow through the post-attention state and earlier computation.
         block = self.blocks[layer_index]
-        return block.compressor(block.ce_norm(post_attn_states[layer_index]))
+        # SIGReg should update only the compressor. The residual state and CE norm are fixed inputs here.
+        with torch.no_grad():
+            normed = block.ce_norm(post_attn_states[layer_index])
+        return block.compressor(normed)
 
     def forward(
         self,
@@ -358,7 +359,7 @@ class IntertwinedHJEPA(nn.Module):
             z:                 depth compressed states, each (B, L, K)
             deltas:            depth predicted deltas, each (B, L, K)
             targets:           depth - 1 EMA targets, each (B, L, K)
-            loss_sigreg_layers: depth - 1 local SIGReg losses
+            loss_sigreg_layers: depth local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
         h = self.embed(input_ids)
@@ -395,7 +396,8 @@ class IntertwinedHJEPA(nn.Module):
                     valid_mask=valid_mask,
                 )
             )
-            if self.config.beta_sigreg > 0:
+        if self.config.beta_sigreg > 0:
+            for layer_index in range(self.config.depth):
                 sigreg_input_l = self.compute_sigreg_input_for_layer(layer_index, post_attn_states)
                 if valid_mask is not None:
                     assert valid_mask.shape == sigreg_input_l.shape[:-1], (
@@ -407,7 +409,7 @@ class IntertwinedHJEPA(nn.Module):
         # Keep per-layer JEPA losses explicit and sum them into the total objective.
         loss_jepa = torch.stack(jepa_losses).sum()
         if not sigreg_losses:
-            sigreg_losses = [logits.new_zeros(()) for _ in range(self.config.depth - 1)]
+            sigreg_losses = [logits.new_zeros(()) for _ in range(self.config.depth)]
         loss_sigreg = torch.stack(sigreg_losses).sum()
         lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps)
         beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps)

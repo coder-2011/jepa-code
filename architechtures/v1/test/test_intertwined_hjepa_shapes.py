@@ -178,7 +178,7 @@ def test_model_forward_returns_expected_shapes():
     assert outputs["loss_jepa"].ndim == 0
     assert outputs["loss_sigreg"].ndim == 0
     assert len(outputs["loss_jepa_layers"]) == config.depth - 1
-    assert len(outputs["loss_sigreg_layers"]) == config.depth - 1
+    assert len(outputs["loss_sigreg_layers"]) == config.depth
     assert len(outputs["z"]) == config.depth
     assert len(outputs["deltas"]) == config.depth
     assert len(outputs["targets"]) == config.depth - 1
