@@ -88,6 +88,21 @@ class DeltaPredictor(nn.Module):
         return self.net(x)
 
 
+def init_intertwined_weights(module: nn.Module) -> None:
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    elif isinstance(module, nn.RMSNorm) and module.weight is not None:
+        nn.init.ones_(module.weight)
+    elif isinstance(module, nn.MultiheadAttention):
+        nn.init.normal_(module.in_proj_weight, mean=0.0, std=0.02)
+        if module.in_proj_bias is not None:
+            nn.init.zeros_(module.in_proj_bias)
+
+
 class IntertwinedBlock(nn.Module):
     def __init__(
         self,
@@ -260,18 +275,6 @@ class IntertwinedHJEPA(nn.Module):
                 for _ in range(config.depth)
             ]
         )
-        # Track EMA copies only for the compressors, matching the architecture docs.
-        ema_avg_fn = get_ema_multi_avg_fn(self.ema_momentum)
-        self.ema_compressors = nn.ModuleList(
-            AveragedModel(block.compressor, multi_avg_fn=ema_avg_fn, use_buffers=False)
-            for block in self.blocks
-        )
-        for ema_compressor in self.ema_compressors:
-            ema_compressor.requires_grad_(False)
-            ema_compressor.eval()
-            # AveragedModel already starts as a copy; setting n_averaged avoids the first update turning
-            # into another hard copy instead of the EMA blend we want after optimizer.step().
-            ema_compressor.n_averaged.fill_(1)
         self.final_norm = nn.RMSNorm(config.residual_dim)
         self.sigreg = SlicedEppsPulleySIGReg(
             num_slices=config.sigreg_num_slices,
@@ -284,6 +287,19 @@ class IntertwinedHJEPA(nn.Module):
             token_embedding=self.embeddings.token_embedding,
             tie_weights=config.tie_weights,
         )
+        self.apply(init_intertwined_weights)
+        # Track EMA copies only for the compressors, matching the architecture docs.
+        ema_avg_fn = get_ema_multi_avg_fn(self.ema_momentum)
+        self.ema_compressors = nn.ModuleList(
+            AveragedModel(block.compressor, multi_avg_fn=ema_avg_fn, use_buffers=False)
+            for block in self.blocks
+        )
+        for ema_compressor in self.ema_compressors:
+            ema_compressor.requires_grad_(False)
+            ema_compressor.eval()
+            # AveragedModel already starts as a copy; setting n_averaged avoids the first update turning
+            # into another hard copy instead of the EMA blend we want after optimizer.step().
+            ema_compressor.n_averaged.fill_(1)
 
     def student_parameters(self):
         # EMA parameters are frozen, so this naturally returns only trainable student weights.

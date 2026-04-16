@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 from intertwined_hjepa import IntertwinedBlock, IntertwinedConfig, IntertwinedHJEPA
 from text_helpers import HFTokenizer, LMHead, TokenEmbeddings
@@ -108,6 +109,27 @@ def test_config_loads_from_yaml_and_builds_model():
     assert model.embeddings.token_embedding.num_embeddings == config.vocab_size
     assert model.embeddings.position_embedding.num_embeddings == config.max_length
     assert model.embeddings.token_embedding.embedding_dim == config.residual_dim
+
+
+def test_model_uses_explicit_small_initialization():
+    torch.manual_seed(0)
+    model = IntertwinedHJEPA(make_config())
+
+    assert 0.0 < model.embeddings.token_embedding.weight.std().item() < 0.1
+    assert 0.0 < model.embeddings.position_embedding.weight.std().item() < 0.1
+    for module in model.modules():
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            assert torch.count_nonzero(module.bias) == 0
+        if isinstance(module, nn.RMSNorm):
+            assert torch.allclose(module.weight, torch.ones_like(module.weight))
+        if isinstance(module, nn.MultiheadAttention):
+            assert 0.0 < module.in_proj_weight.std().item() < 0.1
+    for block, ema_compressor in zip(model.blocks, model.ema_compressors):
+        for student_parameter, ema_parameter in zip(
+            block.compressor.parameters(),
+            ema_compressor.module.parameters(),
+        ):
+            assert torch.equal(student_parameter, ema_parameter)
 
 
 def test_model_forward_returns_expected_shapes():
