@@ -32,7 +32,7 @@ def make_model():
     )
 
 
-def test_jepa_delta_loss_detaches_target_delta():
+def test_jepa_delta_loss_stops_teacher_but_updates_z():
     delta = torch.randn(2, 3, 4, requires_grad=True)
     z = torch.randn(2, 3, 4, requires_grad=True)
     target = torch.randn(2, 3, 4, requires_grad=True)
@@ -41,7 +41,7 @@ def test_jepa_delta_loss_detaches_target_delta():
     loss.backward()
 
     assert delta.grad is not None
-    assert z.grad is None
+    assert z.grad is not None
     assert target.grad is None
 
 
@@ -74,6 +74,21 @@ def test_total_loss_sums_lm_and_local_jepa_losses():
 
     expected = outputs["loss_main"] + model.config.lambda_jepa * torch.stack(outputs["loss_jepa_layers"]).sum()
     assert torch.allclose(outputs["loss"], expected)
+
+
+def test_jepa_loss_updates_ce_path():
+    model = make_model()
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids)
+    outputs["loss"].backward()
+
+    first_block = model.blocks[0]
+    assert any(parameter.grad is not None for parameter in first_block.attn.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.ce_norm.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.compressor.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.predictor.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
 
 
 def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
@@ -165,6 +180,7 @@ def test_sigreg_loss_updates_layer_representation_path():
     assert all(parameter.grad is None for parameter in final_block.predictor.parameters())
     assert all(parameter.grad is None for parameter in final_block.projector.parameters())
     assert any(parameter.grad is not None for parameter in model.embeddings.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_ce_norms.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
 
 
@@ -174,19 +190,26 @@ def test_training_step_updates_students_then_ema():
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
 
     student_before = [parameter.detach().clone() for parameter in model.student_parameters()]
-    ema_before = [parameter.detach().clone() for parameter in model.ema_compressors.parameters()]
+    ema_before = [
+        parameter.detach().clone()
+        for parameter in list(model.ema_ce_norms.parameters()) + list(model.ema_compressors.parameters())
+    ]
 
     outputs = model(input_ids=input_ids, labels=input_ids)
     outputs["loss"].backward()
 
     assert any(parameter.grad is not None for parameter in model.blocks.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_ce_norms.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
 
     optimizer.step()
     model.update_ema()
 
     student_after = [parameter.detach() for parameter in model.student_parameters()]
-    ema_after = [parameter.detach() for parameter in model.ema_compressors.parameters()]
+    ema_after = [
+        parameter.detach()
+        for parameter in list(model.ema_ce_norms.parameters()) + list(model.ema_compressors.parameters())
+    ]
 
     assert any(not torch.equal(before, after) for before, after in zip(student_before, student_after))
     assert any(not torch.equal(before, after) for before, after in zip(ema_before, ema_after))

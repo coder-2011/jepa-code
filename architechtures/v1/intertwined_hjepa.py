@@ -196,16 +196,16 @@ def jepa_delta_loss(
     if delta_l.shape != z_l.shape or delta_l.shape != target_z_l.shape:
         raise ValueError("delta_l, z_l, and target_z_l must have exactly the same shape")
 
-    # Stop gradients through both pieces of the teacher delta target.
+    # The EMA target is stopped, while z_l stays live so JEPA trains the CE path.
     if valid_mask is None:
-        return F.mse_loss(delta_l, target_z_l.detach() - z_l.detach())
+        return F.mse_loss(delta_l, target_z_l.detach() - z_l)
 
     assert valid_mask.shape == delta_l.shape[:-1], "valid_mask must match the leading shape of delta_l"
     if not valid_mask.any():
         raise ValueError("valid_mask selects no JEPA loss positions")
 
     # valid_mask is over token positions (B, L); broadcast it across the compressed width K.
-    error = F.mse_loss(delta_l, target_z_l.detach() - z_l.detach(), reduction="none")
+    error = F.mse_loss(delta_l, target_z_l.detach() - z_l, reduction="none")
     expanded_mask = valid_mask.unsqueeze(-1).expand_as(error)
     return error.masked_select(expanded_mask).mean()
 
@@ -288,13 +288,17 @@ class IntertwinedHJEPA(nn.Module):
             tie_weights=config.tie_weights,
         )
         self.apply(init_intertwined_weights)
-        # Track EMA copies only for the compressors, matching the architecture docs.
+        # Track EMA copies of the full CE path: norm + compressor.
         ema_avg_fn = get_ema_multi_avg_fn(self.ema_momentum)
+        self.ema_ce_norms = nn.ModuleList(nn.RMSNorm(config.residual_dim) for _ in self.blocks)
         self.ema_compressors = nn.ModuleList(
             AveragedModel(block.compressor, multi_avg_fn=ema_avg_fn, use_buffers=False)
             for block in self.blocks
         )
-        for ema_compressor in self.ema_compressors:
+        for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
+            ema_ce_norm.load_state_dict(block.ce_norm.state_dict())
+            ema_ce_norm.requires_grad_(False)
+            ema_ce_norm.eval()
             ema_compressor.requires_grad_(False)
             ema_compressor.eval()
             # AveragedModel already starts as a copy; setting n_averaged avoids the first update turning
@@ -317,12 +321,10 @@ class IntertwinedHJEPA(nn.Module):
     ) -> torch.Tensor:
         # For layer l, the teacher target comes from the next layer's post-attention state:
         # post_attn_states[layer_index + 1]: (B, L, D) -> target_z_l: (B, L, K)
-        next_block = self.blocks[layer_index + 1]
         next_post_attn = post_attn_states[layer_index + 1]
-        # Mirror the student's CE input path, but swap in the EMA compressor from layer l+1.
-        target_z_l = self.ema_compressors[layer_index + 1].module(
-            next_block.ce_norm(next_post_attn)
-        )
+        # Mirror the student's full CE input path, but use the EMA copy from layer l+1.
+        ema_norm = self.ema_ce_norms[layer_index + 1]
+        target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_post_attn))
         return target_z_l.detach()
 
     def compute_sigreg_input_for_layer(
@@ -450,6 +452,17 @@ class IntertwinedHJEPA(nn.Module):
 
     @torch.no_grad()
     def update_ema(self) -> None:
-        # Call after optimizer.step() so the EMA teacher lags the student compressors.
-        for ema_compressor, block in zip(self.ema_compressors, self.blocks):
+        # Call after optimizer.step() so the EMA teacher lags the student CE path.
+        for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
+            ema_ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - self.ema_momentum)
             ema_compressor.update_parameters(block.compressor)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        upgraded = state_dict.copy()
+        for layer_index in range(self.config.depth):
+            ema_norm_key = f"ema_ce_norms.{layer_index}.weight"
+            student_norm_key = f"blocks.{layer_index}.ce_norm.weight"
+            if ema_norm_key not in upgraded and student_norm_key in upgraded:
+                upgraded[ema_norm_key] = upgraded[student_norm_key].detach().clone()
+
+        return super().load_state_dict(upgraded, strict=strict, assign=assign)

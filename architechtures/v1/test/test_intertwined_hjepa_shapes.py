@@ -124,12 +124,45 @@ def test_model_uses_explicit_small_initialization():
             assert torch.allclose(module.weight, torch.ones_like(module.weight))
         if isinstance(module, nn.MultiheadAttention):
             assert 0.0 < module.in_proj_weight.std().item() < 0.1
-    for block, ema_compressor in zip(model.blocks, model.ema_compressors):
+    for block, ema_ce_norm, ema_compressor in zip(model.blocks, model.ema_ce_norms, model.ema_compressors):
+        assert torch.equal(block.ce_norm.weight, ema_ce_norm.weight)
         for student_parameter, ema_parameter in zip(
             block.compressor.parameters(),
             ema_compressor.module.parameters(),
         ):
             assert torch.equal(student_parameter, ema_parameter)
+
+
+def test_jepa_target_uses_ema_norm_not_live_norm():
+    model = IntertwinedHJEPA(make_config())
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+    outputs = model(input_ids=input_ids, labels=input_ids)
+    next_post_attn = outputs["post_attn_states"][1]
+
+    with torch.no_grad():
+        model.blocks[1].ce_norm.weight.fill_(2.0)
+
+    target = model.compute_jepa_target_for_layer(0, outputs["post_attn_states"])
+    ema_target = model.ema_compressors[1].module(model.ema_ce_norms[1](next_post_attn))
+    live_target = model.blocks[1].compressor(model.blocks[1].ce_norm(next_post_attn))
+
+    assert torch.allclose(target, ema_target)
+    assert not torch.allclose(target, live_target)
+
+
+def test_load_legacy_state_without_ema_ce_norms():
+    model = IntertwinedHJEPA(make_config())
+    legacy_state = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.startswith("ema_ce_norms.")
+    }
+    loaded = IntertwinedHJEPA(make_config())
+
+    loaded.load_state_dict(legacy_state)
+
+    for block, ema_ce_norm in zip(loaded.blocks, loaded.ema_ce_norms):
+        assert torch.equal(block.ce_norm.weight, ema_ce_norm.weight)
 
 
 def test_model_forward_returns_expected_shapes():
