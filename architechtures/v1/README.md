@@ -142,7 +142,7 @@ Call order during training:
 ```text
 loss.backward()
 optimizer.step()
-model.update_ema()
+model.update_ema(step_index)
 model.zero_grad(set_to_none=True)
 ```
 
@@ -160,6 +160,8 @@ num_heads: 4
 predictor_hidden_dim: 256
 dropout: 0.0
 ema_momentum: 0.996
+ema_momentum_final: 0.996
+ema_warmup_steps: 0
 lambda_jepa: 1.0
 jepa_warmup_steps: 100
 beta_sigreg: 0.04

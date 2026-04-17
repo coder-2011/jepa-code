@@ -7,6 +7,8 @@ num_heads: 12
 predictor_hidden_dim: 1536
 dropout: 0.0
 ema_momentum: 0.996
+ema_momentum_final: 0.996
+ema_warmup_steps: 0
 lambda_jepa: 1.0
 jepa_warmup_steps: 100
 jepa_dropout_rate: 0.0

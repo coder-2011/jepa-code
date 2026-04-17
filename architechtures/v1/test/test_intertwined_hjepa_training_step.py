@@ -250,3 +250,41 @@ def test_training_step_updates_students_then_ema():
     assert any(not torch.equal(before, after) for before, after in zip(student_before, student_after))
     assert any(not torch.equal(before, after) for before, after in zip(ema_before, ema_after))
     assert all(torch.equal(before, after) for before, after in zip(output_target_before, output_target_after))
+
+
+def test_scheduled_ema_update_uses_step():
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=8,
+            compressed_dim=4,
+            depth=3,
+            num_heads=2,
+            predictor_hidden_dim=16,
+            dropout=0.0,
+            ema_momentum=0.0,
+            ema_momentum_final=1.0,
+            ema_warmup_steps=10,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+        )
+    )
+
+    block = model.blocks[0]
+    ema_norm = model.ema_ce_norms[0]
+    ema_before = ema_norm.weight.detach().clone()
+
+    with torch.no_grad():
+        block.ce_norm.weight.fill_(2.0)
+
+    assert model.ema_momentum_at_step(0) == pytest.approx(0.1)
+    assert model.ema_momentum_at_step(9) == pytest.approx(1.0)
+
+    model.update_ema(step=0)
+
+    expected = ema_before.lerp(block.ce_norm.weight, 0.9)
+    assert torch.allclose(ema_norm.weight, expected)

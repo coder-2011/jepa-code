@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import nn
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from torch.optim.swa_utils import AveragedModel
 
 from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
@@ -56,6 +56,8 @@ class IntertwinedConfig:
     sigreg_t_max: float
     sigreg_n_points: int
     tie_weights: bool
+    ema_momentum_final: float = 0.996
+    ema_warmup_steps: int = 0
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "IntertwinedConfig":
@@ -321,9 +323,14 @@ class IntertwinedHJEPA(nn.Module):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
         assert 0.0 <= config.jepa_dropout_rate <= 1.0, "jepa_dropout_rate must be between 0 and 1"
+        assert 0.0 <= config.ema_momentum <= 1.0, "ema_momentum must be between 0 and 1"
+        assert 0.0 <= config.ema_momentum_final <= 1.0, "ema_momentum_final must be between 0 and 1"
+        assert config.ema_warmup_steps >= 0, "ema_warmup_steps must be non-negative"
 
         self.config = config
         self.ema_momentum = float(config.ema_momentum)
+        self.ema_momentum_final = float(config.ema_momentum_final)
+        self.ema_warmup_steps = int(config.ema_warmup_steps)
 
         # Plain learned token + position embeddings for v1.
         self.embeddings = TokenEmbeddings(
@@ -374,25 +381,24 @@ class IntertwinedHJEPA(nn.Module):
         self.output_target_compressor.requires_grad_(False)
         self.output_target_compressor.eval()
         # Track EMA copies of the full CE path: norm + compressor.
-        ema_avg_fn = get_ema_multi_avg_fn(self.ema_momentum)
         self.ema_ce_norms = nn.ModuleList(nn.RMSNorm(config.residual_dim) for _ in self.blocks)
-        self.ema_compressors = nn.ModuleList(
-            AveragedModel(block.compressor, multi_avg_fn=ema_avg_fn, use_buffers=False)
-            for block in self.blocks
-        )
+        self.ema_compressors = nn.ModuleList(AveragedModel(block.compressor, use_buffers=False) for block in self.blocks)
         for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
             ema_ce_norm.load_state_dict(block.ce_norm.state_dict())
             ema_ce_norm.requires_grad_(False)
             ema_ce_norm.eval()
             ema_compressor.requires_grad_(False)
             ema_compressor.eval()
-            # AveragedModel already starts as a copy; setting n_averaged avoids the first update turning
-            # into another hard copy instead of the EMA blend we want after optimizer.step().
-            ema_compressor.n_averaged.fill_(1)
 
     def student_parameters(self):
         # EMA parameters are frozen, so this naturally returns only trainable student weights.
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
+
+    def ema_momentum_at_step(self, step: int | None) -> float:
+        if step is None or self.ema_warmup_steps <= 0 or self.ema_momentum == self.ema_momentum_final:
+            return self.ema_momentum
+        progress = min(1.0, (step + 1) / self.ema_warmup_steps)
+        return self.ema_momentum + (self.ema_momentum_final - self.ema_momentum) * progress
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids: (B, L) -> h_0: (B, L, D)
@@ -541,11 +547,13 @@ class IntertwinedHJEPA(nn.Module):
         }
 
     @torch.no_grad()
-    def update_ema(self) -> None:
+    def update_ema(self, step: int | None = None) -> None:
         # Call after optimizer.step() so the EMA teacher lags the student CE path.
+        momentum = self.ema_momentum_at_step(step)
         for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
-            ema_ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - self.ema_momentum)
-            ema_compressor.update_parameters(block.compressor)
+            ema_ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - momentum)
+            for ema_parameter, student_parameter in zip(ema_compressor.module.parameters(), block.compressor.parameters()):
+                ema_parameter.lerp_(student_parameter, 1.0 - momentum)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         upgraded = state_dict.copy()

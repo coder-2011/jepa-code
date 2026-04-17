@@ -414,7 +414,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.student_parameters(), args.grad_clip)
 
         optimizer_step(optimizer, scaler)
-        model.update_ema()
+        model.update_ema(step_index)
         model.zero_grad(set_to_none=True)
 
         synchronize()
