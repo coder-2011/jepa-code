@@ -164,7 +164,7 @@ ema_momentum_final: 0.996
 ema_warmup_steps: 0
 lambda_jepa: 1.0
 jepa_warmup_steps: 100
-beta_sigreg: 0.04
+beta_sigreg: 0.1
 sigreg_warmup_steps: 100
 sigreg_num_slices: 256
 sigreg_t_max: 3.0
