@@ -185,6 +185,7 @@ Run project commands with `uv run` so they execute inside the synced environment
 Use `uv lock` when you need to refresh the lockfile, and avoid manual `venv`/`pip` setup for the normal workflow.
 
 W&B is included in the project dependencies, so no separate install step is needed.
+This repo now targets a Blackwell-friendly stack: PyTorch `2.9.1` with CUDA `13.0` wheels, `torchao>=0.15.0`, and `flash-attn-4==4.0.0b9` cu13 for attention.
 
 The training script expects cached Parameter Golf FineWeb shards unless `--dataset-root` points directly at a compatible dataset folder.
 
