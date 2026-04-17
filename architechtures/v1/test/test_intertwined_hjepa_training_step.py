@@ -88,7 +88,10 @@ def test_jepa_loss_updates_ce_path():
     assert any(parameter.grad is not None for parameter in first_block.ce_norm.parameters())
     assert any(parameter.grad is not None for parameter in first_block.compressor.parameters())
     assert any(parameter.grad is not None for parameter in first_block.predictor.parameters())
+    assert all(parameter.grad is None for parameter in model.final_block.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
 
 
 def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
@@ -135,7 +138,7 @@ def test_total_loss_includes_local_sigreg_when_enabled():
     assert outputs["loss_sigreg"] > 0
 
 
-def test_sigreg_loss_only_updates_compressors():
+def test_sigreg_loss_updates_compressor_only():
     model = IntertwinedHJEPA(
         replace(
             YAML_CONFIG,
@@ -160,15 +163,18 @@ def test_sigreg_loss_only_updates_compressors():
     outputs["loss"].backward()
 
     for block in model.blocks:
+        assert any(parameter.grad is not None for parameter in block.compressor.parameters())
         assert all(parameter.grad is None for parameter in block.attn.parameters())
         assert all(parameter.grad is None for parameter in block.ce_norm.parameters())
-        assert any(parameter.grad is not None for parameter in block.compressor.parameters())
         assert all(parameter.grad is None for parameter in block.predictor.parameters())
         assert all(parameter.grad is None for parameter in block.projector.parameters())
 
+    assert all(parameter.grad is None for parameter in model.final_block.parameters())
     assert all(parameter.grad is None for parameter in model.embeddings.parameters())
     assert all(parameter.grad is None for parameter in model.ema_ce_norms.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
 
 
 def test_training_step_updates_students_then_ema():
@@ -181,13 +187,21 @@ def test_training_step_updates_students_then_ema():
         parameter.detach().clone()
         for parameter in list(model.ema_ce_norms.parameters()) + list(model.ema_compressors.parameters())
     ]
+    output_target_before = [
+        parameter.detach().clone()
+        for parameter in list(model.output_target_norm.parameters())
+        + list(model.output_target_compressor.parameters())
+    ]
 
     outputs = model(input_ids=input_ids, labels=input_ids)
     outputs["loss"].backward()
 
     assert any(parameter.grad is not None for parameter in model.blocks.parameters())
+    assert any(parameter.grad is not None for parameter in model.final_block.parameters())
     assert all(parameter.grad is None for parameter in model.ema_ce_norms.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
+    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
 
     optimizer.step()
     model.update_ema()
@@ -197,6 +211,12 @@ def test_training_step_updates_students_then_ema():
         parameter.detach()
         for parameter in list(model.ema_ce_norms.parameters()) + list(model.ema_compressors.parameters())
     ]
+    output_target_after = [
+        parameter.detach()
+        for parameter in list(model.output_target_norm.parameters())
+        + list(model.output_target_compressor.parameters())
+    ]
 
     assert any(not torch.equal(before, after) for before, after in zip(student_before, student_after))
     assert any(not torch.equal(before, after) for before, after in zip(ema_before, ema_after))
+    assert all(torch.equal(before, after) for before, after in zip(output_target_before, output_target_after))

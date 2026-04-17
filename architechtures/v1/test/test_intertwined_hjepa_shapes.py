@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from intertwined_hjepa import IntertwinedBlock, IntertwinedConfig, IntertwinedHJEPA
+from intertwined_hjepa import FinalResidualBlock, IntertwinedBlock, IntertwinedConfig, IntertwinedHJEPA
 from text_helpers import HFTokenizer, LMHead, TokenEmbeddings
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +48,22 @@ def test_block_student_forward_shapes():
     assert out["x_post_attn"].shape == (batch_size, sequence_length, config.residual_dim)
     assert out["z"].shape == (batch_size, sequence_length, config.compressed_dim)
     assert out["delta"].shape == (batch_size, sequence_length, config.compressed_dim)
+
+
+def test_final_residual_block_shapes():
+    config = make_config()
+    block = FinalResidualBlock(
+        residual_dim=config.residual_dim,
+        hidden_dim=config.predictor_hidden_dim,
+        num_heads=config.num_heads,
+        dropout=config.dropout,
+    )
+    batch_size = 2
+    sequence_length = min(5, config.max_length)
+    out = block(torch.randn(batch_size, sequence_length, config.residual_dim))
+
+    assert out["x_next"].shape == (batch_size, sequence_length, config.residual_dim)
+    assert out["x_post_attn"].shape == (batch_size, sequence_length, config.residual_dim)
 
 
 def test_text_helpers_shapes():
@@ -105,7 +121,10 @@ def test_config_loads_from_yaml_and_builds_model():
     config = YAML_CONFIG
     model = IntertwinedHJEPA(config)
 
-    assert len(model.blocks) == config.depth
+    assert len(model.blocks) == config.depth - 1
+    assert isinstance(model.final_block, FinalResidualBlock)
+    assert len(model.ema_ce_norms) == config.depth - 1
+    assert len(model.ema_compressors) == config.depth - 1
     assert model.embeddings.token_embedding.num_embeddings == config.vocab_size
     assert model.embeddings.position_embedding.num_embeddings == config.max_length
     assert model.embeddings.token_embedding.embedding_dim == config.residual_dim
@@ -150,6 +169,21 @@ def test_jepa_target_uses_ema_norm_not_live_norm():
     assert not torch.allclose(target, live_target)
 
 
+def test_last_jepa_target_uses_frozen_output_encoder():
+    model = IntertwinedHJEPA(make_config())
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+    outputs = model(input_ids=input_ids, labels=input_ids)
+    final_post_attn = outputs["post_attn_states"][-1]
+
+    target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["post_attn_states"])
+    expected = model.output_target_compressor(model.output_target_norm(final_post_attn))
+
+    assert torch.allclose(target, expected)
+    assert not target.requires_grad
+    assert all(not parameter.requires_grad for parameter in model.output_target_norm.parameters())
+    assert all(not parameter.requires_grad for parameter in model.output_target_compressor.parameters())
+
+
 def test_load_legacy_state_without_ema_ce_norms():
     model = IntertwinedHJEPA(make_config())
     legacy_state = {
@@ -178,10 +212,12 @@ def test_model_forward_returns_expected_shapes():
     assert outputs["loss_jepa"].ndim == 0
     assert outputs["loss_sigreg"].ndim == 0
     assert len(outputs["loss_jepa_layers"]) == config.depth - 1
-    assert len(outputs["loss_sigreg_layers"]) == config.depth
-    assert len(outputs["z"]) == config.depth
-    assert len(outputs["deltas"]) == config.depth
+    assert len(outputs["loss_sigreg_layers"]) == config.depth - 1
+    assert len(outputs["z"]) == config.depth - 1
+    assert len(outputs["deltas"]) == config.depth - 1
     assert len(outputs["targets"]) == config.depth - 1
+    assert len(outputs["states"]) == config.depth + 1
+    assert len(outputs["post_attn_states"]) == config.depth
 
 
 def test_model_forward_without_labels_uses_jepa_loss():

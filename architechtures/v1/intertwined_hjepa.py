@@ -186,6 +186,54 @@ class IntertwinedBlock(nn.Module):
         }
 
 
+class FinalResidualBlock(nn.Module):
+    def __init__(
+        self,
+        residual_dim: int,
+        hidden_dim: int,
+        num_heads: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.attn_norm = nn.RMSNorm(residual_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=residual_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+            bias=False,
+        )
+        self.mlp = nn.Sequential(
+            nn.RMSNorm(residual_dim),
+            nn.Linear(residual_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, residual_dim),
+        )
+
+    def forward(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
+        x_l_normed = self.attn_norm(x_l)
+        sequence_length = x_l_normed.shape[1]
+        causal_mask = torch.ones(
+            sequence_length,
+            sequence_length,
+            dtype=torch.bool,
+            device=x_l_normed.device,
+        ).triu(1)
+        attn_out, _ = self.attn(
+            x_l_normed,
+            x_l_normed,
+            x_l_normed,
+            attn_mask=causal_mask,
+            need_weights=False,
+        )
+        x_post_attn = x_l + attn_out
+        return {
+            "x_next": x_post_attn + self.mlp(x_post_attn),
+            "x_post_attn": x_post_attn,
+        }
+
+
 def jepa_delta_loss(
     delta_l: torch.Tensor,
     z_l: torch.Tensor,
@@ -240,13 +288,15 @@ def warmup_weight(weight: float, step: int | None, warmup_steps: int) -> float:
 
 class IntertwinedHJEPA(nn.Module):
     """
+    For depth=N, the model has N-1 JEPA blocks and one normal final residual block.
+
     h_l_post_attn = h_l + Attention_l(RMSNorm(h_l))
     z_l = CE_l(RMSNorm(h_l_post_attn))
     d_l = Pred_l(z_l)
     h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
 
-    target_z_l = sg(CEbar_{l+1}(RMSNorm(h_{l+1}_post_attn)))
-    L_jepa_l = MSE(d_l, target_z_l - sg(z_l))
+    target_z_l = sg(CEbar_{l+1}(h_{l+1}_post_attn)) or sg(T_out(h_final_post_attn))
+    L_jepa_l = MSE(d_l, target_z_l - z_l)
     """
 
     def __init__(self, config: IntertwinedConfig):
@@ -262,7 +312,7 @@ class IntertwinedHJEPA(nn.Module):
             max_length=config.max_length,
             residual_dim=config.residual_dim,
         )
-        # Uniform blocks keep the stack simple; the last block still produces z/delta even though it has no JEPA loss.
+        jepa_depth = config.depth - 1
         self.blocks = nn.ModuleList(
             [
                 IntertwinedBlock(
@@ -272,8 +322,14 @@ class IntertwinedHJEPA(nn.Module):
                     num_heads=config.num_heads,
                     dropout=config.dropout,
                 )
-                for _ in range(config.depth)
+                for _ in range(jepa_depth)
             ]
+        )
+        self.final_block = FinalResidualBlock(
+            residual_dim=config.residual_dim,
+            hidden_dim=config.predictor_hidden_dim,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
         )
         self.final_norm = nn.RMSNorm(config.residual_dim)
         self.sigreg = SlicedEppsPulleySIGReg(
@@ -287,7 +343,17 @@ class IntertwinedHJEPA(nn.Module):
             token_embedding=self.embeddings.token_embedding,
             tie_weights=config.tie_weights,
         )
+        self.output_target_norm = nn.RMSNorm(config.residual_dim)
+        self.output_target_compressor = SimpleCompressor(
+            config.residual_dim,
+            config.compressed_dim,
+            dropout=0.0,
+        )
         self.apply(init_intertwined_weights)
+        self.output_target_norm.requires_grad_(False)
+        self.output_target_norm.eval()
+        self.output_target_compressor.requires_grad_(False)
+        self.output_target_compressor.eval()
         # Track EMA copies of the full CE path: norm + compressor.
         ema_avg_fn = get_ema_multi_avg_fn(self.ema_momentum)
         self.ema_ce_norms = nn.ModuleList(nn.RMSNorm(config.residual_dim) for _ in self.blocks)
@@ -319,12 +385,13 @@ class IntertwinedHJEPA(nn.Module):
         layer_index: int,
         post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
-        # For layer l, the teacher target comes from the next layer's post-attention state:
-        # post_attn_states[layer_index + 1]: (B, L, D) -> target_z_l: (B, L, K)
+        assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
         next_post_attn = post_attn_states[layer_index + 1]
-        # Mirror the student's full CE input path, but use the EMA copy from layer l+1.
-        ema_norm = self.ema_ce_norms[layer_index + 1]
-        target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_post_attn))
+        if layer_index + 1 < len(self.blocks):
+            ema_norm = self.ema_ce_norms[layer_index + 1]
+            target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_post_attn))
+        else:
+            target_z_l = self.output_target_compressor(self.output_target_norm(next_post_attn))
         return target_z_l.detach()
 
     def compute_sigreg_input_for_layer(
@@ -333,7 +400,6 @@ class IntertwinedHJEPA(nn.Module):
         post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
         block = self.blocks[layer_index]
-        # SIGReg should update only the compressor. The residual state and CE norm are fixed inputs here.
         with torch.no_grad():
             normed = block.ce_norm(post_attn_states[layer_index])
         return block.compressor(normed)
@@ -356,10 +422,10 @@ class IntertwinedHJEPA(nn.Module):
             final_states:      (B, L, D)
             states:            depth + 1 residual states, each (B, L, D)
             post_attn_states:  depth states, each (B, L, D)
-            z:                 depth compressed states, each (B, L, K)
-            deltas:            depth predicted deltas, each (B, L, K)
-            targets:           depth - 1 EMA targets, each (B, L, K)
-            loss_sigreg_layers: depth local SIGReg losses
+            z:                 depth - 1 JEPA compressed states, each (B, L, K)
+            deltas:            depth - 1 predicted deltas, each (B, L, K)
+            targets:           depth - 1 stopped targets, each (B, L, K)
+            loss_sigreg_layers: depth - 1 local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
         h = self.embed(input_ids)
@@ -368,7 +434,7 @@ class IntertwinedHJEPA(nn.Module):
         compressed = []
         deltas = []
 
-        # Each block preserves the dense (B, L, *) leading shape; only the trailing width flips between D and K.
+        # JEPA blocks preserve the dense residual stream and expose compressed local predictions.
         for block in self.blocks:
             states.append(h)
             out = block.forward_student(h)
@@ -378,14 +444,17 @@ class IntertwinedHJEPA(nn.Module):
             deltas.append(out["delta"])
 
         states.append(h)
+        final_out = self.final_block(h)
+        h = final_out["x_next"]
+        post_attn_states.append(final_out["x_post_attn"])
+        states.append(h)
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
 
         targets = []
         jepa_losses = []
         sigreg_losses = []
-        # Only layers 0..depth-2 receive JEPA loss because the final layer has no l+1 teacher target.
-        for layer_index in range(self.config.depth - 1):
+        for layer_index in range(len(self.blocks)):
             target_z_l = self.compute_jepa_target_for_layer(layer_index, post_attn_states)
             targets.append(target_z_l)
             jepa_losses.append(
@@ -397,7 +466,7 @@ class IntertwinedHJEPA(nn.Module):
                 )
             )
         if self.config.beta_sigreg > 0:
-            for layer_index in range(self.config.depth):
+            for layer_index in range(len(self.blocks)):
                 sigreg_input_l = self.compute_sigreg_input_for_layer(layer_index, post_attn_states)
                 if valid_mask is not None:
                     assert valid_mask.shape == sigreg_input_l.shape[:-1], (
@@ -409,7 +478,7 @@ class IntertwinedHJEPA(nn.Module):
         # Keep per-layer JEPA losses explicit and sum them into the total objective.
         loss_jepa = torch.stack(jepa_losses).sum()
         if not sigreg_losses:
-            sigreg_losses = [logits.new_zeros(()) for _ in range(self.config.depth)]
+            sigreg_losses = [logits.new_zeros(()) for _ in range(len(self.blocks))]
         loss_sigreg = torch.stack(sigreg_losses).sum()
         lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps)
         beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps)
@@ -461,7 +530,7 @@ class IntertwinedHJEPA(nn.Module):
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         upgraded = state_dict.copy()
-        for layer_index in range(self.config.depth):
+        for layer_index in range(len(self.blocks)):
             ema_norm_key = f"ema_ce_norms.{layer_index}.weight"
             student_norm_key = f"blocks.{layer_index}.ce_norm.weight"
             if ema_norm_key not in upgraded and student_norm_key in upgraded:
