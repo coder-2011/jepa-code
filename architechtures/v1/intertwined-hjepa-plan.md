@@ -2,363 +2,267 @@
 
 ## Purpose
 
-This document defines the first implementation plan for an **Intertwined Hierarchical JEPA** architecture.
+Intertwined H-JEPA is a predictive residual-stream language model. Each JEPA block compresses its post-attention residual state, predicts a compressed delta toward a future target representation, and injects the enriched compressed state back into the dense residual stream.
 
-The design goal is not to build a standard JEPA pretraining head. The first pass is a compact autoregressive residual-stream model in which each non-final layer learns a JEPA-style predictive delta toward a one-layer-future EMA teacher state, and that delta is added back into the residual stream during both training and inference.
+The predictor remains active at inference. This is not a standard JEPA setup where the predictor can be discarded after training.
 
-## Evidence Base
+## Current Architecture
 
-Primary local references:
-
-- `docs/papers/JEPA.pdf`: I-JEPA paper.
-- `docs/papers/LeJEPA.pdf`: LeJEPA paper.
-- `docs/text-jepa-plan.md`: current standard text-JEPA baseline in this repo.
-- `docs/text-jepa-flow.md`: current standard text-JEPA tensor contracts.
-- `docs/intertwined-hjepa-literature.md`: literature map and architecture implications.
-
-External papers to keep in the design loop:
-
-- I-JEPA: latent prediction from context blocks to target-block representations, with masking strategy central to semantic level.
-  <https://arxiv.org/abs/2301.08243>
-- BYOL: online network predicts an EMA target network representation, and the target is updated by slow moving average.
-  <https://arxiv.org/abs/2006.07733>
-- data2vec: masked-view student predicts contextualized latent representations from a teacher/self-distillation setup across modalities.
-  <https://arxiv.org/abs/2202.03555>
-- Masked Siamese Networks: masked-view representation matching to unmasked-view representation, useful precedent for sparse/masked computation tradeoffs.
-  <https://arxiv.org/abs/2204.07141>
-- V-JEPA: feature prediction as a standalone objective for video without reconstruction, negatives, or extra supervision.
-  <https://arxiv.org/abs/2404.08471>
-- VICReg: explicit variance and covariance regularization to prevent representational collapse.
-  <https://arxiv.org/abs/2105.04906>
-- LeJEPA: predictive JEPA objective plus SIGReg, arguing for isotropic Gaussian embeddings and a direct anti-collapse regularizer.
-  <https://arxiv.org/abs/2511.08544>
-- LLM-JEPA: applies JEPA-style embedding-space objectives to language models and motivates keeping an LM head in the design.
-  <https://arxiv.org/abs/2509.14252>
-- NextLat: adds next-latent prediction to next-token training and is a close auxiliary-loss baseline for our residual-delta path.
-  <https://arxiv.org/abs/2511.05963>
-- PredNet: predictive-coding network where layers make local predictions and pass deviations upward.
-  <https://arxiv.org/abs/1605.08104>
-
-## Core Claim
-
-Intertwined H-JEPA should be treated as a **predictive residual-stream architecture**, not as a disposable auxiliary JEPA head.
-
-In ordinary JEPA, the predictor is often a training-time module used to make the context representation match the target representation. In this architecture, the predictor persists at inference and its output is added into the residual stream. That makes the predictor part of the model's computation.
-
-## Architecture Definition
-
-For layer `l`, define:
-
-- `x`: input token ids
-- `h_0`: token + position embeddings
-- `h_l`: residual stream entering JEPA block `l`
-- `h_l_post_attn`: post-attention residual state for layer `l`
-- `z_l`: compressed representation of `h_l_post_attn`
-- `CE_l`: online compressor at layer `l`
-- `CEbar_l`: EMA copy of compressor `CE_l`
-- `P_l`: predictor at layer `l`
-- `d_l`: predicted delta at layer `l`
-
-The online path is:
+For config `depth = N`, the implemented model contains:
 
 ```text
-x -> token_embedding + position_embedding -> h_0
-h_l_normed     = LayerNorm(h_l)
-h_l_post_attn  = h_l + Attention_l(h_l_normed)
-z_l            = CE_l(LayerNorm(h_l_post_attn))
-d_l            = P_l(z_l)
-h_{l+1}        = h_l_post_attn + Proj_l(z_l + d_l)
-h_depth -> final_norm -> lm_head -> token logits
+N - 1 JEPA blocks
+1 final residual block
 ```
 
-The teacher target for non-final layer `l` is:
+The final residual block is causal attention plus an MLP and produces the final language-model residual state.
+
+For JEPA block `l`:
 
 ```text
-target_z_l = stopgrad(CEbar_{l+1}(LayerNorm(h_{l+1}_post_attn)))
+h_l_normed     = RMSNorm(h_l)
+h_l_post_attn  = h_l + CausalAttention_l(h_l_normed)
+z_l            = CE_l(h_l_post_attn)
+delta_l        = Pred_l(z_l)
+h_{l+1}        = h_l_post_attn + Proj_l(z_l + delta_l)
 ```
 
-The layer loss is:
+where:
 
 ```text
-target_delta_l = target_z_l - stopgrad(z_l)
-loss_jepa_l = MSE(d_l, target_delta_l)
+CE_l(h) = Compressor_l(RMSNorm_l(h))
+z_l:     (B, L, K)
+delta_l: (B, L, K)
+h_l:     (B, L, D)
 ```
 
-The total predictive loss is:
+The final logits are:
 
 ```text
-loss_jepa = sum_l alpha_l * loss_l, for l in [0, depth - 2]
+logits = LMHead(final_norm(h_final))
 ```
 
-The final layer has no natural `l + 1` teacher, so v1 should skip the final-layer JEPA loss.
+The LM head may tie weights with the token embedding.
 
-## Autoregressive Generation Loop
+## Targets
 
-The intended inference loop is autoregressive:
+Every JEPA block has a target.
+
+For a JEPA block with another JEPA block above it:
 
 ```text
-1. Start with an input prefix.
-2. Run the full JEPA stack.
-3. Use the LM head to produce logits for one next token.
-4. Pick or sample that token.
-5. Append it to the sequence.
-6. Run the model again.
+target_z_l = stopgrad(CEbar_{l+1}(h_{l+1}_post_attn))
 ```
 
-So each generation pass produces one new token. Training can still use teacher forcing over a full sequence for efficiency:
+`CEbar` is the EMA copy of the next block's CE path:
 
 ```text
-training logits:   (B, L, vocab_size)
-generation logits: (B, vocab_size) for the final/current position
+ema_ce_norm + ema_compressor
 ```
 
-The first implementation does not need KV caching.
-
-## Tokenizer, Embeddings, and LM Head
-
-Borrow the tokenizer for v1, but use plain token and position embeddings unless an existing compatible embedding module is already available. The goal is to validate the JEPA block, not to build tokenization infrastructure.
-
-Initial contract:
+For the top JEPA block, the target comes from a frozen output target encoder applied to the final block's post-attention state:
 
 ```text
-input_ids:      (B, L)
-labels:         (B, L)
-valid_mask:     (B, L), optional loss mask
+target_z_top = stopgrad(output_target_compressor(output_target_norm(h_final_post_attn)))
 ```
 
-Input embeddings:
+The output target encoder is initialized once and frozen.
+
+## Losses
+
+The training objective is:
 
 ```text
-token_embedding:    (vocab_size, D)
-position_embedding: (max_length, D)
-h_0 = token_embedding[input_ids] + position_embedding[position_ids]
+loss = loss_lm
+     + lambda_jepa_eff * loss_jepa
+     + beta_sigreg_eff * loss_sigreg
 ```
 
-The LM head projects the final residual stream to vocabulary logits:
+Warmups are scalar linear warmups over `jepa_warmup_steps` and `sigreg_warmup_steps`.
+
+### LM Loss
+
+The LM loss is normal next-token cross entropy:
 
 ```text
-logits = lm_head(final_norm(h_depth))
+loss_lm = CE(logits[:, :-1], labels[:, 1:])
 ```
 
-The LM loss is ordinary next-token cross entropy:
+### JEPA Loss
+
+Current JEPA loss:
 
 ```text
-loss_lm = cross_entropy(logits[:, :-1], labels[:, 1:])
+loss_jepa_l = MSE(delta_l, stopgrad(target_z_l) - z_l)
 ```
 
-Do not use same-token reconstruction for the LM head in the first pass.
+The target is stopped. The student `z_l` is not stopped. Therefore JEPA trains both the predictor and the CE path.
 
-Weight tying is optional:
-
-```python
-if tie_weights:
-    lm_head.weight = token_embedding.weight
-```
-
-Only tie when both shapes are `(vocab_size, D)`. Do not add projection glue just to force tying.
-
-## Why This Differs From The Existing Layer Model
-
-The existing `LayerModel` follows the standard student/teacher text-JEPA shape:
+This replaced the older predictor-only form:
 
 ```text
-masked input -> context tower -> predictor -> target latents
-full input   -> EMA target tower -> target latents
+MSE(delta_l, stopgrad(target_z_l - z_l))
 ```
 
-Intertwined H-JEPA instead makes predictions **inside the depth recurrence**:
+which detached `z_l` and did not train CE through JEPA.
+
+### SIGReg Loss
+
+SIGReg is applied to the actual cached encoder embedding:
 
 ```text
-layer l post-attention residual -> predictor delta -> next residual
-future layer post-attention residual -> EMA compressor -> target for previous predictor
+loss_sigreg_l = SIGReg(z_l)
 ```
 
-Consequences:
+`z_l` is the direct analog of LeJEPA's `f_theta(x)` output embedding.
 
-- the predictor cannot be thrown away after training
-- training and inference must use the same delta-injected residual dynamics
-- the target state depends on a future internal activation from the same forward pass
-- the model needs explicit storage of post-attention states and compressed states at every layer
-- the JEPA loss supervises the predictor as a true delta function: `d_l ~= target_z_l - sg(z_l)`
-
-## First Tensor Contract
-
-Use dense full-sequence tensors for v1.
+SIGReg is not applied to:
 
 ```text
-h_l:             (B, L, D)
-h_l_post_attn:   (B, L, D)
-z_l:             (B, L, K)
-d_l:             (B, L, K)
-Proj_l(...):     (B, L, D)
-logits:          (B, L, vocab_size)
+delta_l
+z_l + delta_l
+projector(z_l + delta_l)
+the dense residual stream
 ```
 
-Where:
-
-- `B` is batch size
-- `L` is sequence length
-- `D` is residual width
-- `K` is JEPA compressed width
-
-## Error Handling Policy
-
-Do not add broad defensive validation in the first pass. Let PyTorch report normal tensor shape, dtype, and matmul errors.
-
-Manual checks should be limited to architecture invariants where a later failure would be confusing:
-
-```text
-depth >= 2
-delta_l, z_l, and target_z_l have the same shape in JEPA loss
-valid_mask selects at least one position if it is used
-```
-
-## Forward Pass Order
-
-Because `loss_l` needs the next layer's post-attention state, the forward pass should first compute and store all student states, then compute teacher targets and losses.
-
-Suggested structure:
-
-```python
-h = token_embeddings(input_ids) + position_embeddings(position_ids)
-post_attn_states = []
-compressed = []
-deltas = []
-
-for l in range(depth):
-    h_normed = attn_norms[l](h)
-    attn_out = attentions[l](h_normed)
-    h_post_attn = h + attn_out
-
-    z_l = compressors[l](ce_norms[l](h_post_attn))
-    d_l = predictors[l](z_l)
-    h = h_post_attn + projectors[l](z_l + d_l)
-
-    post_attn_states.append(h_post_attn)
-    compressed.append(z_l)
-    deltas.append(d_l)
-
-logits = lm_head(final_norm(h))
-
-jepa_losses = []
-for l in range(depth - 1):
-    with torch.no_grad():
-        target_z_l = ema_compressors[l + 1](
-            ce_norms[l + 1](post_attn_states[l + 1])
-        )
-
-    target_delta = target_z_l.detach() - compressed[l].detach()
-    jepa_losses.append(mse(deltas[l], target_delta))
-
-loss_main = next_token_cross_entropy(logits, labels, valid_mask)
-loss = loss_main + lambda_jepa * mean(jepa_losses)
-```
-
-## JEPA Loss
-
-For v1, use plain MSE only:
-
-```text
-loss_jepa_l = MSE(d_l, target_z_l.detach() - z_l.detach())
-```
-
-Default:
-
-```text
-lambda_jepa = 0.1
-```
-
-Do not use SIGReg in the initial pass.
+Because SIGReg uses the cached `z_l`, gradients flow through the full encoder path that produced `z_l`.
 
 ## EMA Contract
 
-EMA copies are per-layer teacher compressors only:
+EMA tracks only the CE path:
 
 ```text
-CEbar_l <- momentum * CEbar_l + (1 - momentum) * CE_l
+ema_ce_norm_l
+ema_compressor_l
 ```
 
-First-pass EMA scope:
+EMA excludes:
 
 ```text
-EMA includes:  compressors CE_l
-EMA excludes:  predictors P_l
-EMA excludes:  projectors Proj_l
-EMA excludes:  attention weights
-EMA excludes:  embeddings
-EMA excludes:  LM head
+attention
+predictor
+projector
+embeddings
+LM head
+final residual block
+output target encoder
 ```
 
-Use a clean helper:
+The EMA path is never optimized by AdamW and only changes in `update_ema()` after `optimizer.step()`.
 
-```python
-def make_ema_copy(module: nn.Module) -> nn.Module:
-    ema = copy.deepcopy(module)
-    ema.requires_grad_(False)
-    ema.eval()
-    return ema
-```
-
-Training order:
+Current EMA momentum in YAML:
 
 ```text
-1. student forward
-2. no_grad target computation with CEbar_{l+1}
-3. total loss
-4. backward
-5. optimizer.step()
-6. update_ema()
+ema_momentum: 0.996
 ```
 
-Do not put EMA modules in AdamW.
+## Initialization
 
-## Minimal Implementation Layout
-
-Keep the first implementation compact. Prefer one main model file plus focused tests.
-
-Suggested local files:
+The model uses explicit small initialization:
 
 ```text
-intertwined_hjepa.py
-test_intertwined_hjepa_shapes.py
-test_intertwined_hjepa_training_step.py
+Linear weights:    Normal(0, 0.02)
+Linear biases:     0
+Embedding weights: Normal(0, 0.02)
+RMSNorm weights:   1
+MHA in_proj_weight: Normal(0, 0.02)
 ```
 
-The model file should contain:
+This replaced PyTorch default embedding initialization, which made initial logits too hot.
 
-- config dataclass
-- attention block pieces
-- compressor
-- predictor
-- projector
-- intertwined model
-- JEPA delta loss
-- next-token loss
-- EMA update helper
+## Current YAML Defaults
 
-## Milestones
+Current important knobs:
 
-1. Implement one model file with:
-   - token + position embeddings
-   - pre-norm causal self-attention per layer
-   - compressor / predictor / projector
-   - LM head
-   - EMA compressors
+```text
+lambda_jepa: 1.0
+jepa_warmup_steps: 100
+beta_sigreg: 0.04
+sigreg_warmup_steps: 100
+ema_momentum: 0.996
+dropout: 0.0
+```
 
-2. Add shape and detach tests:
-   - block output shapes
-   - JEPA loss shape contract
-   - no-grad EMA target path
-   - final layer excluded from JEPA loss
+The LeJEPA-style `lambda` in `L_pred + lambda * L_sig` corresponds to this codebase's `beta_sigreg`.
 
-3. Add one training-step smoke test:
-   - forward
-   - backward
-   - optimizer step
-   - EMA update
+## Diagnostics
 
-4. Only then consider:
-   - better compressor shapes
-   - scaling laws
-   - masked JEPA positions
-   - extra regularization
+The model reports:
+
+```text
+loss_lm
+loss_jepa
+loss_sigreg
+loss_jepa_layer_i
+loss_sigreg_layer_i
+z_variance_layer_i
+z_std_mean_layer_i
+z_std_min_layer_i
+delta_norm_layer_i
+```
+
+`z_std_min` is a worst-dimension collapse check after flattening batch and sequence:
+
+```text
+z_l:      (B, L, K)
+z_flat:   (B * L, K)
+z_std:    std(z_flat, dim=0)
+z_std_min = min(z_std)
+```
+
+## Current Empirical Notes
+
+On local M2 runs with `B=2`, `L=64`, `D=256`, `K=128`:
+
+```text
+small init made initial LM loss sane: around log(1024)
+JEPA must flow into z_l / CE for healthy representations
+SIGReg must apply directly to z_l with full encoder gradients
+beta_sigreg=0.04 works after the SIGReg path fix
+```
+
+A 2000-step run with corrected SIGReg and `beta_sigreg=0.04` produced healthy non-final JEPA block stats:
+
+```text
+z_std_mean_layer_0..2 around 1.0
+z_std_min_layer_0..2 roughly 0.4-0.5 late in training
+eval/loss_lm around 5.96
+eval/loss_sigreg around 16
+```
+
+The model is still far from coherent language generation at 256k tokens; this is a training-loop and representation-health checkpoint, not a finished language model.
+
+## Training And Inference
+
+Training uses cached Parameter-Golf FineWeb shards through `scripts.train_intertwined_hjepa`.
+
+Typical local smoke command:
+
+```bash
+./.venv/bin/python -m scripts.train_intertwined_hjepa \
+  --parameter-golf-root /Users/namanchetwani/Projects/parameter-golf \
+  --variant sp1024 \
+  --device mps \
+  --batch-size 2 \
+  --seq-len 64 \
+  --train-shards 1 \
+  --max-steps 2000 \
+  --log-every 250 \
+  --eval-every 500 \
+  --eval-batches 2 \
+  --save-every 2000 \
+  --run-name smoke \
+  --wandb-mode disabled
+```
+
+Inference/inspection uses:
+
+```bash
+./.venv/bin/python -m scripts.inspect_checkpoint \
+  --checkpoint runs/intertwined_hjepa/<run>/latest.pt \
+  --parameter-golf-root /Users/namanchetwani/Projects/parameter-golf \
+  --variant sp1024 \
+  --device mps
+```
+
+Generation currently reruns the full context each token. There is no KV cache.
