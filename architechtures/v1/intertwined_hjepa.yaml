@@ -1,10 +1,10 @@
 vocab_size: 1024
-max_length: 128
-residual_dim: 256
-compressed_dim: 128
-depth: 4
-num_heads: 4
-predictor_hidden_dim: 256
+max_length: 256
+residual_dim: 768
+compressed_dim: 384
+depth: 10
+num_heads: 12
+predictor_hidden_dim: 1536
 dropout: 0.0
 ema_momentum: 0.996
 lambda_jepa: 1.0
