@@ -203,7 +203,7 @@ def evaluate(
     total_jepa = 0.0
     total_sigreg = 0.0
     jepa_layer_totals = [0.0] * (model.config.depth - 1)
-    sigreg_layer_totals = [0.0] * model.config.depth
+    sigreg_layer_totals = [0.0] * (model.config.depth - 1)
     num_batches = 0
 
     for batch in eval_loader:
