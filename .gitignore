@@ -7,5 +7,6 @@ tmp/
 wandb/
 checkpoints/
 llm-jepa/
+parameter-golf/
 __pycache__/
 *.pyc
