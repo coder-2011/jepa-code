@@ -138,7 +138,7 @@ def test_total_loss_includes_local_sigreg_when_enabled():
     assert outputs["loss_sigreg"] > 0
 
 
-def test_sigreg_loss_updates_compressor_only():
+def test_sigreg_loss_updates_encoder_path():
     model = IntertwinedHJEPA(
         replace(
             YAML_CONFIG,
@@ -163,14 +163,12 @@ def test_sigreg_loss_updates_compressor_only():
     outputs["loss"].backward()
 
     for block in model.blocks:
+        assert any(parameter.grad is not None for parameter in block.attn.parameters())
+        assert any(parameter.grad is not None for parameter in block.ce_norm.parameters())
         assert any(parameter.grad is not None for parameter in block.compressor.parameters())
-        assert all(parameter.grad is None for parameter in block.attn.parameters())
-        assert all(parameter.grad is None for parameter in block.ce_norm.parameters())
-        assert all(parameter.grad is None for parameter in block.predictor.parameters())
-        assert all(parameter.grad is None for parameter in block.projector.parameters())
 
     assert all(parameter.grad is None for parameter in model.final_block.parameters())
-    assert all(parameter.grad is None for parameter in model.embeddings.parameters())
+    assert any(parameter.grad is not None for parameter in model.embeddings.parameters())
     assert all(parameter.grad is None for parameter in model.ema_ce_norms.parameters())
     assert all(parameter.grad is None for parameter in model.ema_compressors.parameters())
     assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())

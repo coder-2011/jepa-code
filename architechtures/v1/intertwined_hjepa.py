@@ -394,16 +394,6 @@ class IntertwinedHJEPA(nn.Module):
             target_z_l = self.output_target_compressor(self.output_target_norm(next_post_attn))
         return target_z_l.detach()
 
-    def compute_sigreg_input_for_layer(
-        self,
-        layer_index: int,
-        post_attn_states: list[torch.Tensor],
-    ) -> torch.Tensor:
-        block = self.blocks[layer_index]
-        with torch.no_grad():
-            normed = block.ce_norm(post_attn_states[layer_index])
-        return block.compressor(normed)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -467,7 +457,7 @@ class IntertwinedHJEPA(nn.Module):
             )
         if self.config.beta_sigreg > 0:
             for layer_index in range(len(self.blocks)):
-                sigreg_input_l = self.compute_sigreg_input_for_layer(layer_index, post_attn_states)
+                sigreg_input_l = compressed[layer_index]
                 if valid_mask is not None:
                     assert valid_mask.shape == sigreg_input_l.shape[:-1], (
                         "valid_mask must match the leading shape of SIGReg inputs"
