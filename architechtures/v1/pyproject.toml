@@ -2,7 +2,7 @@
 name = "intertwined-hjepa-v1"
 version = "0.1.0"
 description = "Intertwined H-JEPA training and inspection scripts"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "pyyaml>=6.0",
@@ -22,6 +22,7 @@ dev = [
 [tool.uv]
 package = false
 default-groups = ["dev"]
+link-mode = "symlink"
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
