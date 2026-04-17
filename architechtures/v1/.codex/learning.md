@@ -1,0 +1,4 @@
+- `torch.compile` on the v1 trainer should not see per-step Python ints inside `IntertwinedHJEPA.forward`; passing `step` into warmup logic caused Dynamo to specialize on `step == N` and recompile every iteration. Compute JEPA/SIGReg warmup scalars in the trainer and pass them as tensor inputs instead.
+- SIGReg randomness must stay graph-safe for compile. `Tensor.item()`, per-step Python seeding, and `torch.Generator(...)` construction inside `forward()` cause Dynamo graph breaks and restart storms. Plain `torch.randn(...)` inside the graph compiles cleanly.
+- CUDA bf16 autocast with fp32 `nn.RMSNorm` weights emits a mixed-dtype warning and falls off the fused path. A small `RMSNorm(nn.RMSNorm)` subclass that computes in fp32 and casts back removes the warning while keeping state_dict/test compatibility.
+- Import TorchAO lazily in the trainer so normal non-TorchAO runs do not emit TorchAO extension-version warnings at startup.

@@ -18,7 +18,7 @@ from data.dataset_helpers import (
     resolve_dataset_root,
     select_train_shards,
 )
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, warmup_weight
 
 
 class _DisabledWandbRun:
@@ -289,8 +289,15 @@ def evaluate(
 
     for batch in eval_loader:
         input_ids, labels = move_batch_to_device(batch, device=device, non_blocking=non_blocking)
+        lambda_jepa_scale = warmup_weight(model.config.lambda_jepa, step, model.config.jepa_warmup_steps)
+        beta_sigreg_scale = warmup_weight(model.config.beta_sigreg, step, model.config.sigreg_warmup_steps)
         with build_autocast_context(device, compute_dtype):
-            outputs = model(input_ids=input_ids, labels=labels, step=step)
+            outputs = model(
+                input_ids=input_ids,
+                labels=labels,
+                lambda_jepa_scale=torch.tensor(lambda_jepa_scale, device=device),
+                beta_sigreg_scale=torch.tensor(beta_sigreg_scale, device=device),
+            )
         total_loss += outputs["loss"].item()
         total_lm += outputs["loss_main"].item()
         total_jepa += outputs["loss_jepa"].item()
@@ -396,12 +403,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
         drop_jepa_loss = should_drop_jepa_loss(config.jepa_dropout_rate)
         jepa_dropout_steps += int(drop_jepa_loss)
+        lambda_jepa_scale = 0.0 if drop_jepa_loss else warmup_weight(config.lambda_jepa, step_index, config.jepa_warmup_steps)
+        beta_sigreg_scale = 0.0 if drop_jepa_loss else warmup_weight(config.beta_sigreg, step_index, config.sigreg_warmup_steps)
         with build_autocast_context(device, compute_dtype):
             outputs = train_model(
                 input_ids=input_ids,
                 labels=labels,
-                step=step_index,
                 compute_aux_losses=not drop_jepa_loss,
+                lambda_jepa_scale=torch.tensor(lambda_jepa_scale, device=device),
+                beta_sigreg_scale=torch.tensor(beta_sigreg_scale, device=device),
             )
         loss = outputs["loss"]
         if scaler is not None:

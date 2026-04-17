@@ -84,9 +84,8 @@ class SimpleCompressor(nn.Module):
 
 class RMSNorm(nn.RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "cuda" and self.weight is not None and x.dtype != self.weight.dtype:
-            return F.rms_norm(x.float(), self.normalized_shape, self.weight.float(), self.eps).to(dtype=x.dtype)
-        return super().forward(x)
+        weight = None if self.weight is None else self.weight.float()
+        return F.rms_norm(x.float(), self.normalized_shape, weight, self.eps).to(dtype=x.dtype)
 
 
 class DeltaPredictor(nn.Module):
@@ -433,6 +432,8 @@ class IntertwinedHJEPA(nn.Module):
         valid_mask: torch.Tensor | None = None,
         step: int | None = None,
         compute_aux_losses: bool = True,
+        lambda_jepa_scale: torch.Tensor | float | None = None,
+        beta_sigreg_scale: torch.Tensor | float | None = None,
     ) -> dict[str, object]:
         """
         Args:
@@ -511,23 +512,36 @@ class IntertwinedHJEPA(nn.Module):
         if not sigreg_losses:
             sigreg_losses = [logits.new_zeros(()) for _ in range(len(self.blocks))]
         loss_sigreg = torch.stack(sigreg_losses).sum()
-        lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps) if compute_aux_losses else 0.0
-        beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps) if compute_aux_losses else 0.0
+        lambda_eff = (
+            warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps)
+            if lambda_jepa_scale is None
+            else lambda_jepa_scale
+        )
+        beta_eff = (
+            warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps)
+            if beta_sigreg_scale is None
+            else beta_sigreg_scale
+        )
+        if not compute_aux_losses:
+            lambda_eff = 0.0
+            beta_eff = 0.0
+        if not torch.is_tensor(lambda_eff):
+            lambda_eff = logits.new_tensor(lambda_eff)
+        else:
+            lambda_eff = lambda_eff.to(device=logits.device, dtype=logits.dtype)
+        if not torch.is_tensor(beta_eff):
+            beta_eff = logits.new_tensor(beta_eff)
+        else:
+            beta_eff = beta_eff.to(device=logits.device, dtype=logits.dtype)
         loss_main = next_token_loss(logits, labels, valid_mask) if labels is not None else None
-        loss = logits.new_zeros(())
-        if loss_main is not None:
-            loss = loss + loss_main
-        if lambda_eff != 0:
-            loss = loss + lambda_eff * loss_jepa
-        if beta_eff != 0:
-            loss = loss + beta_eff * loss_sigreg
+        loss = (loss_main if loss_main is not None else logits.new_zeros(())) + lambda_eff * loss_jepa + beta_eff * loss_sigreg
 
         # Keep a few cheap summaries around for smoke tests and debugging.
         z_stds = [z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in compressed]
         diagnostics = {
             "compute_aux_losses": compute_aux_losses,
-            "lambda_jepa": lambda_eff,
-            "beta_sigreg": beta_eff,
+            "lambda_jepa": lambda_eff.detach(),
+            "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
             "loss_sigreg_layers": [loss.detach() for loss in sigreg_losses],
             "z_variance": [z.detach().float().var() for z in compressed],

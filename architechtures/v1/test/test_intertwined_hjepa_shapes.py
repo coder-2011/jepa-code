@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+import warnings
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from intertwined_hjepa import (
     IntertwinedBlock,
     IntertwinedConfig,
     IntertwinedHJEPA,
+    RMSNorm,
 )
 from text_helpers import HFTokenizer, LMHead, TokenEmbeddings
 
@@ -162,6 +164,21 @@ def test_model_uses_explicit_small_initialization():
             ema_compressor.module.parameters(),
         ):
             assert torch.equal(student_parameter, ema_parameter)
+
+
+def test_rmsnorm_mixed_bf16_input_avoids_dtype_mismatch_warning():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    norm = RMSNorm(8).to(device=device)
+    x = torch.randn(2, 3, 8, device=device, dtype=torch.bfloat16)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        y = norm(x)
+
+    assert norm.weight.dtype == torch.float32
+    assert y.dtype == torch.bfloat16
+    assert torch.isfinite(y.float()).all()
+    assert not any("Mismatch dtype between input and weight" in str(w.message) for w in caught)
 
 
 def test_jepa_target_uses_ema_norm_not_live_norm():
