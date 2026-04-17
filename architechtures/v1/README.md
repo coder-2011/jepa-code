@@ -174,19 +174,15 @@ tie_weights: true
 
 ## Setup
 
-Use a local virtual environment:
+Use `uv` for environment management in this repo. Install dependencies and create the local environment with:
 
 ```bash
-python -m venv .venv
-./.venv/bin/python -m pip install -U pip
-./.venv/bin/python -m pip install torch numpy pyyaml pytest sentencepiece
+uv sync
 ```
 
-W&B is optional:
-
-```bash
-./.venv/bin/python -m pip install wandb
-```
+Run project commands with `uv run` so they execute inside the synced environment.
+Use `uv lock` when you need to refresh the lockfile, and avoid manual `venv`/`pip` setup for the normal workflow.
+W&B is included in the project dependencies, so no separate install step is needed.
 
 The training script expects cached Parameter Golf FineWeb shards unless `--dataset-root` points directly at a compatible dataset folder.
 
@@ -195,25 +191,19 @@ The training script expects cached Parameter Golf FineWeb shards unless `--datas
 Run all tests:
 
 ```bash
-just test
-```
-
-or directly:
-
-```bash
-./.venv/bin/python -m pytest test test_dataset_helpers.py
+uv run -- pytest test test_dataset_helpers.py
 ```
 
 Model-focused tests:
 
 ```bash
-just test-model
+uv run -- pytest test/test_intertwined_hjepa_shapes.py test/test_intertwined_hjepa_training_step.py
 ```
 
 Trainer tests:
 
 ```bash
-just test-trainer
+uv run -- pytest test/test_train_intertwined_hjepa.py
 ```
 
 ## Training
@@ -221,7 +211,7 @@ just test-trainer
 Small local smoke run:
 
 ```bash
-./.venv/bin/python -m scripts.train_intertwined_hjepa \
+uv run -- python -m scripts.train_intertwined_hjepa \
   --parameter-golf-root /Users/namanchetwani/Projects/parameter-golf \
   --variant sp1024 \
   --device mps \
@@ -240,7 +230,7 @@ Small local smoke run:
 Checkpointing:
 
 ```bash
-./.venv/bin/python -m scripts.train_intertwined_hjepa \
+uv run -- python -m scripts.train_intertwined_hjepa \
   --parameter-golf-root /Users/namanchetwani/Projects/parameter-golf \
   --variant sp1024 \
   --device mps \
