@@ -87,6 +87,13 @@ def test_trainer_writes_latest_checkpoint(tmp_path: Path):
     assert checkpoint["step"] == 2
     assert checkpoint["tokens_processed"] == 16
     assert checkpoint["config"]["max_length"] == 4
+    assert result["last_train_metrics"] is not None
+    assert result["last_eval_metrics"] is not None
+    assert "train/loss" in result["last_train_metrics"]
+    assert "eval/loss" in result["last_eval_metrics"]
+    assert result["peak_memory_mb"] == 0.0
+    assert result["device"] == "cpu"
+    assert result["compute_dtype"] == "float32"
 
 
 def test_trainer_counts_jepa_dropout_steps(tmp_path: Path):

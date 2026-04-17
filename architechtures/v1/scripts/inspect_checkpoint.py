@@ -14,6 +14,7 @@ from data.dataset_helpers import build_eval_dataloader, dataset_dir_for_variant,
 from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, warmup_weight
 
 
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PROMPTS = ["Once upon a time", "The meaning of life is", "In a small town"]
 EVAL_KEYS = ("loss", "loss_lm", "loss_jepa", "loss_sigreg")
 LAYER_KEYS = (
@@ -92,7 +93,7 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[IntertwinedHJEPA,
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     assert "config" in checkpoint and "model" in checkpoint, "Checkpoint must contain config and model"
 
-    yaml_config = IntertwinedConfig.from_yaml("intertwined_hjepa.yaml")
+    yaml_config = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
     config_values = dict(checkpoint["config"])
     missing_fields = [name for name in yaml_config.__dataclass_fields__ if name not in config_values]
     for name in missing_fields:

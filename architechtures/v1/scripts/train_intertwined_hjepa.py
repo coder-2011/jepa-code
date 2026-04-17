@@ -102,6 +102,14 @@ def build_synchronize(device: torch.device):
     return lambda: None
 
 
+def peak_memory_mb(device: torch.device) -> float:
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    if device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+        return torch.mps.current_allocated_memory() / (1024 * 1024)
+    return 0.0
+
+
 def detect_compute_dtype(device: torch.device, requested: str) -> torch.dtype:
     if requested != "auto":
         return getattr(torch, requested)
@@ -371,6 +379,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     train_model.train()
     train_iter = iter(train_loader)
     input_ids, labels = move_batch_to_device(next(train_iter), device=device, non_blocking=non_blocking)
+    last_train_metrics: dict[str, float] | None = None
+    last_eval_metrics: dict[str, float] | None = None
+    train_start_time = time.time()
 
     for step_index in range(start_step, args.max_steps):
         step_number = step_index + 1
@@ -460,6 +471,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 + " ".join(f"{key}={value:.4f}" for key, value in sorted(metrics.items()))
             )
             wandb_run.log(metrics, step=step_index)
+            last_train_metrics = metrics.copy()
 
         if should_eval:
             assert eval_loader is not None, "Evaluation requested without an eval loader"
@@ -476,6 +488,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 + " ".join(f"{key}={value:.4f}" for key, value in sorted(eval_metrics.items()))
             )
             wandb_run.log(eval_metrics, step=step_index)
+            last_eval_metrics = eval_metrics.copy()
 
         if should_save:
             checkpoint_kwargs = {
@@ -494,12 +507,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     wandb_run.finish()
     steps_completed = max(args.max_steps - start_step, 0)
+    total_wall_seconds = time.time() - train_start_time
     return {
         "run_dir": run_dir,
         "step": args.max_steps,
         "tokens_processed": tokens_processed,
         "jepa_dropout_steps": jepa_dropout_steps,
         "jepa_dropout_fraction": jepa_dropout_steps / steps_completed if steps_completed > 0 else 0.0,
+        "last_train_metrics": last_train_metrics,
+        "last_eval_metrics": last_eval_metrics,
+        "peak_memory_mb": peak_memory_mb(device),
+        "wall_seconds": total_wall_seconds,
+        "device": device.type,
+        "compute_dtype": str(compute_dtype).replace("torch.", ""),
     }
 
 
