@@ -414,15 +414,15 @@ class IntertwinedHJEPA(nn.Module):
     def compute_jepa_target_for_layer(
         self,
         layer_index: int,
-        post_attn_states: list[torch.Tensor],
+        states: list[torch.Tensor],
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
-        next_post_attn = post_attn_states[layer_index + 1]
         if layer_index + 1 < len(self.blocks):
+            next_state = states[layer_index + 1]
             ema_norm = self.ema_ce_norms[layer_index + 1]
-            target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_post_attn))
+            target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_state))
         else:
-            target_z_l = self.output_target_compressor(self.output_target_norm(next_post_attn))
+            target_z_l = self.output_target_compressor(self.output_target_norm(states[-1]))
         return target_z_l.detach()
 
     def forward(
@@ -481,7 +481,7 @@ class IntertwinedHJEPA(nn.Module):
             jepa_losses = []
             sigreg_losses = []
             for layer_index in range(len(self.blocks)):
-                target_z_l = self.compute_jepa_target_for_layer(layer_index, post_attn_states)
+                target_z_l = self.compute_jepa_target_for_layer(layer_index, states)
                 targets.append(target_z_l)
                 jepa_losses.append(
                     jepa_delta_loss(

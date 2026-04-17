@@ -185,14 +185,14 @@ def test_jepa_target_uses_ema_norm_not_live_norm():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    next_post_attn = outputs["post_attn_states"][1]
+    next_state = outputs["states"][1]
 
     with torch.no_grad():
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
-    target = model.compute_jepa_target_for_layer(0, outputs["post_attn_states"])
-    ema_target = model.ema_compressors[1].module(model.ema_ce_norms[1](next_post_attn))
-    live_target = model.blocks[1].compressor(model.blocks[1].ce_norm(next_post_attn))
+    target = model.compute_jepa_target_for_layer(0, outputs["states"])
+    ema_target = model.ema_compressors[1].module(model.ema_ce_norms[1](next_state))
+    live_target = model.blocks[1].compressor(model.blocks[1].ce_norm(next_state))
 
     assert torch.allclose(target, ema_target)
     assert not torch.allclose(target, live_target)
@@ -202,10 +202,10 @@ def test_last_jepa_target_uses_frozen_output_encoder():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    final_post_attn = outputs["post_attn_states"][-1]
+    final_state = outputs["states"][-1]
 
-    target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["post_attn_states"])
-    expected = model.output_target_compressor(model.output_target_norm(final_post_attn))
+    target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
+    expected = model.output_target_compressor(model.output_target_norm(final_state))
 
     assert torch.allclose(target, expected)
     assert not target.requires_grad
