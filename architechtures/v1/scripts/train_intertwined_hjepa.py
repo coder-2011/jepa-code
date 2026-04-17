@@ -50,6 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--return-model", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--run-name", default="default")
     parser.add_argument("--out-dir", type=Path, default=Path("runs/intertwined_hjepa"))
     parser.add_argument("--resume", type=Path, default=None)
@@ -531,6 +532,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "wall_seconds": total_wall_seconds,
         "device": device.type,
         "compute_dtype": str(compute_dtype).replace("torch.", ""),
+        **({"model": model} if args.return_model else {}),
     }
 
 
