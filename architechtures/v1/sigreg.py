@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -39,16 +40,6 @@ class SlicedEppsPulleySIGReg(nn.Module):
         self.register_buffer("t", t, persistent=False)
         self.register_buffer("phi", phi, persistent=False)
         self.register_buffer("weights", weights * phi, persistent=False)
-        self.register_buffer("global_step", torch.zeros((), dtype=torch.long), persistent=False)
-        self._generator = None
-        self._generator_device = None
-
-    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
-        if self._generator is None or self._generator_device != device:
-            self._generator = torch.Generator(device=device)
-            self._generator_device = device
-        self._generator.manual_seed(seed)
-        return self._generator
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         assert z.shape[-1] > 0, "SIGReg input must have a feature dimension"
@@ -57,16 +48,11 @@ class SlicedEppsPulleySIGReg(nn.Module):
         assert x.shape[0] > 0, "SIGReg input must contain at least one sample"
 
         with torch.no_grad():
-            seed = int(self.global_step.item())
-            generator = self._get_generator(x.device, seed)
-            slices = torch.randn(
-                (x.shape[-1], self.num_slices),
-                device=x.device,
-                dtype=x.dtype,
-                generator=generator,
+            slices = F.normalize(
+                torch.randn((x.shape[-1], self.num_slices), device=x.device, dtype=x.dtype),
+                p=2,
+                dim=0,
             )
-            slices = slices / slices.norm(p=2, dim=0, keepdim=True)
-            self.global_step.add_(1)
 
         projected = x @ slices
         t = self.t.to(device=x.device, dtype=x.dtype)

@@ -11,11 +11,11 @@ from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
 
 _flash_attn_func = None
-for _module_name in ("flash_attn", "flash_attn.cute"):
+for _module_name in ("flash_attn.cute", "flash_attn"):
     try:
         _flash_attn_func = __import__(_module_name, fromlist=["flash_attn_func"]).flash_attn_func
         break
-    except ImportError:
+    except (ImportError, AttributeError):
         pass
 
 """
@@ -82,12 +82,19 @@ class SimpleCompressor(nn.Module):
         return self.net(x)
 
 
+class RMSNorm(nn.RMSNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cuda" and self.weight is not None and x.dtype != self.weight.dtype:
+            return F.rms_norm(x.float(), self.normalized_shape, self.weight.float(), self.eps).to(dtype=x.dtype)
+        return super().forward(x)
+
+
 class DeltaPredictor(nn.Module):
     def __init__(self, compressed_dim: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         # Predict the "one-layer-future" delta directly in compressed space.
         self.net = nn.Sequential(
-            nn.RMSNorm(compressed_dim),
+            RMSNorm(compressed_dim),
             nn.Linear(compressed_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -173,14 +180,14 @@ class IntertwinedBlock(nn.Module):
     ):
         super().__init__()
         # Pre-norm causal self-attention on the residual stream.
-        self.attn_norm = nn.RMSNorm(residual_dim)
+        self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         # Compressor path: D -> K, predictor path: K -> K, projector path: K -> D.
-        self.ce_norm = nn.RMSNorm(residual_dim)
+        self.ce_norm = RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
         self.predictor = DeltaPredictor(compressed_dim, predictor_hidden_dim, dropout=dropout)
         self.projector = nn.Sequential(
-            nn.RMSNorm(compressed_dim),
+            RMSNorm(compressed_dim),
             nn.Linear(compressed_dim, residual_dim),
         )
 
@@ -234,10 +241,10 @@ class FinalResidualBlock(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.attn_norm = nn.RMSNorm(residual_dim)
+        self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         self.mlp = nn.Sequential(
-            nn.RMSNorm(residual_dim),
+            RMSNorm(residual_dim),
             nn.Linear(residual_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -357,7 +364,7 @@ class IntertwinedHJEPA(nn.Module):
             num_heads=config.num_heads,
             dropout=config.dropout,
         )
-        self.final_norm = nn.RMSNorm(config.residual_dim)
+        self.final_norm = RMSNorm(config.residual_dim)
         self.sigreg = SlicedEppsPulleySIGReg(
             num_slices=config.sigreg_num_slices,
             t_max=config.sigreg_t_max,
@@ -369,7 +376,7 @@ class IntertwinedHJEPA(nn.Module):
             token_embedding=self.embeddings.token_embedding,
             tie_weights=config.tie_weights,
         )
-        self.output_target_norm = nn.RMSNorm(config.residual_dim)
+        self.output_target_norm = RMSNorm(config.residual_dim)
         self.output_target_compressor = SimpleCompressor(
             config.residual_dim,
             config.compressed_dim,
@@ -381,7 +388,7 @@ class IntertwinedHJEPA(nn.Module):
         self.output_target_compressor.requires_grad_(False)
         self.output_target_compressor.eval()
         # Track EMA copies of the full CE path: norm + compressor.
-        self.ema_ce_norms = nn.ModuleList(nn.RMSNorm(config.residual_dim) for _ in self.blocks)
+        self.ema_ce_norms = nn.ModuleList(RMSNorm(config.residual_dim) for _ in self.blocks)
         self.ema_compressors = nn.ModuleList(AveragedModel(block.compressor, use_buffers=False) for block in self.blocks)
         for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
             ema_ce_norm.load_state_dict(block.ce_norm.state_dict())

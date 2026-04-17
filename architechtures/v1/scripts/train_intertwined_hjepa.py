@@ -10,8 +10,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-from torchao.optim import AdamW4bit, AdamW8bit, AdamWFp8
 
 from data.dataset_helpers import (
     build_eval_dataloader,
@@ -139,6 +137,8 @@ def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace
     if not args.torchao_float8:
         return
     assert device.type == "cuda", "TorchAO float8 training currently requires CUDA"
+    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
     config = Float8LinearConfig.from_recipe_name(args.torchao_float8_recipe)
     convert_to_float8_training(
         model,
@@ -153,15 +153,16 @@ def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace
 
 
 def build_optimizer(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> torch.optim.Optimizer:
+    kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(model.student_parameters(), fused=device.type == "cuda", **kwargs)
+    from torchao.optim import AdamW4bit, AdamW8bit, AdamWFp8
+
     optimizer_cls = {
-        "adamw": torch.optim.AdamW,
         "adamw8bit": AdamW8bit,
         "adamw4bit": AdamW4bit,
         "adamwfp8": AdamWFp8,
     }[args.optimizer]
-    kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
-    if optimizer_cls is torch.optim.AdamW:
-        kwargs["fused"] = device.type == "cuda"
     return optimizer_cls(model.student_parameters(), **kwargs)
 
 
