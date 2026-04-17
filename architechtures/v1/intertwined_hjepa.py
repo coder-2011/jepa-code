@@ -49,6 +49,7 @@ class IntertwinedConfig:
     ema_momentum: float
     lambda_jepa: float
     jepa_warmup_steps: int
+    jepa_dropout_rate: float
     beta_sigreg: float
     sigreg_warmup_steps: int
     sigreg_num_slices: int
@@ -319,6 +320,7 @@ class IntertwinedHJEPA(nn.Module):
     def __init__(self, config: IntertwinedConfig):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
+        assert 0.0 <= config.jepa_dropout_rate <= 1.0, "jepa_dropout_rate must be between 0 and 1"
 
         self.config = config
         self.ema_momentum = float(config.ema_momentum)
@@ -417,12 +419,14 @@ class IntertwinedHJEPA(nn.Module):
         labels: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
         step: int | None = None,
+        compute_aux_losses: bool = True,
     ) -> dict[str, object]:
         """
         Args:
             input_ids:  (B, L)
             labels:     (B, L), optional next-token labels
             valid_mask: (B, L), optional loss mask on token positions
+            compute_aux_losses: when false, skip teacher-target JEPA and SIGReg loss computation
 
         Returns:
             logits:            (B, L, vocab_size)
@@ -458,37 +462,44 @@ class IntertwinedHJEPA(nn.Module):
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
 
-        targets = []
-        jepa_losses = []
-        sigreg_losses = []
-        for layer_index in range(len(self.blocks)):
-            target_z_l = self.compute_jepa_target_for_layer(layer_index, post_attn_states)
-            targets.append(target_z_l)
-            jepa_losses.append(
-                jepa_delta_loss(
-                    deltas[layer_index],
-                    compressed[layer_index],
-                    target_z_l,
-                    valid_mask=valid_mask,
-                )
-            )
-        if self.config.beta_sigreg > 0:
+        if compute_aux_losses:
+            targets = []
+            jepa_losses = []
+            sigreg_losses = []
             for layer_index in range(len(self.blocks)):
-                sigreg_input_l = compressed[layer_index]
-                if valid_mask is not None:
-                    assert valid_mask.shape == sigreg_input_l.shape[:-1], (
-                        "valid_mask must match the leading shape of SIGReg inputs"
+                target_z_l = self.compute_jepa_target_for_layer(layer_index, post_attn_states)
+                targets.append(target_z_l)
+                jepa_losses.append(
+                    jepa_delta_loss(
+                        deltas[layer_index],
+                        compressed[layer_index],
+                        target_z_l,
+                        valid_mask=valid_mask,
                     )
-                    sigreg_input_l = sigreg_input_l[valid_mask.to(torch.bool)]
-                sigreg_losses.append(self.sigreg(sigreg_input_l))
+                )
+            if self.config.beta_sigreg > 0:
+                for layer_index in range(len(self.blocks)):
+                    sigreg_input_l = compressed[layer_index]
+                    if valid_mask is not None:
+                        assert valid_mask.shape == sigreg_input_l.shape[:-1], (
+                            "valid_mask must match the leading shape of SIGReg inputs"
+                        )
+                        sigreg_input_l = sigreg_input_l[valid_mask.to(torch.bool)]
+                    sigreg_losses.append(self.sigreg(sigreg_input_l))
+        else:
+            zero_loss = logits.new_zeros(())
+            # Keep output structure stable on dropout steps without running the teacher path.
+            targets = [z.detach() for z in compressed]
+            jepa_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
+            sigreg_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
 
         # Keep per-layer JEPA losses explicit and sum them into the total objective.
         loss_jepa = torch.stack(jepa_losses).sum()
         if not sigreg_losses:
             sigreg_losses = [logits.new_zeros(()) for _ in range(len(self.blocks))]
         loss_sigreg = torch.stack(sigreg_losses).sum()
-        lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps)
-        beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps)
+        lambda_eff = warmup_weight(self.config.lambda_jepa, step, self.config.jepa_warmup_steps) if compute_aux_losses else 0.0
+        beta_eff = warmup_weight(self.config.beta_sigreg, step, self.config.sigreg_warmup_steps) if compute_aux_losses else 0.0
         loss_main = next_token_loss(logits, labels, valid_mask) if labels is not None else None
         loss = logits.new_zeros(())
         if loss_main is not None:
@@ -501,6 +512,7 @@ class IntertwinedHJEPA(nn.Module):
         # Keep a few cheap summaries around for smoke tests and debugging.
         z_stds = [z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in compressed]
         diagnostics = {
+            "compute_aux_losses": compute_aux_losses,
             "lambda_jepa": lambda_eff,
             "beta_sigreg": beta_eff,
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],

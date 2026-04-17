@@ -123,6 +123,10 @@ def optimizer_step(optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScale
     scaler.update()
 
 
+def should_drop_jepa_loss(jepa_dropout_rate: float) -> bool:
+    return jepa_dropout_rate > 0.0 and random.random() < jepa_dropout_rate
+
+
 def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> None:
     if not args.torchao_float8:
         return
@@ -358,6 +362,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     start_step = 0
     tokens_processed = 0
+    jepa_dropout_steps = 0
     if args.resume is not None:
         checkpoint = load_checkpoint(args.resume, model=model, optimizer=optimizer, device=device)
         start_step = int(checkpoint["step"])
@@ -377,8 +382,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         synchronize()
         t0 = time.time()
 
+        drop_jepa_loss = should_drop_jepa_loss(config.jepa_dropout_rate)
+        jepa_dropout_steps += int(drop_jepa_loss)
         with build_autocast_context(device, compute_dtype):
-            outputs = train_model(input_ids=input_ids, labels=labels, step=step_index)
+            outputs = train_model(
+                input_ids=input_ids,
+                labels=labels,
+                step=step_index,
+                compute_aux_losses=not drop_jepa_loss,
+            )
         loss = outputs["loss"]
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -417,6 +429,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "train/loss_sigreg": outputs["loss_sigreg"].item(),
                 "train/lambda_jepa": float(outputs["diagnostics"]["lambda_jepa"]),
                 "train/beta_sigreg": float(outputs["diagnostics"]["beta_sigreg"]),
+                "train/jepa_aux_dropped": float(drop_jepa_loss),
+                "train/jepa_dropout_steps": float(jepa_dropout_steps),
+                "train/jepa_dropout_fraction": jepa_dropout_steps / step_number,
                 "train/step_time": step_time,
                 "train/tokens_per_sec": input_ids.numel() / max(step_time, 1e-8),
             }
@@ -478,10 +493,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             input_ids, labels = next_input_ids, next_labels
 
     wandb_run.finish()
+    steps_completed = max(args.max_steps - start_step, 0)
     return {
         "run_dir": run_dir,
         "step": args.max_steps,
         "tokens_processed": tokens_processed,
+        "jepa_dropout_steps": jepa_dropout_steps,
+        "jepa_dropout_fraction": jepa_dropout_steps / steps_completed if steps_completed > 0 else 0.0,
     }
 
 
