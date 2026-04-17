@@ -10,6 +10,14 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
 
+_flash_attn_func = None
+for _module_name in ("flash_attn", "flash_attn.cute"):
+    try:
+        _flash_attn_func = __import__(_module_name, fromlist=["flash_attn_func"]).flash_attn_func
+        break
+    except ImportError:
+        pass
+
 """
 Notation used below:
     B: batch size
@@ -88,6 +96,58 @@ class DeltaPredictor(nn.Module):
         return self.net(x)
 
 
+class CausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        residual_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert residual_dim % num_heads == 0, "residual_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = residual_dim // num_heads
+        self.dropout = dropout
+        self.q_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.k_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.v_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.out_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        squeeze_sequence = x.ndim == 2
+        if squeeze_sequence:
+            x = x.unsqueeze(1)
+
+        batch_size, sequence_length, residual_dim = x.shape
+        q = self.q_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+
+        if _flash_attn_func is not None and q.is_cuda and q.dtype in {torch.float16, torch.bfloat16}:
+            attn_out = _flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout if self.training else 0.0,
+                causal=True,
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            ).transpose(1, 2)
+
+        attn_out = attn_out.reshape(batch_size, sequence_length, residual_dim)
+        attn_out = self.out_proj(attn_out)
+
+        if squeeze_sequence:
+            attn_out = attn_out.squeeze(1)
+        return attn_out
+
+
 def init_intertwined_weights(module: nn.Module) -> None:
     if isinstance(module, nn.Linear):
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -97,10 +157,6 @@ def init_intertwined_weights(module: nn.Module) -> None:
         nn.init.normal_(module.weight, mean=0.0, std=0.02)
     elif isinstance(module, nn.RMSNorm) and module.weight is not None:
         nn.init.ones_(module.weight)
-    elif isinstance(module, nn.MultiheadAttention):
-        nn.init.normal_(module.in_proj_weight, mean=0.0, std=0.02)
-        if module.in_proj_bias is not None:
-            nn.init.zeros_(module.in_proj_bias)
 
 
 class IntertwinedBlock(nn.Module):
@@ -115,13 +171,7 @@ class IntertwinedBlock(nn.Module):
         super().__init__()
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = nn.RMSNorm(residual_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=residual_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-            bias=False,
-        )
+        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         # Compressor path: D -> K, predictor path: K -> K, projector path: K -> D.
         self.ce_norm = nn.RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
@@ -148,21 +198,7 @@ class IntertwinedBlock(nn.Module):
             x_l = x_l.unsqueeze(1)
 
         x_l_normed = self.attn_norm(x_l)
-        sequence_length = x_l_normed.shape[1]
-        # The JEPA block also carries the LM head, so attention must stay causal.
-        causal_mask = torch.ones(
-            sequence_length,
-            sequence_length,
-            dtype=torch.bool,
-            device=x_l_normed.device,
-        ).triu(1)
-        attn_out, _ = self.attn(
-            x_l_normed,
-            x_l_normed,
-            x_l_normed,
-            attn_mask=causal_mask,
-            need_weights=False,
-        )
+        attn_out = self.attn(x_l_normed)
         # h_l_post_attn is both the residual update output and the input to the compressor.
         x_l_post_attn = x_l + attn_out
         z_l = self.compressor(self.ce_norm(x_l_post_attn))
@@ -196,13 +232,7 @@ class FinalResidualBlock(nn.Module):
     ):
         super().__init__()
         self.attn_norm = nn.RMSNorm(residual_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=residual_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-            bias=False,
-        )
+        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         self.mlp = nn.Sequential(
             nn.RMSNorm(residual_dim),
             nn.Linear(residual_dim, hidden_dim),
@@ -213,20 +243,7 @@ class FinalResidualBlock(nn.Module):
 
     def forward(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
         x_l_normed = self.attn_norm(x_l)
-        sequence_length = x_l_normed.shape[1]
-        causal_mask = torch.ones(
-            sequence_length,
-            sequence_length,
-            dtype=torch.bool,
-            device=x_l_normed.device,
-        ).triu(1)
-        attn_out, _ = self.attn(
-            x_l_normed,
-            x_l_normed,
-            x_l_normed,
-            attn_mask=causal_mask,
-            need_weights=False,
-        )
+        attn_out = self.attn(x_l_normed)
         x_post_attn = x_l + attn_out
         return {
             "x_next": x_post_attn + self.mlp(x_post_attn),

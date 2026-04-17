@@ -5,7 +5,13 @@ import pytest
 import torch
 from torch import nn
 
-from intertwined_hjepa import FinalResidualBlock, IntertwinedBlock, IntertwinedConfig, IntertwinedHJEPA
+from intertwined_hjepa import (
+    CausalSelfAttention,
+    FinalResidualBlock,
+    IntertwinedBlock,
+    IntertwinedConfig,
+    IntertwinedHJEPA,
+)
 from text_helpers import HFTokenizer, LMHead, TokenEmbeddings
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -141,8 +147,14 @@ def test_model_uses_explicit_small_initialization():
             assert torch.count_nonzero(module.bias) == 0
         if isinstance(module, nn.RMSNorm):
             assert torch.allclose(module.weight, torch.ones_like(module.weight))
-        if isinstance(module, nn.MultiheadAttention):
-            assert 0.0 < module.in_proj_weight.std().item() < 0.1
+        if isinstance(module, CausalSelfAttention):
+            for weight in (
+                module.q_proj.weight,
+                module.k_proj.weight,
+                module.v_proj.weight,
+                module.out_proj.weight,
+            ):
+                assert 0.0 < weight.std().item() < 0.1
     for block, ema_ce_norm, ema_compressor in zip(model.blocks, model.ema_ce_norms, model.ema_compressors):
         assert torch.equal(block.ce_norm.weight, ema_ce_norm.weight)
         for student_parameter, ema_parameter in zip(
