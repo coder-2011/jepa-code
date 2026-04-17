@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+from torchao.optim import AdamW4bit, AdamW8bit, AdamWFp8
 
 from data.dataset_helpers import (
     build_eval_dataloader,
@@ -35,6 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--parameter-golf-root", type=Path, default=None)
     parser.add_argument("--variant", default="sp1024")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=None)
@@ -42,6 +46,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adamw8bit", "adamw4bit", "adamwfp8"])
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -52,6 +57,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--wandb-project", default="intertwined-hjepa")
     parser.add_argument("--wandb-mode", default="disabled", choices=["disabled", "offline", "online"])
+    parser.add_argument("--torchao-float8", action="store_true")
+    parser.add_argument(
+        "--torchao-float8-recipe",
+        default="tensorwise",
+        choices=["tensorwise", "rowwise", "rowwise_with_gw_hp"],
+    )
+    parser.add_argument("--compile", dest="compile_model", action="store_true")
+    parser.add_argument("--no-compile", dest="compile_model", action="store_false")
+    parser.set_defaults(compile_model=None)
     return parser.parse_args(argv)
 
 
@@ -68,6 +82,8 @@ def validate_args(args: argparse.Namespace) -> None:
     assert args.seq_len is None or args.seq_len > 0, "--seq-len must be positive"
     assert args.train_shards is None or args.train_shards >= 0, "--train-shards must be non-negative"
     assert args.resume is None or args.resume.is_file(), f"Resume checkpoint not found: {args.resume}"
+    assert not args.torchao_float8 or args.device in {None, "cuda"}, "--torchao-float8 currently requires CUDA"
+    assert not args.torchao_float8 or args.dtype in {"auto", "bfloat16"}, "--torchao-float8 expects bf16 compute"
 
 
 def default_device() -> str:
@@ -84,6 +100,57 @@ def build_synchronize(device: torch.device):
     if device.type == "mps":
         return torch.mps.synchronize
     return lambda: None
+
+
+def detect_compute_dtype(device: torch.device, requested: str) -> torch.dtype:
+    if requested != "auto":
+        return getattr(torch, requested)
+    return torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+
+
+def build_autocast_context(device: torch.device, compute_dtype: torch.dtype):
+    enabled = device.type == "cuda" and compute_dtype in {torch.float16, torch.bfloat16}
+    if not enabled:
+        return nullcontext()
+    return torch.amp.autocast(device_type=device.type, dtype=compute_dtype)
+
+
+def optimizer_step(optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler | None) -> None:
+    if scaler is None:
+        optimizer.step()
+        return
+    scaler.step(optimizer)
+    scaler.update()
+
+
+def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> None:
+    if not args.torchao_float8:
+        return
+    assert device.type == "cuda", "TorchAO float8 training currently requires CUDA"
+    config = Float8LinearConfig.from_recipe_name(args.torchao_float8_recipe)
+    convert_to_float8_training(
+        model,
+        config=config,
+        module_filter_fn=lambda mod, _fqn: (
+            isinstance(mod, torch.nn.Linear)
+            and mod.in_features % 16 == 0
+            and mod.out_features % 16 == 0
+            and min(mod.in_features, mod.out_features) >= 16
+        ),
+    )
+
+
+def build_optimizer(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> torch.optim.Optimizer:
+    optimizer_cls = {
+        "adamw": torch.optim.AdamW,
+        "adamw8bit": AdamW8bit,
+        "adamw4bit": AdamW4bit,
+        "adamwfp8": AdamWFp8,
+    }[args.optimizer]
+    kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if optimizer_cls is torch.optim.AdamW:
+        kwargs["fused"] = device.type == "cuda"
+    return optimizer_cls(model.student_parameters(), **kwargs)
 
 
 def set_seed(seed: int) -> None:
@@ -194,6 +261,7 @@ def evaluate(
     device: torch.device,
     non_blocking: bool,
     step: int,
+    compute_dtype: torch.dtype,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -208,7 +276,8 @@ def evaluate(
 
     for batch in eval_loader:
         input_ids, labels = move_batch_to_device(batch, device=device, non_blocking=non_blocking)
-        outputs = model(input_ids=input_ids, labels=labels, step=step)
+        with build_autocast_context(device, compute_dtype):
+            outputs = model(input_ids=input_ids, labels=labels, step=step)
         total_loss += outputs["loss"].item()
         total_lm += outputs["loss_main"].item()
         total_jepa += outputs["loss_jepa"].item()
@@ -249,8 +318,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     validate_args(args)
     config = merge_config(load_config(Path(args.config)), args)
     device = torch.device(args.device or default_device())
+    compute_dtype = detect_compute_dtype(device, args.dtype)
+    compile_model = args.compile_model if args.compile_model is not None else device.type == "cuda"
     non_blocking = device.type == "cuda"
     synchronize = build_synchronize(device)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     set_seed(args.seed)
     dataset_root = resolve_dataset_root(args.dataset_root, args.parameter_golf_root, args.variant)
@@ -259,7 +332,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     assert train_shards, "No train shards selected"
 
     model = IntertwinedHJEPA(config).to(device)
-    optimizer = torch.optim.AdamW(model.student_parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    maybe_apply_torchao_float8(model, args, device)
+    optimizer = build_optimizer(model, args, device)
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and compute_dtype == torch.float16 else None
+    train_model = torch.compile(model, dynamic=False) if compile_model else model
     train_loader = build_train_dataloader(
         train_shards,
         batch_size=args.batch_size,
@@ -287,7 +363,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         start_step = int(checkpoint["step"])
         tokens_processed = int(checkpoint["tokens_processed"])
 
-    model.train()
+    train_model.train()
     train_iter = iter(train_loader)
     input_ids, labels = move_batch_to_device(next(train_iter), device=device, non_blocking=non_blocking)
 
@@ -301,9 +377,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         synchronize()
         t0 = time.time()
 
-        outputs = model(input_ids=input_ids, labels=labels, step=step_index)
+        with build_autocast_context(device, compute_dtype):
+            outputs = train_model(input_ids=input_ids, labels=labels, step=step_index)
         loss = outputs["loss"]
-        loss.backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if last_step:
             next_input_ids = None
@@ -316,10 +396,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         grad_norm = None
+        if scaler is not None:
+            scaler.unscale_(optimizer)
         if args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.student_parameters(), args.grad_clip)
 
-        optimizer.step()
+        optimizer_step(optimizer, scaler)
         model.update_ema()
         model.zero_grad(set_to_none=True)
 
@@ -367,11 +449,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if should_eval:
             assert eval_loader is not None, "Evaluation requested without an eval loader"
             eval_metrics = evaluate(
-                model,
+                train_model,
                 eval_loader,
                 device=device,
                 non_blocking=non_blocking,
                 step=step_index,
+                compute_dtype=compute_dtype,
             )
             print(
                 f"eval step={step_index} "
