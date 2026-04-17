@@ -323,9 +323,9 @@ class IntertwinedHJEPA(nn.Module):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
         assert 0.0 <= config.jepa_dropout_rate <= 1.0, "jepa_dropout_rate must be between 0 and 1"
-        assert 0.0 <= config.ema_momentum <= 1.0, "ema_momentum must be between 0 and 1"
-        assert 0.0 <= config.ema_momentum_final <= 1.0, "ema_momentum_final must be between 0 and 1"
-        assert config.ema_warmup_steps >= 0, "ema_warmup_steps must be non-negative"
+        assert 0.0 <= config.ema_momentum <= 1.0 and 0.0 <= config.ema_momentum_final <= 1.0 and config.ema_warmup_steps >= 0, (
+            "EMA momentum must be in [0, 1] and ema_warmup_steps must be non-negative"
+        )
 
         self.config = config
         self.ema_momentum = float(config.ema_momentum)
