@@ -138,6 +138,38 @@ def test_total_loss_includes_local_sigreg_when_enabled():
     assert outputs["loss_sigreg"] > 0
 
 
+def test_forward_can_skip_auxiliary_losses_and_use_only_lm_loss():
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=8,
+            compressed_dim=4,
+            depth=3,
+            num_heads=2,
+            predictor_hidden_dim=16,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.05,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids, compute_aux_losses=False)
+
+    assert torch.equal(outputs["loss"], outputs["loss_main"])
+    assert torch.equal(outputs["loss_jepa"], torch.zeros_like(outputs["loss_jepa"]))
+    assert torch.equal(outputs["loss_sigreg"], torch.zeros_like(outputs["loss_sigreg"]))
+    assert len(outputs["targets"]) == len(model.blocks)
+    assert all(torch.equal(loss, torch.zeros_like(loss)) for loss in outputs["loss_jepa_layers"])
+    assert all(torch.equal(loss, torch.zeros_like(loss)) for loss in outputs["loss_sigreg_layers"])
+    assert outputs["diagnostics"]["compute_aux_losses"] is False
+
+
 def test_sigreg_loss_updates_encoder_path():
     model = IntertwinedHJEPA(
         replace(

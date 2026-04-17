@@ -29,6 +29,7 @@ def test_load_checkpoint_fills_missing_sigreg_config_from_yaml(tmp_path: Path):
     assert loaded_model.config.beta_sigreg == config.beta_sigreg
     assert loaded_model.config.sigreg_num_slices == config.sigreg_num_slices
     assert set(missing_fields) == {
+        "jepa_dropout_rate",
         "beta_sigreg",
         "sigreg_warmup_steps",
         "sigreg_num_slices",

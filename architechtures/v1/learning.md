@@ -47,3 +47,4 @@
 - Current JEPA loss is `MSE(delta_l, target_z_l.detach() - z_l)`, not the older predictor-only `MSE(delta_l, target_z_l.detach() - z_l.detach())`; `z_l` remains live so JEPA gradients train the CE path.
 - Current SIGReg placement is directly on cached `z_l = CE_l(h_l_post_attn)`, the encoder output embedding. This lets SIGReg gradients flow through the full encoder path that produced `z_l`; do not recompute SIGReg inputs under `no_grad`.
 - With corrected SIGReg-on-`z_l`, `beta_sigreg=0.04` is viable on the local MPS smoke: a 2000-step run kept JEPA block `z_std_mean` near `1.0` and reduced summed SIGReg from about `154` to about `16`.
+- JEPA loss dropout in Intertwined H-JEPA should be implemented as trainer-controlled auxiliary-loss dropout: on dropped steps, skip teacher-target JEPA and SIGReg loss computation and train with LM loss only, but keep the student compressor/predictor/projector path active because it is part of the residual-stream forward contract.
