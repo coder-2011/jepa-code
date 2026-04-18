@@ -82,6 +82,24 @@ def test_next_token_jepa_masks_out_final_position():
     assert not outputs["jepa_valid_mask"][:, -1].any()
 
 
+def test_next_token_jepa_combines_sequence_valid_mask_with_tail_mask():
+    model = make_model()
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+    valid_mask = torch.tensor(
+        [
+            [True, False, True, True],
+            [False, True, True, True],
+        ],
+        dtype=torch.bool,
+    )
+
+    outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask, compute_aux_losses=False)
+
+    expected = valid_mask.clone()
+    expected[:, -1] = False
+    assert torch.equal(outputs["jepa_valid_mask"], expected)
+
+
 def test_ema_targets_have_no_gradients():
     model = make_model()
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)

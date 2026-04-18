@@ -323,8 +323,9 @@ def next_token_jepa_mask(input_ids: torch.Tensor) -> torch.Tensor:
 
 def shift_targets_to_next_token(raw_target_z: torch.Tensor) -> torch.Tensor:
     assert raw_target_z.ndim == 3, "raw_target_z must have shape (B, L, K)"
-    target_z = torch.zeros_like(raw_target_z)
-    target_z[:, :-1] = raw_target_z[:, 1:]
+    # The tail position is masked out by JEPA, so we only need to overwrite the valid prefix.
+    target_z = raw_target_z.clone()
+    target_z[:, :-1].copy_(raw_target_z[:, 1:])
     return target_z
 
 
@@ -507,12 +508,12 @@ class IntertwinedHJEPA(nn.Module):
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
         sequence_valid_mask = None if valid_mask is None else valid_mask.to(torch.bool)
-        jepa_next_token_mask = next_token_jepa_mask(input_ids)
-        jepa_valid_mask = jepa_next_token_mask if sequence_valid_mask is None else sequence_valid_mask & jepa_next_token_mask
+        jepa_valid_mask = next_token_jepa_mask(input_ids)
+        if sequence_valid_mask is not None:
+            jepa_valid_mask &= sequence_valid_mask
 
         if compute_aux_losses:
-            if not jepa_valid_mask.any():
-                raise ValueError("next-token JEPA requires at least one valid future-token position")
+            assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid future-token position"
             targets = []
             jepa_losses = []
             sigreg_losses = []
