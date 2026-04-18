@@ -204,19 +204,26 @@ def test_jepa_target_uses_same_layer_ema_context_path_on_next_token():
     assert not torch.allclose(target[:, :-1], next_block_target[:, :-1])
 
 
-def test_last_jepa_target_uses_next_token_frozen_output_encoder():
+def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    final_state = outputs["states"][-1]
+    current_state = outputs["states"][len(model.blocks) - 1]
 
     target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
-    expected = model.output_target_compressor(model.output_target_norm(final_state))
+    expected = model.ema_target_blocks[-1].encode_context(current_state)[1]
 
     assert torch.allclose(target[:, :-1], expected[:, 1:])
     assert not target.requires_grad
-    assert all(not parameter.requires_grad for parameter in model.output_target_norm.parameters())
-    assert all(not parameter.requires_grad for parameter in model.output_target_compressor.parameters())
+
+    with torch.no_grad():
+        for parameter in model.output_target_norm.parameters():
+            parameter.zero_()
+        for parameter in model.output_target_compressor.parameters():
+            parameter.zero_()
+
+    unchanged = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
+    assert torch.allclose(target, unchanged)
 
 
 def test_load_legacy_state_without_ema_context_copies():
