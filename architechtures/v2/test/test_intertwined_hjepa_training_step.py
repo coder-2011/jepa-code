@@ -72,6 +72,16 @@ def test_jepa_delta_loss_uses_normalized_latents():
     assert torch.allclose(jepa_delta_loss(delta, z, target), expected)
 
 
+def test_next_token_jepa_masks_out_final_position():
+    model = make_model()
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids)
+
+    assert outputs["jepa_valid_mask"][:, :-1].all()
+    assert not outputs["jepa_valid_mask"][:, -1].any()
+
+
 def test_ema_targets_have_no_gradients():
     model = make_model()
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)

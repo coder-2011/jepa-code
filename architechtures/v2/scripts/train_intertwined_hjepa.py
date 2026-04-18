@@ -465,6 +465,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "train/loss_sigreg": outputs["loss_sigreg"].item(),
                 "train/lambda_jepa": float(outputs["diagnostics"]["lambda_jepa"]),
                 "train/beta_sigreg": float(outputs["diagnostics"]["beta_sigreg"]),
+                "train/jepa_valid_fraction": float(outputs["diagnostics"]["jepa_valid_fraction"]),
+                "train/jepa_positions": float(outputs["diagnostics"]["jepa_positions"]),
                 "train/jepa_aux_dropped": float(drop_jepa_loss),
                 "train/jepa_dropout_steps": float(jepa_dropout_steps),
                 "train/jepa_dropout_fraction": jepa_dropout_steps / step_number,

@@ -314,6 +314,20 @@ def next_token_loss(
     )
 
 
+def next_token_jepa_mask(input_ids: torch.Tensor) -> torch.Tensor:
+    assert input_ids.ndim == 2, "input_ids must have shape (B, L)"
+    mask = torch.ones_like(input_ids, dtype=torch.bool)
+    mask[:, -1] = False
+    return mask
+
+
+def shift_targets_to_next_token(raw_target_z: torch.Tensor) -> torch.Tensor:
+    assert raw_target_z.ndim == 3, "raw_target_z must have shape (B, L, K)"
+    target_z = torch.zeros_like(raw_target_z)
+    target_z[:, :-1] = raw_target_z[:, 1:]
+    return target_z
+
+
 def warmup_weight(weight: float, step: int | None, warmup_steps: int) -> float:
     # Scalar schedule only; it does not touch any tensor shapes.
     if warmup_steps <= 0 or step is None:
@@ -335,7 +349,8 @@ class IntertwinedHJEPA(nn.Module):
     d_l = Pred_l(z_l)
     h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
 
-    target_z_l = sg(CEbar_{l+1}(h_{l+1}_post_attn)) or sg(T_out(h_final_post_attn))
+    target_z_l[:, t] = sg(CEbar_l(h_l)[:, t+1]) for lower layers
+    target_z_top[:, t] = sg(T_out(h_final)[:, t+1]) for the top JEPA block
     L_jepa_l = MSE(d_l, target_z_l - z_l)
     """
 
@@ -420,17 +435,26 @@ class IntertwinedHJEPA(nn.Module):
         return self.embeddings(input_ids)
 
     @torch.no_grad()
-    def compute_jepa_target_for_layer(
+    def compute_raw_jepa_target_for_layer(
         self,
         layer_index: int,
         states: list[torch.Tensor],
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
         if layer_index + 1 < len(self.blocks):
-            target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index + 1])[1]
+            target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index])[1]
         else:
             target_z_l = self.output_target_compressor(self.output_target_norm(states[-1]))
         return target_z_l.detach()
+
+    @torch.no_grad()
+    def compute_jepa_target_for_layer(
+        self,
+        layer_index: int,
+        states: list[torch.Tensor],
+    ) -> torch.Tensor:
+        raw_target_z_l = self.compute_raw_jepa_target_for_layer(layer_index, states)
+        return shift_targets_to_next_token(raw_target_z_l)
 
     def forward(
         self,
@@ -482,8 +506,13 @@ class IntertwinedHJEPA(nn.Module):
         states.append(h)
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
+        sequence_valid_mask = None if valid_mask is None else valid_mask.to(torch.bool)
+        jepa_next_token_mask = next_token_jepa_mask(input_ids)
+        jepa_valid_mask = jepa_next_token_mask if sequence_valid_mask is None else sequence_valid_mask & jepa_next_token_mask
 
         if compute_aux_losses:
+            if not jepa_valid_mask.any():
+                raise ValueError("next-token JEPA requires at least one valid future-token position")
             targets = []
             jepa_losses = []
             sigreg_losses = []
@@ -495,17 +524,17 @@ class IntertwinedHJEPA(nn.Module):
                         deltas[layer_index],
                         compressed[layer_index],
                         target_z_l,
-                        valid_mask=valid_mask,
+                        valid_mask=jepa_valid_mask,
                     )
                 )
             if self.config.beta_sigreg > 0:
                 for layer_index in range(len(self.blocks)):
                     sigreg_input_l = rms_normalize_last_dim(compressed[layer_index])
-                    if valid_mask is not None:
-                        assert valid_mask.shape == sigreg_input_l.shape[:-1], (
+                    if sequence_valid_mask is not None:
+                        assert sequence_valid_mask.shape == sigreg_input_l.shape[:-1], (
                             "valid_mask must match the leading shape of SIGReg inputs"
                         )
-                        sigreg_input_l = sigreg_input_l[valid_mask.to(torch.bool)]
+                        sigreg_input_l = sigreg_input_l[sequence_valid_mask]
                     sigreg_losses.append(self.sigreg(sigreg_input_l))
         else:
             zero_loss = logits.new_zeros(())
@@ -551,6 +580,8 @@ class IntertwinedHJEPA(nn.Module):
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
             "loss_sigreg_layers": [loss.detach() for loss in sigreg_losses],
+            "jepa_valid_fraction": jepa_valid_mask.float().mean().detach(),
+            "jepa_positions": jepa_valid_mask.sum().detach(),
             "z_variance": [z.detach().float().var() for z in compressed],
             "z_std_mean": [std.mean() for std in z_stds],
             "z_std_min": [std.min() for std in z_stds],
@@ -571,6 +602,7 @@ class IntertwinedHJEPA(nn.Module):
             "z": compressed,
             "deltas": deltas,
             "targets": targets,
+            "jepa_valid_mask": jepa_valid_mask,
             "diagnostics": diagnostics,
         }
 

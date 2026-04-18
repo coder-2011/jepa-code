@@ -136,10 +136,11 @@ def add_layer_metrics(
     z = outputs["z"][index].detach().float()
     delta = outputs["deltas"][index].detach().float()
     target_delta = outputs["targets"][index].detach().float() - z
+    jepa_valid_mask = outputs["jepa_valid_mask"].to(torch.bool)
     z_flat = z.reshape(-1, z.shape[-1])
     z_std = z_flat.std(dim=0, unbiased=False)
-    delta_norm = delta.norm(dim=-1).mean()
-    target_delta_norm = target_delta.norm(dim=-1).mean()
+    delta_norm = delta[jepa_valid_mask].norm(dim=-1).mean()
+    target_delta_norm = target_delta[jepa_valid_mask].norm(dim=-1).mean()
 
     layer["loss_jepa"] += outputs["loss_jepa_layers"][index].item()
     layer["loss_sigreg"] += outputs["loss_sigreg_layers"][index].item()
@@ -256,7 +257,7 @@ def generate(
     for _ in range(max_new_tokens):
         context = generated[-model.config.max_length :]
         x = torch.tensor([context], dtype=torch.long, device=device)
-        logits = model(input_ids=x)["logits"][0, -1]
+        logits = model(input_ids=x, compute_aux_losses=False)["logits"][0, -1]
         generated.append(sample_next_id(logits, temperature=temperature, top_k=top_k))
 
     new_ids = generated[len(ids) :]

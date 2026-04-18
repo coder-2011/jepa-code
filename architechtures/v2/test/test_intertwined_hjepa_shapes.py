@@ -180,11 +180,11 @@ def test_rmsnorm_mixed_bf16_input_avoids_dtype_mismatch_warning():
     assert not any("Mismatch dtype between input and weight" in str(w.message) for w in caught)
 
 
-def test_jepa_target_uses_current_layer_full_ema_context_path_on_next_residual_state():
+def test_jepa_target_uses_same_layer_ema_context_path_on_next_token():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    next_state = outputs["states"][1]
+    current_state = outputs["states"][0]
 
     with torch.no_grad():
         model.blocks[0].attn_norm.weight.fill_(2.0)
@@ -193,17 +193,18 @@ def test_jepa_target_uses_current_layer_full_ema_context_path_on_next_residual_s
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
     target = model.compute_jepa_target_for_layer(0, outputs["states"])
-    ema_target = model.ema_target_blocks[0].encode_context(next_state)[1]
-    live_post_attn = next_state + model.blocks[0].attn(model.blocks[0].attn_norm(next_state))
+    ema_target = model.ema_target_blocks[0].encode_context(current_state)[1]
+    live_post_attn = current_state + model.blocks[0].attn(model.blocks[0].attn_norm(current_state))
     live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(live_post_attn))
-    next_block_target = model.ema_target_blocks[1].encode_context(next_state)[1]
+    next_block_target = model.ema_target_blocks[1].encode_context(current_state)[1]
 
-    assert torch.allclose(target, ema_target)
-    assert not torch.allclose(target, live_target)
-    assert not torch.allclose(target, next_block_target)
+    assert torch.allclose(target[:, :-1], ema_target[:, 1:])
+    assert torch.equal(outputs["jepa_valid_mask"][:, -1], torch.zeros_like(outputs["jepa_valid_mask"][:, -1]))
+    assert not torch.allclose(target[:, :-1], live_target[:, :-1])
+    assert not torch.allclose(target[:, :-1], next_block_target[:, :-1])
 
 
-def test_last_jepa_target_uses_frozen_output_encoder():
+def test_last_jepa_target_uses_next_token_frozen_output_encoder():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
@@ -212,7 +213,7 @@ def test_last_jepa_target_uses_frozen_output_encoder():
     target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
     expected = model.output_target_compressor(model.output_target_norm(final_state))
 
-    assert torch.allclose(target, expected)
+    assert torch.allclose(target[:, :-1], expected[:, 1:])
     assert not target.requires_grad
     assert all(not parameter.requires_grad for parameter in model.output_target_norm.parameters())
     assert all(not parameter.requires_grad for parameter in model.output_target_compressor.parameters())
@@ -257,6 +258,9 @@ def test_model_forward_returns_expected_shapes():
     assert len(outputs["targets"]) == config.depth - 1
     assert len(outputs["states"]) == config.depth + 1
     assert len(outputs["post_attn_states"]) == config.depth
+    assert outputs["jepa_valid_mask"].shape == input_ids.shape
+    assert outputs["jepa_valid_mask"][:, :-1].all()
+    assert not outputs["jepa_valid_mask"][:, -1].any()
 
 
 def test_model_forward_without_labels_uses_jepa_loss():
