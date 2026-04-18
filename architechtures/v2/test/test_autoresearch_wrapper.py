@@ -1,6 +1,33 @@
 from pathlib import Path
 
-from autoresearch.train import RESULTS_COLUMNS, main
+import torch
+
+from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, main
+
+
+class _FakeSentencePiece:
+    def vocab_size(self) -> int:
+        return 6
+
+    def is_control(self, token_id: int) -> bool:
+        return token_id == 0
+
+    def is_unknown(self, token_id: int) -> bool:
+        return token_id == 1
+
+    def is_unused(self, token_id: int) -> bool:
+        return token_id == 2
+
+    def is_byte(self, token_id: int) -> bool:
+        return token_id == 5
+
+    def id_to_piece(self, token_id: int) -> str:
+        pieces = {
+            3: "foo",
+            4: "▁bar",
+            5: "<0x61>",
+        }
+        return pieces[token_id]
 
 
 def test_validate_only_plans_run_and_initializes_results_tsv(tmp_path: Path):
@@ -45,3 +72,35 @@ def test_validate_only_plans_run_and_initializes_results_tsv(tmp_path: Path):
     assert result["trainer_argv"][0:2] == ["--config", str(Path("intertwined_hjepa.yaml").resolve())]
     assert "--parameter-golf-root" in result["trainer_argv"]
     assert "--max-steps" in result["trainer_argv"]
+
+
+def test_build_sentencepiece_luts_matches_parameter_golf_semantics():
+    base_bytes, has_leading_space, is_boundary = build_sentencepiece_luts(
+        _FakeSentencePiece(),
+        vocab_size=8,
+        device=torch.device("cpu"),
+    )
+
+    assert base_bytes.shape[0] == 8
+    assert has_leading_space.shape[0] == 8
+    assert is_boundary.shape[0] == 8
+
+    # Control / unknown / unused ids are excluded from byte counting.
+    assert base_bytes[0].item() == 0
+    assert base_bytes[1].item() == 0
+    assert base_bytes[2].item() == 0
+    assert is_boundary[0].item() is True
+    assert is_boundary[1].item() is True
+    assert is_boundary[2].item() is True
+
+    # Normal text pieces count UTF-8 bytes; leading-space pieces defer the space to context logic.
+    assert base_bytes[3].item() == len("foo".encode("utf-8"))
+    assert base_bytes[4].item() == len("bar".encode("utf-8"))
+    assert has_leading_space[3].item() is False
+    assert has_leading_space[4].item() is True
+    assert is_boundary[3].item() is False
+    assert is_boundary[4].item() is False
+
+    # Byte fallback pieces count as one byte.
+    assert base_bytes[5].item() == 1
+    assert is_boundary[5].item() is False
