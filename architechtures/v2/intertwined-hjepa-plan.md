@@ -48,25 +48,17 @@ The LM head may tie weights with the token embedding.
 
 Every JEPA block has a target.
 
-For a JEPA block with another JEPA block above it:
+For every JEPA block, the target is the same-depth EMA encoder at the next token position:
 
 ```text
-target_z_l = stopgrad(CEbar_{l+1}(h_{l+1}_post_attn))
+target_z_l[:, t] = stopgrad(EMA_Enc_l(h_l)[:, t+1])
 ```
 
-`CEbar` is the EMA copy of the next block's CE path:
+`EMA_Enc_l` is the EMA copy of the current block's encoder path:
 
 ```text
-ema_ce_norm + ema_compressor
+ema_attn_norm + ema_attn + ema_ce_norm + ema_compressor
 ```
-
-For the top JEPA block, the target comes from a frozen output target encoder applied to the final block's post-attention state:
-
-```text
-target_z_top = stopgrad(output_target_compressor(output_target_norm(h_final_post_attn)))
-```
-
-The output target encoder is initialized once and frozen.
 
 ## Losses
 
@@ -82,10 +74,11 @@ Warmups are scalar linear warmups over `jepa_warmup_steps` and `sigreg_warmup_st
 
 ### LM Loss
 
-The LM loss is normal next-token cross entropy:
+The LM loss is normal next-token cross entropy. The loader already shifts the
+targets, so the loss consumes aligned `(logits[:, t], labels[:, t])` pairs:
 
 ```text
-loss_lm = CE(logits[:, :-1], labels[:, 1:])
+loss_lm = CE(logits, labels)
 ```
 
 ### JEPA Loss
@@ -96,7 +89,7 @@ Current JEPA loss:
 loss_jepa_l = MSE(delta_l, stopgrad(target_z_l) - z_l)
 ```
 
-The target is stopped. The student `z_l` is not stopped. Therefore JEPA trains both the predictor and the CE path.
+The target is stopped. The student `z_l` is not stopped. Therefore JEPA trains both the predictor and the encoder path.
 
 This replaced the older predictor-only form:
 
@@ -104,7 +97,7 @@ This replaced the older predictor-only form:
 MSE(delta_l, stopgrad(target_z_l - z_l))
 ```
 
-which detached `z_l` and did not train CE through JEPA.
+which detached `z_l` and did not train the encoder path through JEPA.
 
 ### SIGReg Loss
 
@@ -129,9 +122,11 @@ Because SIGReg uses the cached `z_l`, gradients flow through the full encoder pa
 
 ## EMA Contract
 
-EMA tracks only the CE path:
+EMA tracks the teacher encoder path:
 
 ```text
+ema_attn_norm_l
+ema_attn_l
 ema_ce_norm_l
 ema_compressor_l
 ```
@@ -139,13 +134,11 @@ ema_compressor_l
 EMA excludes:
 
 ```text
-attention
 predictor
 projector
 embeddings
 LM head
 final residual block
-output target encoder
 ```
 
 The EMA path is never optimized by AdamW and only changes in `update_ema()` after `optimizer.step()`.

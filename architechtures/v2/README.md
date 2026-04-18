@@ -88,24 +88,21 @@ loss = loss_lm
 
 ### LM Loss
 
-The LM loss is standard next-token cross entropy:
+The LM loss is standard next-token cross entropy. The dataloader already
+builds `labels[:, t] = input_ids[:, t+1]`, so there is no second shift inside
+the loss:
 
 ```text
-loss_lm = CE(logits[:, :-1], labels[:, 1:])
+loss_lm = CE(logits, labels)
 ```
 
 ### JEPA Loss
 
-For non-top JEPA block `l`, the target is the EMA copy of the next block's CE path:
+For each JEPA block `l`, the target is the EMA copy of that same block's encoder path,
+evaluated on the real sequence and shifted one token into the future:
 
 ```text
-target_z_l = stopgrad(EMA_CE_{l+1}(h_{l+1}_post_attn))
-```
-
-For the top JEPA block, the target comes from a frozen output target encoder after the final block:
-
-```text
-target_z_top = stopgrad(output_target_compressor(output_target_norm(h_final_post_attn)))
+target_z_l[:, t] = stopgrad(EMA_Enc_l(h_l)[:, t+1])
 ```
 
 The JEPA loss is:
@@ -114,7 +111,7 @@ The JEPA loss is:
 loss_jepa_l = MSE(delta_l, stopgrad(target_z_l) - z_l)
 ```
 
-Only the teacher target is stopped. The student `z_l` is live, so JEPA trains the predictor and the student CE path.
+Only the teacher target is stopped. The student `z_l` is live, so JEPA trains the predictor and the student encoder path.
 
 ### SIGReg Loss
 
@@ -128,14 +125,16 @@ It is not applied to `delta_l`, `z_l + delta_l`, the projected update, or the re
 
 ## EMA
 
-EMA tracks only the CE path for each JEPA block:
+EMA tracks the teacher encoder path for each JEPA block:
 
 ```text
+ema_attn_norm_l
+ema_attn_l
 ema_ce_norm_l
 ema_compressor_l
 ```
 
-EMA does not track attention, predictor, projector, embeddings, LM head, final block, or the frozen output target encoder.
+EMA does not track predictor, projector, embeddings, LM head, or the final block.
 
 Call order during training:
 
