@@ -299,16 +299,12 @@ def next_token_loss(
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # logits: (B, L, vocab_size), labels/valid_mask: (B, L)
-    # We predict token t+1 from position t, so the loss sees B * (L - 1) rows after shifting.
-    assert logits.shape[1] >= 2, "next-token loss requires sequence length >= 2"
+    # The dataloader already shifts targets so labels[:, t] is the next token for logits[:, t].
     if valid_mask is not None:
-        # The mask applies to the predicted token positions, so it shifts with the labels.
-        labels = labels[:, 1:].masked_fill(~valid_mask[:, 1:].to(torch.bool), -100)
-    else:
-        labels = labels[:, 1:]
+        labels = labels.masked_fill(~valid_mask.to(torch.bool), -100)
 
     return F.cross_entropy(
-        logits[:, :-1].reshape(-1, logits.shape[-1]),
+        logits.reshape(-1, logits.shape[-1]),
         labels.reshape(-1),
         ignore_index=-100,
     )
@@ -350,8 +346,7 @@ class IntertwinedHJEPA(nn.Module):
     d_l = Pred_l(z_l)
     h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
 
-    target_z_l[:, t] = sg(CEbar_l(h_l)[:, t+1]) for lower layers
-    target_z_top[:, t] = sg(T_out(h_final)[:, t+1]) for the top JEPA block
+    target_z_l[:, t] = sg(EMA_Enc_l(h_l)[:, t+1]) for every JEPA block
     L_jepa_l = MSE(d_l, target_z_l - z_l)
     """
 
@@ -405,6 +400,8 @@ class IntertwinedHJEPA(nn.Module):
             token_embedding=self.embeddings.token_embedding,
             tie_weights=config.tie_weights,
         )
+        # Retained only for backward checkpoint compatibility; JEPA targets now
+        # come from same-depth EMA encoders for every JEPA block.
         self.output_target_norm = RMSNorm(config.residual_dim)
         self.output_target_compressor = SimpleCompressor(
             config.residual_dim,
@@ -442,10 +439,7 @@ class IntertwinedHJEPA(nn.Module):
         states: list[torch.Tensor],
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
-        if layer_index + 1 < len(self.blocks):
-            target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index])[1]
-        else:
-            target_z_l = self.output_target_compressor(self.output_target_norm(states[-1]))
+        target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index])[1]
         return target_z_l.detach()
 
     @torch.no_grad()
@@ -609,7 +603,7 @@ class IntertwinedHJEPA(nn.Module):
 
     @torch.no_grad()
     def update_ema(self, step: int | None = None) -> None:
-        # Call after optimizer.step() so the EMA teacher lags the student CE path.
+        # Call after optimizer.step() so the EMA teacher lags the student encoder path.
         momentum = self.ema_momentum_at_step(step)
         for ema_block, block in zip(self.ema_target_blocks, self.blocks):
             ema_block.attn_norm.weight.lerp_(block.attn_norm.weight, 1.0 - momentum)

@@ -6,7 +6,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, rms_normalize_last_dim
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, next_token_loss, rms_normalize_last_dim
 from sigreg import SlicedEppsPulleySIGReg
 
 YAML_CONFIG = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
@@ -70,6 +70,30 @@ def test_jepa_delta_loss_uses_normalized_latents():
     expected = torch.nn.functional.mse_loss(normalized_delta, normalized_target_delta)
 
     assert torch.allclose(jepa_delta_loss(delta, z, target), expected)
+
+
+def test_next_token_loss_uses_already_shifted_labels_without_second_shift():
+    labels = torch.tensor([[11, 12, 13, 14]], dtype=torch.long)
+    logits = torch.full((1, 4, 20), -100.0)
+    for index, token_id in enumerate(labels[0].tolist()):
+        logits[0, index, token_id] = 100.0
+
+    loss = next_token_loss(logits, labels)
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_next_token_loss_masks_current_positions_directly():
+    labels = torch.tensor([[3, 5, 7]], dtype=torch.long)
+    logits = torch.full((1, 3, 10), -100.0)
+    logits[0, 0, 3] = 100.0
+    logits[0, 1, 0] = 100.0
+    logits[0, 2, 7] = 100.0
+    valid_mask = torch.tensor([[True, False, True]], dtype=torch.bool)
+
+    loss = next_token_loss(logits, labels, valid_mask=valid_mask)
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_next_token_jepa_masks_out_final_position():
