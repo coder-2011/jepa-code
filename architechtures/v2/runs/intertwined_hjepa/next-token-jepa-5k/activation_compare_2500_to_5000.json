@@ -1,0 +1,161 @@
+{
+  "checkpoint_a": {
+    "final_state_abs_max": 122.47051334381104,
+    "final_state_mean_abs": 4.6405534744262695,
+    "final_state_std": 12.128102898597717,
+    "loss": 6.7109010219573975,
+    "loss_jepa": 0.2714730016887188,
+    "loss_lm": 5.985418081283569,
+    "loss_sigreg": 11.350248575210571,
+    "num_batches": 8,
+    "num_tokens": 8192,
+    "step": 2500,
+    "tail_delta_norm": [
+      1.0044812858104706,
+      0.8297993615269661,
+      1.0473248362541199
+    ],
+    "tail_target_delta_norm": [
+      0.14594880305230618,
+      0.09187029302120209,
+      1.782408058643341
+    ],
+    "valid_delta_norm": [
+      0.8760885894298553,
+      0.9688859954476357,
+      0.7973970770835876
+    ],
+    "valid_target_delta_norm": [
+      1.5096765458583832,
+      1.677802100777626,
+      1.4249621331691742
+    ],
+    "z_abs_max": [
+      0.5745980590581894,
+      0.8575560003519058,
+      0.8492604643106461
+    ],
+    "z_effective_rank": [
+      89.83587646484375,
+      86.4592981338501,
+      96.86728763580322
+    ],
+    "z_std_mean": [
+      0.12691122107207775,
+      0.14523921348154545,
+      0.13029335625469685
+    ],
+    "z_std_min": [
+      0.10703783482313156,
+      0.11562378983944654,
+      0.11099654249846935
+    ]
+  },
+  "checkpoint_b": {
+    "final_state_abs_max": 174.52259635925293,
+    "final_state_mean_abs": 6.24597305059433,
+    "final_state_std": 14.544827461242676,
+    "loss": 6.714112162590027,
+    "loss_jepa": 0.3565436862409115,
+    "loss_lm": 5.944146513938904,
+    "loss_sigreg": 10.335548162460327,
+    "num_batches": 8,
+    "num_tokens": 8192,
+    "step": 5000,
+    "tail_delta_norm": [
+      1.1594398021697998,
+      0.9920085594058037,
+      1.3971879482269287
+    ],
+    "tail_target_delta_norm": [
+      0.1011487701907754,
+      0.08978347200900316,
+      1.732348158955574
+    ],
+    "valid_delta_norm": [
+      0.8999535217881203,
+      0.9139683470129967,
+      0.9413611963391304
+    ],
+    "valid_target_delta_norm": [
+      1.9676006585359573,
+      2.130472183227539,
+      1.3057115972042084
+    ],
+    "z_abs_max": [
+      0.9176618605852127,
+      1.0248799473047256,
+      1.0851146578788757
+    ],
+    "z_effective_rank": [
+      93.92801189422607,
+      92.42968559265137,
+      105.77913570404053
+    ],
+    "z_std_mean": [
+      0.1623076256364584,
+      0.1819585021585226,
+      0.12609142996370792
+    ],
+    "z_std_min": [
+      0.1377551220357418,
+      0.1550760492682457,
+      0.1096816211938858
+    ]
+  },
+  "drift": {
+    "final_state_abs_max": 52.052083015441895,
+    "final_state_mean_abs": 1.6054195761680603,
+    "final_state_std": 2.4167245626449585,
+    "layers": [
+      {
+        "layer": 0,
+        "tail_delta_norm": 0.15495851635932922,
+        "tail_to_valid_delta_ratio_a": 1.1465521842536166,
+        "tail_to_valid_delta_ratio_b": 1.2883329795366605,
+        "tail_to_valid_target_ratio_a": 0.09667554513759867,
+        "tail_to_valid_target_ratio_b": 0.05140716422916715,
+        "valid_delta_norm": 0.023864932358264923,
+        "z_abs_max": 0.3430638015270233,
+        "z_effective_rank": 4.092135429382324,
+        "z_std_mean": 0.035396404564380646,
+        "z_std_min": 0.030717287212610245
+      },
+      {
+        "layer": 1,
+        "tail_delta_norm": 0.16220919787883759,
+        "tail_to_valid_delta_ratio_a": 0.8564468528039668,
+        "tail_to_valid_delta_ratio_b": 1.0853861215739644,
+        "tail_to_valid_target_ratio_a": 0.05475633447986633,
+        "tail_to_valid_target_ratio_b": 0.042142522543047956,
+        "valid_delta_norm": -0.05491764843463898,
+        "z_abs_max": 0.16732394695281982,
+        "z_effective_rank": 5.9703874588012695,
+        "z_std_mean": 0.03671928867697716,
+        "z_std_min": 0.03945225942879915
+      },
+      {
+        "layer": 2,
+        "tail_delta_norm": 0.34986311197280884,
+        "tail_to_valid_delta_ratio_a": 1.3134294899658046,
+        "tail_to_valid_delta_ratio_b": 1.4842208853099828,
+        "tail_to_valid_target_ratio_a": 1.2508459117290314,
+        "tail_to_valid_target_ratio_b": 1.3267463984120846,
+        "valid_delta_norm": 0.14396411925554276,
+        "z_abs_max": 0.23585419356822968,
+        "z_effective_rank": 8.911848068237305,
+        "z_std_mean": -0.004201926290988922,
+        "z_std_min": -0.0013149213045835495
+      }
+    ],
+    "loss": 0.0032111406326293945,
+    "loss_jepa": 0.08507068455219269,
+    "loss_lm": -0.04127156734466553,
+    "loss_sigreg": -1.0147004127502441
+  },
+  "warnings": [
+    "layer 0 tail delta norm exceeds valid-position delta norm by >25% at checkpoint B",
+    "layer 2 tail delta norm exceeds valid-position delta norm by >25% at checkpoint B",
+    "layer 2 tail target-delta norm exceeds valid-position target-delta norm by >25% at checkpoint B"
+  ]
+}
