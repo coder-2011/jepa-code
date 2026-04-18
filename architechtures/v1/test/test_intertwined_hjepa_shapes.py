@@ -131,8 +131,7 @@ def test_config_loads_from_yaml_and_builds_model():
 
     assert len(model.blocks) == config.depth - 1
     assert isinstance(model.final_block, FinalResidualBlock)
-    assert len(model.ema_ce_norms) == config.depth - 1
-    assert len(model.ema_compressors) == config.depth - 1
+    assert len(model.ema_target_blocks) == config.depth - 1
     assert model.embeddings.token_embedding.num_embeddings == config.vocab_size
     assert model.embeddings.position_embedding.num_embeddings == config.max_length
     assert model.embeddings.token_embedding.embedding_dim == config.residual_dim
@@ -157,12 +156,12 @@ def test_model_uses_explicit_small_initialization():
                 module.out_proj.weight,
             ):
                 assert 0.0 < weight.std().item() < 0.1
-    for block, ema_ce_norm, ema_compressor in zip(model.blocks, model.ema_ce_norms, model.ema_compressors):
-        assert torch.equal(block.ce_norm.weight, ema_ce_norm.weight)
-        for student_parameter, ema_parameter in zip(
-            block.compressor.parameters(),
-            ema_compressor.module.parameters(),
-        ):
+    for block, ema_block in zip(model.blocks, model.ema_target_blocks):
+        assert torch.equal(block.attn_norm.weight, ema_block.attn_norm.weight)
+        assert torch.equal(block.ce_norm.weight, ema_block.ce_norm.weight)
+        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_block.attn.parameters()):
+            assert torch.equal(student_parameter, ema_parameter)
+        for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_block.compressor.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
 
 
@@ -181,21 +180,27 @@ def test_rmsnorm_mixed_bf16_input_avoids_dtype_mismatch_warning():
     assert not any("Mismatch dtype between input and weight" in str(w.message) for w in caught)
 
 
-def test_jepa_target_uses_ema_norm_not_live_norm():
+def test_jepa_target_uses_current_layer_full_ema_context_path_on_next_residual_state():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
     next_state = outputs["states"][1]
 
     with torch.no_grad():
+        model.blocks[0].attn_norm.weight.fill_(2.0)
+        model.blocks[0].ce_norm.weight.fill_(2.0)
+        model.blocks[1].attn_norm.weight.fill_(2.0)
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
     target = model.compute_jepa_target_for_layer(0, outputs["states"])
-    ema_target = model.ema_compressors[1].module(model.ema_ce_norms[1](next_state))
-    live_target = model.blocks[1].compressor(model.blocks[1].ce_norm(next_state))
+    ema_target = model.ema_target_blocks[0].encode_context(next_state)[1]
+    live_post_attn = next_state + model.blocks[0].attn(model.blocks[0].attn_norm(next_state))
+    live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(live_post_attn))
+    next_block_target = model.ema_target_blocks[1].encode_context(next_state)[1]
 
     assert torch.allclose(target, ema_target)
     assert not torch.allclose(target, live_target)
+    assert not torch.allclose(target, next_block_target)
 
 
 def test_last_jepa_target_uses_frozen_output_encoder():
@@ -213,19 +218,24 @@ def test_last_jepa_target_uses_frozen_output_encoder():
     assert all(not parameter.requires_grad for parameter in model.output_target_compressor.parameters())
 
 
-def test_load_legacy_state_without_ema_ce_norms():
+def test_load_legacy_state_without_ema_context_copies():
     model = IntertwinedHJEPA(make_config())
     legacy_state = {
         key: value
         for key, value in model.state_dict().items()
-        if not key.startswith("ema_ce_norms.")
+        if not key.startswith("ema_target_blocks.")
     }
     loaded = IntertwinedHJEPA(make_config())
 
     loaded.load_state_dict(legacy_state)
 
-    for block, ema_ce_norm in zip(loaded.blocks, loaded.ema_ce_norms):
-        assert torch.equal(block.ce_norm.weight, ema_ce_norm.weight)
+    for block, ema_block in zip(loaded.blocks, loaded.ema_target_blocks):
+        assert torch.equal(block.attn_norm.weight, ema_block.attn_norm.weight)
+        assert torch.equal(block.ce_norm.weight, ema_block.ce_norm.weight)
+        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_block.attn.parameters()):
+            assert torch.equal(student_parameter, ema_parameter)
+        for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_block.compressor.parameters()):
+            assert torch.equal(student_parameter, ema_parameter)
 
 
 def test_model_forward_returns_expected_shapes():

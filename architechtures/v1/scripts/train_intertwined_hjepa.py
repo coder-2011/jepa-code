@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import time
 from contextlib import nullcontext
@@ -206,6 +207,17 @@ def _safe_value(value: Any) -> Any:
     return value
 
 
+def append_metrics_event(path: Path, *, event: str, step: int, tokens_processed: int, metrics: dict[str, float]) -> None:
+    payload = {
+        "event": event,
+        "step": step,
+        "tokens_processed": tokens_processed,
+        "metrics": {key: float(value) for key, value in metrics.items()},
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def save_checkpoint(
     path: Path,
     *,
@@ -375,6 +387,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     run_dir = args.out_dir / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "metrics.jsonl"
     wandb_run = init_wandb(args, config)
 
     start_step = 0
@@ -482,6 +495,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"step={step_index} tokens={tokens_processed} "
                 + " ".join(f"{key}={value:.4f}" for key, value in sorted(metrics.items()))
             )
+            append_metrics_event(metrics_path, event="train", step=step_index, tokens_processed=tokens_processed, metrics=metrics)
             wandb_run.log(metrics, step=step_index)
             last_train_metrics = metrics.copy()
 
@@ -499,6 +513,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 f"eval step={step_index} "
                 + " ".join(f"{key}={value:.4f}" for key, value in sorted(eval_metrics.items()))
             )
+            append_metrics_event(metrics_path, event="eval", step=step_index, tokens_processed=tokens_processed, metrics=eval_metrics)
             wandb_run.log(eval_metrics, step=step_index)
             last_eval_metrics = eval_metrics.copy()
 
@@ -522,6 +537,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     total_wall_seconds = time.time() - train_start_time
     return {
         "run_dir": run_dir,
+        "metrics_path": metrics_path,
         "step": args.max_steps,
         "tokens_processed": tokens_processed,
         "jepa_dropout_steps": jepa_dropout_steps,

@@ -46,6 +46,7 @@ class SlicedEppsPulleySIGReg(nn.Module):
 
         x = z.float().reshape(-1, z.shape[-1])
         assert x.shape[0] > 0, "SIGReg input must contain at least one sample"
+        x = x * x.pow(2).mean(dim=-1, keepdim=True).add(1e-8).rsqrt()
 
         with torch.no_grad():
             slices = F.normalize(

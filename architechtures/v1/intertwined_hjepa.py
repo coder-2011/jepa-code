@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -5,7 +6,6 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import nn
-from torch.optim.swa_utils import AveragedModel
 
 from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
@@ -190,6 +190,19 @@ class IntertwinedBlock(nn.Module):
             nn.Linear(compressed_dim, residual_dim),
         )
 
+    def encode_context(self, x_l: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        squeeze_sequence = x_l.ndim == 2
+        if squeeze_sequence:
+            x_l = x_l.unsqueeze(1)
+
+        x_l_post_attn = x_l + self.attn(self.attn_norm(x_l))
+        z_l = self.compressor(self.ce_norm(x_l_post_attn))
+
+        if squeeze_sequence:
+            x_l_post_attn = x_l_post_attn.squeeze(1)
+            z_l = z_l.squeeze(1)
+        return x_l_post_attn, z_l
+
     def forward_student(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -206,21 +219,14 @@ class IntertwinedBlock(nn.Module):
         if squeeze_sequence:
             x_l = x_l.unsqueeze(1)
 
-        x_l_normed = self.attn_norm(x_l)
-        attn_out = self.attn(x_l_normed)
-        # h_l_post_attn is both the residual update output and the input to the compressor.
-        x_l_post_attn = x_l + attn_out
-        z_l = self.compressor(self.ce_norm(x_l_post_attn))
+        x_l_post_attn, z_l = self.encode_context(x_l)
         delta_l = self.predictor(z_l)
         # Inject the compressed prediction back into the D-wide residual stream.
         update_l = self.projector(z_l + delta_l)
         x_next = x_l_post_attn + update_l
 
-        # Restore the caller's rank if we entered through the single-token path.
         if squeeze_sequence:
             x_next = x_next.squeeze(1)
-            x_l_post_attn = x_l_post_attn.squeeze(1)
-            z_l = z_l.squeeze(1)
             delta_l = delta_l.squeeze(1)
 
         return {
@@ -270,16 +276,19 @@ def jepa_delta_loss(
     if delta_l.shape != z_l.shape or delta_l.shape != target_z_l.shape:
         raise ValueError("delta_l, z_l, and target_z_l must have exactly the same shape")
 
-    # The EMA target is stopped, while z_l stays live so JEPA trains the CE path.
+    normalized_z_l = rms_normalize_last_dim(z_l)
+    normalized_delta_l = rms_normalize_last_dim(delta_l)
+    normalized_target_delta_l = rms_normalize_last_dim(target_z_l.detach()) - normalized_z_l
+
     if valid_mask is None:
-        return F.mse_loss(delta_l, target_z_l.detach() - z_l)
+        return F.mse_loss(normalized_delta_l, normalized_target_delta_l)
 
     assert valid_mask.shape == delta_l.shape[:-1], "valid_mask must match the leading shape of delta_l"
     if not valid_mask.any():
         raise ValueError("valid_mask selects no JEPA loss positions")
 
     # valid_mask is over token positions (B, L); broadcast it across the compressed width K.
-    error = F.mse_loss(delta_l, target_z_l.detach() - z_l, reduction="none")
+    error = F.mse_loss(normalized_delta_l, normalized_target_delta_l, reduction="none")
     expanded_mask = valid_mask.unsqueeze(-1).expand_as(error)
     return error.masked_select(expanded_mask).mean()
 
@@ -310,6 +319,11 @@ def warmup_weight(weight: float, step: int | None, warmup_steps: int) -> float:
     if warmup_steps <= 0 or step is None:
         return weight
     return weight * min(1.0, (step + 1) / warmup_steps)
+
+
+def rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    scale = x.float().pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+    return x * scale.to(device=x.device, dtype=x.dtype)
 
 
 class IntertwinedHJEPA(nn.Module):
@@ -386,15 +400,10 @@ class IntertwinedHJEPA(nn.Module):
         self.output_target_norm.eval()
         self.output_target_compressor.requires_grad_(False)
         self.output_target_compressor.eval()
-        # Track EMA copies of the full CE path: norm + compressor.
-        self.ema_ce_norms = nn.ModuleList(RMSNorm(config.residual_dim) for _ in self.blocks)
-        self.ema_compressors = nn.ModuleList(AveragedModel(block.compressor, use_buffers=False) for block in self.blocks)
-        for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
-            ema_ce_norm.load_state_dict(block.ce_norm.state_dict())
-            ema_ce_norm.requires_grad_(False)
-            ema_ce_norm.eval()
-            ema_compressor.requires_grad_(False)
-            ema_compressor.eval()
+        self.ema_target_blocks = nn.ModuleList(copy.deepcopy(block) for block in self.blocks)
+        for ema_block in self.ema_target_blocks:
+            ema_block.requires_grad_(False)
+            ema_block.eval()
 
     def student_parameters(self):
         # EMA parameters are frozen, so this naturally returns only trainable student weights.
@@ -418,9 +427,7 @@ class IntertwinedHJEPA(nn.Module):
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
         if layer_index + 1 < len(self.blocks):
-            next_state = states[layer_index + 1]
-            ema_norm = self.ema_ce_norms[layer_index + 1]
-            target_z_l = self.ema_compressors[layer_index + 1].module(ema_norm(next_state))
+            target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index + 1])[1]
         else:
             target_z_l = self.output_target_compressor(self.output_target_norm(states[-1]))
         return target_z_l.detach()
@@ -493,7 +500,7 @@ class IntertwinedHJEPA(nn.Module):
                 )
             if self.config.beta_sigreg > 0:
                 for layer_index in range(len(self.blocks)):
-                    sigreg_input_l = compressed[layer_index]
+                    sigreg_input_l = rms_normalize_last_dim(compressed[layer_index])
                     if valid_mask is not None:
                         assert valid_mask.shape == sigreg_input_l.shape[:-1], (
                             "valid_mask must match the leading shape of SIGReg inputs"
@@ -571,17 +578,25 @@ class IntertwinedHJEPA(nn.Module):
     def update_ema(self, step: int | None = None) -> None:
         # Call after optimizer.step() so the EMA teacher lags the student CE path.
         momentum = self.ema_momentum_at_step(step)
-        for ema_ce_norm, ema_compressor, block in zip(self.ema_ce_norms, self.ema_compressors, self.blocks):
-            ema_ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - momentum)
-            for ema_parameter, student_parameter in zip(ema_compressor.module.parameters(), block.compressor.parameters()):
+        for ema_block, block in zip(self.ema_target_blocks, self.blocks):
+            ema_block.attn_norm.weight.lerp_(block.attn_norm.weight, 1.0 - momentum)
+            for ema_parameter, student_parameter in zip(ema_block.attn.parameters(), block.attn.parameters()):
+                ema_parameter.lerp_(student_parameter, 1.0 - momentum)
+            ema_block.ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - momentum)
+            for ema_parameter, student_parameter in zip(ema_block.compressor.parameters(), block.compressor.parameters()):
                 ema_parameter.lerp_(student_parameter, 1.0 - momentum)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        upgraded = state_dict.copy()
+        upgraded = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("ema_ce_norms.") and not key.startswith("ema_compressors.")
+        }
         for layer_index in range(len(self.blocks)):
-            ema_norm_key = f"ema_ce_norms.{layer_index}.weight"
-            student_norm_key = f"blocks.{layer_index}.ce_norm.weight"
-            if ema_norm_key not in upgraded and student_norm_key in upgraded:
-                upgraded[ema_norm_key] = upgraded[student_norm_key].detach().clone()
+            for parameter_name in self.blocks[layer_index].state_dict():
+                ema_key = f"ema_target_blocks.{layer_index}.{parameter_name}"
+                student_key = f"blocks.{layer_index}.{parameter_name}"
+                if ema_key not in upgraded and student_key in upgraded:
+                    upgraded[ema_key] = upgraded[student_key].detach().clone()
 
         return super().load_state_dict(upgraded, strict=strict, assign=assign)
