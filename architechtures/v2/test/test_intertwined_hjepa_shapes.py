@@ -255,10 +255,9 @@ def test_model_uses_explicit_small_initialization():
             ):
                 assert 0.0 < weight.std().item() < 0.1
     for block, ema_encoder in zip(model.blocks, model.ema_target_encoders):
-        assert torch.equal(block.attn_norm.weight, ema_encoder.attn_norm.weight)
+        assert not hasattr(ema_encoder, "attn")
+        assert not hasattr(ema_encoder, "attn_norm")
         assert torch.equal(block.ce_norm.weight, ema_encoder.ce_norm.weight)
-        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_encoder.attn.parameters()):
-            assert torch.equal(student_parameter, ema_parameter)
         for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_encoder.compressor.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
 
@@ -292,23 +291,20 @@ def test_rmsnorm_mixed_bf16_input_avoids_dtype_mismatch_warning():
     assert not any("Mismatch dtype between input and weight" in str(w.message) for w in caught)
 
 
-def test_jepa_target_uses_same_layer_ema_context_path_on_next_token():
+def test_jepa_target_uses_same_layer_ema_ce_path_on_cached_post_attention_state():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    current_state = outputs["states"][0]
+    current_post_attn = outputs["post_attn_states"][0]
 
     with torch.no_grad():
-        model.blocks[0].attn_norm.weight.fill_(2.0)
         model.blocks[0].ce_norm.weight.fill_(2.0)
-        model.blocks[1].attn_norm.weight.fill_(2.0)
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
-    target = model.compute_raw_jepa_target_for_layer(0, outputs["states"])
-    ema_target = model.ema_target_encoders[0](current_state)
-    live_post_attn = current_state + model.blocks[0].attn(model.blocks[0].attn_norm(current_state))
-    live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(live_post_attn))
-    next_block_target = model.ema_target_encoders[1](current_state)
+    target = model.compute_raw_jepa_target_for_layer(0, outputs["post_attn_states"])
+    ema_target = model.ema_target_encoders[0](current_post_attn)
+    live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(current_post_attn))
+    next_block_target = model.ema_target_encoders[1](current_post_attn)
 
     assert torch.allclose(target, ema_target)
     assert torch.equal(outputs["jepa_valid_mask"][:, -1], torch.zeros_like(outputs["jepa_valid_mask"][:, -1]))
@@ -320,10 +316,10 @@ def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
     model = IntertwinedHJEPA(make_config())
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
     outputs = model(input_ids=input_ids, labels=input_ids)
-    current_state = outputs["states"][len(model.blocks) - 1]
+    current_post_attn = outputs["post_attn_states"][len(model.blocks) - 1]
 
-    target = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
-    expected = model.ema_target_encoders[-1](current_state)
+    target = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["post_attn_states"])
+    expected = model.ema_target_encoders[-1](current_post_attn)
 
     assert torch.allclose(target, expected)
     assert not target.requires_grad

@@ -98,11 +98,11 @@ loss_lm = CE(logits, labels)
 
 ### JEPA Loss
 
-For each JEPA block `l`, the target is the EMA copy of that same block's encoder path,
-evaluated on the real sequence and shifted one token into the future:
+For each JEPA block `l`, the target is the EMA copy of that same block's CE path,
+evaluated on the cached post-attention state and shifted one token into the future:
 
 ```text
-target_z_l[:, t] = stopgrad(EMA_Enc_l(h_l)[:, t+1])
+target_z_l[:, t] = stopgrad(EMA_CE_l(h_l_post_attn)[:, t+1])
 ```
 
 The JEPA loss is:
@@ -125,16 +125,14 @@ It is not applied to `delta_l`, `z_l + delta_l`, the projected update, or the re
 
 ## EMA
 
-EMA tracks the teacher encoder path for each JEPA block:
+EMA tracks the teacher CE path for each JEPA block:
 
 ```text
-ema_attn_norm_l
-ema_attn_l
 ema_ce_norm_l
 ema_compressor_l
 ```
 
-EMA does not track predictor, projector, embeddings, LM head, or the final block.
+EMA does not track attention, predictor, projector, embeddings, LM head, or the final block.
 
 Call order during training:
 

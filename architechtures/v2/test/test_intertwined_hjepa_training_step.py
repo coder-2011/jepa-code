@@ -6,7 +6,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, next_token_loss, rms_normalize_last_dim
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, next_token_loss, rms_normalize_last_dim, split_scalars
 from sigreg import SIGReg
 
 YAML_CONFIG = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
@@ -170,6 +170,54 @@ def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
     assert torch.isfinite(z.grad).all()
 
 
+def test_stacked_auxiliary_losses_match_individual_layer_losses():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.05,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+        )
+    )
+    model.eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0]], dtype=torch.long)
+    valid_mask = torch.tensor([[True, True, True, True, True, True], [True, True, True, False, False, False]])
+
+    torch.manual_seed(999)
+    outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
+
+    individual_jepa_losses = [
+        jepa_delta_loss(
+            outputs["deltas"][index][:, :-1],
+            outputs["z"][index][:, :-1],
+            outputs["targets"][index][:, 1:],
+            valid_mask=outputs["jepa_valid_mask"][:, :-1],
+        )
+        for index in range(len(model.blocks))
+    ]
+
+    sigreg_input = rms_normalize_last_dim(torch.stack(outputs["z"]))
+    torch.manual_seed(999)
+    individual_sigreg_losses = [
+        model.sigreg(sigreg_input[index], sample_mask=valid_mask)
+        for index in range(len(model.blocks))
+    ]
+
+    assert torch.allclose(torch.stack(outputs["loss_jepa_layers"]), torch.stack(individual_jepa_losses))
+    assert torch.allclose(torch.stack(outputs["loss_sigreg_layers"]), torch.stack(individual_sigreg_losses))
+
+
 def test_total_loss_includes_local_sigreg_when_enabled():
     model = IntertwinedHJEPA(
         replace(
@@ -330,3 +378,14 @@ def test_scheduled_ema_update_uses_step():
 
     expected = ema_before.lerp(block.ce_norm.weight, 0.9)
     assert torch.allclose(ema_norm.weight, expected)
+
+
+def test_split_scalars_materializes_zero_dim_tensors():
+    values = torch.tensor([1.0, 2.0, 3.0])
+
+    pieces = split_scalars(values)
+
+    assert len(pieces) == 3
+    assert all(piece.shape == torch.Size([]) for piece in pieces)
+    values[0] = 9.0
+    assert pieces[0].item() == pytest.approx(1.0)

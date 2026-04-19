@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, main
+from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, evaluate_bpb, main
 
 
 class _FakeSentencePiece:
@@ -104,3 +104,43 @@ def test_build_sentencepiece_luts_matches_parameter_golf_semantics():
     # Byte fallback pieces count as one byte.
     assert base_bytes[5].item() == 1
     assert is_boundary[5].item() is False
+
+
+class _PerfectNextTokenModel:
+    class _Config:
+        vocab_size = 8
+
+    def __init__(self) -> None:
+        self.config = self._Config()
+        self.training = True
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def train(self):
+        self.training = True
+        return self
+
+    def __call__(self, *, input_ids, labels, **_kwargs):
+        logits = torch.full((*labels.shape, self.config.vocab_size), -100.0, device=labels.device)
+        logits.scatter_(2, labels.unsqueeze(-1), 100.0)
+        return {"logits": logits}
+
+
+def test_evaluate_bpb_uses_loader_shifted_labels_directly():
+    model = _PerfectNextTokenModel()
+    tokenizer = _FakeSentencePiece()
+    input_ids = torch.tensor([[3, 4, 3]], dtype=torch.long)
+    labels = torch.tensor([[4, 3, 5]], dtype=torch.long)
+
+    bpb = evaluate_bpb(
+        model,
+        tokenizer=tokenizer,
+        eval_loader=[(input_ids, labels)],
+        device=torch.device("cpu"),
+        step=0,
+    )
+
+    assert bpb == 0.0
+    assert model.training is True

@@ -4,7 +4,6 @@ import argparse
 import json
 import random
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -114,25 +113,6 @@ def detect_compute_dtype(device: torch.device, requested: str) -> torch.dtype:
     if requested != "auto":
         return getattr(torch, requested)
     return torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
-
-
-def build_autocast_context(device: torch.device, compute_dtype: torch.dtype):
-    enabled = device.type == "cuda" and compute_dtype in {torch.float16, torch.bfloat16}
-    if not enabled:
-        return nullcontext()
-    return torch.amp.autocast(device_type=device.type, dtype=compute_dtype)
-
-
-def optimizer_step(optimizer: torch.optim.Optimizer, scaler: torch.amp.GradScaler | None) -> None:
-    if scaler is None:
-        optimizer.step()
-        return
-    scaler.step(optimizer)
-    scaler.update()
-
-
-def should_drop_jepa_loss(jepa_dropout_rate: float) -> bool:
-    return jepa_dropout_rate > 0.0 and random.random() < jepa_dropout_rate
 
 
 def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> None:
@@ -304,7 +284,15 @@ def evaluate(
         input_ids, labels = move_batch_to_device(batch, device=device, non_blocking=non_blocking)
         lambda_jepa_scale = warmup_weight(model.config.lambda_jepa, step, model.config.jepa_warmup_steps)
         beta_sigreg_scale = warmup_weight(model.config.beta_sigreg, step, model.config.sigreg_warmup_steps)
-        with build_autocast_context(device, compute_dtype):
+        if device.type == "cuda" and compute_dtype in {torch.float16, torch.bfloat16}:
+            with torch.amp.autocast(device_type=device.type, dtype=compute_dtype):
+                outputs = model(
+                    input_ids=input_ids,
+                    labels=labels,
+                    lambda_jepa_scale=torch.tensor(lambda_jepa_scale, device=device),
+                    beta_sigreg_scale=torch.tensor(beta_sigreg_scale, device=device),
+                )
+        else:
             outputs = model(
                 input_ids=input_ids,
                 labels=labels,
@@ -415,11 +403,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         synchronize()
         t0 = time.time()
 
-        drop_jepa_loss = should_drop_jepa_loss(config.jepa_dropout_rate)
+        drop_jepa_loss = config.jepa_dropout_rate > 0.0 and random.random() < config.jepa_dropout_rate
         jepa_dropout_steps += int(drop_jepa_loss)
         lambda_jepa_scale = 0.0 if drop_jepa_loss else warmup_weight(config.lambda_jepa, step_index, config.jepa_warmup_steps)
         beta_sigreg_scale = 0.0 if drop_jepa_loss else warmup_weight(config.beta_sigreg, step_index, config.sigreg_warmup_steps)
-        with build_autocast_context(device, compute_dtype):
+        if device.type == "cuda" and compute_dtype in {torch.float16, torch.bfloat16}:
+            with torch.amp.autocast(device_type=device.type, dtype=compute_dtype):
+                outputs = train_model(
+                    input_ids=input_ids,
+                    labels=labels,
+                    compute_aux_losses=not drop_jepa_loss,
+                    lambda_jepa_scale=torch.tensor(lambda_jepa_scale, device=device),
+                    beta_sigreg_scale=torch.tensor(beta_sigreg_scale, device=device),
+                )
+        else:
             outputs = train_model(
                 input_ids=input_ids,
                 labels=labels,
@@ -449,7 +446,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.student_parameters(), args.grad_clip)
 
-        optimizer_step(optimizer, scaler)
+        if scaler is None:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+            scaler.update()
         model.update_ema(step_index)
         model.zero_grad(set_to_none=True)
 

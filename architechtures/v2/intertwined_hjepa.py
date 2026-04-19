@@ -208,20 +208,14 @@ class JEPAEncoder(nn.Module):
         self,
         residual_dim: int,
         compressed_dim: int,
-        num_heads: int = 1,
         dropout: float = 0.0,
-        residual_branch_scale: float = 1.0,
     ):
         super().__init__()
-        self.residual_branch_scale = float(residual_branch_scale)
-        self.attn_norm = RMSNorm(residual_dim)
-        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         self.ce_norm = RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
 
-    def forward(self, x_l: torch.Tensor) -> torch.Tensor:
-        assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
-        x_l_post_attn = x_l + self.residual_branch_scale * self.attn(self.attn_norm(x_l))
+    def forward(self, x_l_post_attn: torch.Tensor) -> torch.Tensor:
+        assert x_l_post_attn.ndim == 3, "x_l_post_attn must have shape (B, L, D)"
         return self.compressor(self.ce_norm(x_l_post_attn))
 
 
@@ -315,6 +309,12 @@ def rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return x * scale.to(device=x.device, dtype=x.dtype)
 
 
+def split_scalars(x: torch.Tensor) -> list[torch.Tensor]:
+    assert x.ndim == 1, "split_scalars expects a 1D tensor"
+    # `unbind()` returns scalar views, which can trip torch.compile alias handling.
+    return [x[index].clone() for index in range(x.shape[0])]
+
+
 class IntertwinedHJEPA(nn.Module):
     """
     For depth=N, the model has N-1 JEPA blocks and one normal final residual block.
@@ -324,7 +324,7 @@ class IntertwinedHJEPA(nn.Module):
     d_l = Pred_l(z_l)
     h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
 
-    target_z_l[:, t] = sg(EMA_Enc_l(h_l)[:, t+1]) for every JEPA block
+    target_z_l[:, t] = sg(EMA_CE_l(h_l_post_attn)[:, t+1]) for every JEPA block
     L_jepa_l = MSE(d_l, target_z_l - z_l)
     """
 
@@ -393,9 +393,7 @@ class IntertwinedHJEPA(nn.Module):
                 JEPAEncoder(
                     residual_dim=config.residual_dim,
                     compressed_dim=config.compressed_dim,
-                    num_heads=config.num_heads,
                     dropout=config.dropout,
-                    residual_branch_scale=residual_branch_scale,
                 )
                 for _ in range(jepa_depth)
             ]
@@ -403,9 +401,6 @@ class IntertwinedHJEPA(nn.Module):
         for student_block, ema_encoder in zip(self.blocks, self.ema_target_encoders):
             ema_encoder.load_state_dict(
                 {
-                    "attn_norm.weight": student_block.attn_norm.weight.detach().clone(),
-                    "attn.c_attn.weight": student_block.attn.c_attn.weight.detach().clone(),
-                    "attn.c_proj.weight": student_block.attn.c_proj.weight.detach().clone(),
                     "ce_norm.weight": student_block.ce_norm.weight.detach().clone(),
                     "compressor.net.0.weight": student_block.compressor.net[0].weight.detach().clone(),
                     "compressor.net.0.bias": student_block.compressor.net[0].bias.detach().clone(),
@@ -434,10 +429,10 @@ class IntertwinedHJEPA(nn.Module):
     def compute_raw_jepa_target_for_layer(
         self,
         layer_index: int,
-        states: list[torch.Tensor],
+        post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
-        target_z_l = self.ema_target_encoders[layer_index](states[layer_index])
+        target_z_l = self.ema_target_encoders[layer_index](post_attn_states[layer_index])
         return target_z_l.detach()
 
     def forward(
@@ -497,30 +492,38 @@ class IntertwinedHJEPA(nn.Module):
 
         if compute_aux_losses:
             assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid future-token position"
-            aligned_jepa_valid_mask = jepa_valid_mask[:, :-1]
-            targets = []
-            jepa_losses = []
-            sigreg_losses = []
-            for layer_index in range(len(self.blocks)):
-                raw_target_z_l = self.compute_raw_jepa_target_for_layer(layer_index, states)
-                targets.append(raw_target_z_l)
-                jepa_losses.append(
-                    jepa_delta_loss(
-                        deltas[layer_index][:, :-1],
-                        compressed[layer_index][:, :-1],
-                        raw_target_z_l[:, 1:],
-                        valid_mask=aligned_jepa_valid_mask,
-                    )
-                )
+            z_stack = torch.stack(compressed)
+            delta_stack = torch.stack(deltas)
+            target_stack = torch.stack(
+                [
+                    self.compute_raw_jepa_target_for_layer(layer_index, post_attn_states)
+                    for layer_index in range(len(self.blocks))
+                ]
+            )
+            targets = list(target_stack.unbind(dim=0))
+
+            aligned_jepa_valid_mask = jepa_valid_mask[:, :-1].unsqueeze(0).expand(len(self.blocks), -1, -1)
+            normalized_z = rms_normalize_last_dim(z_stack[:, :, :-1])
+            normalized_delta = rms_normalize_last_dim(delta_stack[:, :, :-1])
+            normalized_target_delta = rms_normalize_last_dim(target_stack[:, :, 1:].detach()) - normalized_z
+            jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
+            mask = aligned_jepa_valid_mask.unsqueeze(-1)
+            jepa_loss_by_layer = (jepa_error * mask).sum(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3)).mul(jepa_error.shape[-1])
+            jepa_losses = split_scalars(jepa_loss_by_layer)
+
             if self.config.beta_sigreg > 0:
-                for layer_index in range(len(self.blocks)):
-                    sigreg_input_l = rms_normalize_last_dim(compressed[layer_index])
-                    if sequence_valid_mask is not None:
-                        assert sequence_valid_mask.shape == sigreg_input_l.shape[:-1], (
-                            "valid_mask must match the leading shape of SIGReg inputs"
-                        )
-                        sigreg_input_l = sigreg_input_l[sequence_valid_mask]
-                    sigreg_losses.append(self.sigreg(sigreg_input_l))
+                sigreg_input = rms_normalize_last_dim(z_stack)
+                if sequence_valid_mask is None:
+                    sigreg_loss_by_layer = self.sigreg(sigreg_input, per_layer=True)
+                else:
+                    assert sequence_valid_mask.shape == sigreg_input.shape[1:-1], (
+                        "valid_mask must match batch and sequence dimensions of SIGReg inputs"
+                    )
+                    sigreg_mask = sequence_valid_mask.unsqueeze(0).expand(len(self.blocks), -1, -1)
+                    sigreg_loss_by_layer = self.sigreg(sigreg_input, sample_mask=sigreg_mask, per_layer=True)
+                sigreg_losses = split_scalars(sigreg_loss_by_layer)
+            else:
+                sigreg_losses = []
         else:
             zero_loss = logits.new_zeros(())
             # Keep output structure stable on dropout steps without running the teacher path.
@@ -598,6 +601,6 @@ class IntertwinedHJEPA(nn.Module):
         ema_parameters = []
         student_parameters = []
         for ema_encoder, block in zip(self.ema_target_encoders, self.blocks):
-            ema_parameters.extend((ema_encoder.attn_norm.weight, *ema_encoder.attn.parameters(), ema_encoder.ce_norm.weight, *ema_encoder.compressor.parameters()))
-            student_parameters.extend((block.attn_norm.weight, *block.attn.parameters(), block.ce_norm.weight, *block.compressor.parameters()))
+            ema_parameters.extend((ema_encoder.ce_norm.weight, *ema_encoder.compressor.parameters()))
+            student_parameters.extend((block.ce_norm.weight, *block.compressor.parameters()))
         ema_update(tuple(ema_parameters), tuple(student_parameters), momentum)

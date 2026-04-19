@@ -48,16 +48,16 @@ The LM head may tie weights with the token embedding.
 
 Every JEPA block has a target.
 
-For every JEPA block, the target is the same-depth EMA encoder at the next token position:
+For every JEPA block, the target is the same-depth EMA CE path at the next token position:
 
 ```text
-target_z_l[:, t] = stopgrad(EMA_Enc_l(h_l)[:, t+1])
+target_z_l[:, t] = stopgrad(EMA_CE_l(h_l_post_attn)[:, t+1])
 ```
 
-`EMA_Enc_l` is the EMA copy of the current block's encoder path:
+`EMA_CE_l` is the EMA copy of the current block's CE path:
 
 ```text
-ema_attn_norm + ema_attn + ema_ce_norm + ema_compressor
+ema_ce_norm + ema_compressor
 ```
 
 ## Losses
@@ -122,11 +122,9 @@ Because SIGReg uses the cached `z_l`, gradients flow through the full encoder pa
 
 ## EMA Contract
 
-EMA tracks the teacher encoder path:
+EMA tracks the teacher CE path:
 
 ```text
-ema_attn_norm_l
-ema_attn_l
 ema_ce_norm_l
 ema_compressor_l
 ```
@@ -134,6 +132,7 @@ ema_compressor_l
 EMA excludes:
 
 ```text
+attention
 predictor
 projector
 embeddings
