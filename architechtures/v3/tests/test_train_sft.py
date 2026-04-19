@@ -99,25 +99,20 @@ class TinyCausalLM(torch.nn.Module):
 
 
 class TrainSFTTests(unittest.TestCase):
-    def test_split_chat_messages_preserves_system_prompt(self) -> None:
+    def test_first_text_field_supports_transformed_hf_aliases(self) -> None:
         row = {
-            "messages": [
-                {"role": "system", "content": "You are concise."},
-                {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": "Hello"},
-            ]
+            "question": "What is 1 + 1?",
+            "qwen3_solution": "#### 2",
         }
 
-        prompt_messages, assistant_text = train_sft.split_chat_messages(row)
-
-        self.assertEqual(
-            prompt_messages,
-            [
-                {"role": "system", "content": "You are concise."},
-                {"role": "user", "content": "Hi"},
-            ],
+        tokenized = train_sft.tokenize_supervised_example(
+            tokenizer=DummyTokenizer(),
+            row=row,
+            max_length=128,
+            output_mode="solution_only",
         )
-        self.assertEqual(assistant_text, "Hello")
+
+        self.assertIsNotNone(tokenized)
 
     def test_build_assistant_target_respects_reasoning_mode(self) -> None:
         rows = load_fixture_rows()
@@ -129,7 +124,7 @@ class TrainSFTTests(unittest.TestCase):
         self.assertNotIn("<thought>", without_reasoning)
         self.assertEqual(without_reasoning, "Hello, nice to meet you.")
 
-    def test_tokenize_supervised_example_masks_prompt_tokens(self) -> None:
+    def test_tokenize_supervised_example_marks_completion_tokens(self) -> None:
         tokenizer = DummyTokenizer()
         row = load_fixture_rows()[0]
 
@@ -141,9 +136,10 @@ class TrainSFTTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(tokenized)
-        labels = tokenized["labels"]
-        self.assertEqual(labels[0], train_sft.IGNORE_INDEX)
-        self.assertTrue(any(label != train_sft.IGNORE_INDEX for label in labels))
+        completion_mask = tokenized["completion_mask"]
+        self.assertEqual(completion_mask[0], 0)
+        self.assertTrue(any(completion_mask))
+        self.assertEqual(len(tokenized["input_ids"]), len(completion_mask))
 
     def test_tokenize_supervised_example_drops_truncated_examples(self) -> None:
         tokenizer = DummyTokenizer()
@@ -162,6 +158,24 @@ class TrainSFTTests(unittest.TestCase):
 
         self.assertIsNone(tokenized)
 
+    def test_tokenize_supervised_example_requires_dataset_contract(self) -> None:
+        tokenizer = DummyTokenizer()
+        row = {
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+            ]
+        }
+
+        tokenized = train_sft.tokenize_supervised_example(
+            tokenizer=tokenizer,
+            row=row,
+            max_length=128,
+            output_mode="solution_only",
+        )
+
+        self.assertIsNone(tokenized)
+
     def test_dataset_filters_reasoning_and_category(self) -> None:
         tokenizer = DummyTokenizer()
         rows = load_fixture_rows()
@@ -175,6 +189,26 @@ class TrainSFTTests(unittest.TestCase):
         )
 
         self.assertEqual(len(dataset), 1)
+
+    def test_collator_masks_prompt_and_padding_labels(self) -> None:
+        tokenizer = DummyTokenizer()
+        rows = load_fixture_rows()
+        dataset = train_sft.NemotronSFTDataset(
+            tokenizer=tokenizer,
+            rows=rows,
+            max_length=128,
+            output_mode="solution_only",
+        )
+
+        batch = train_sft.SFTCollator(pad_token_id=tokenizer.pad_token_id)(
+            [dataset[0], dataset[1]]
+        )
+
+        self.assertEqual(batch["labels"][0, 0].item(), train_sft.IGNORE_INDEX)
+        self.assertTrue(torch.any(batch["labels"] != train_sft.IGNORE_INDEX))
+        self.assertTrue(
+            torch.all(batch["labels"][batch["attention_mask"] == 0] == train_sft.IGNORE_INDEX)
+        )
 
     def test_extract_gsm8k_answer_supports_marker_and_fallback(self) -> None:
         self.assertEqual(train_sft.extract_gsm8k_answer("work\n#### 12"), "12")

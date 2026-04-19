@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+"""Minimal SFT baseline for Nemotron-style JSONL data.
+
+This file is intentionally a small, explicit training loop rather than a
+general trainer abstraction. It is the baseline that future JEPA-SFT variants
+should be compared against: raw supervised examples become chat-formatted
+causal-LM sequences, prompt tokens are masked out of the loss, and validation
+can optionally use exact-answer GSM8K generation accuracy.
+"""
+
 import argparse
 import importlib.util
 import json
@@ -17,6 +26,9 @@ from torch.utils.data import DataLoader, Dataset
 
 IGNORE_INDEX = -100
 GSM_ANSWER_PREFIX = "#### "
+PROMPT_FIELDS = ("problem", "prompt", "question")
+SOLUTION_FIELDS = ("qwen3-solution", "qwen3_solution", "solution")
+REASONING_FIELDS = ("qwen3-reasoning", "qwen3_reasoning", "reasoning_trace")
 
 
 def default_device() -> str:
@@ -83,69 +95,31 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def normalize_reasoning_flag(value: Any) -> str:
-    if isinstance(value, bool):
-        return "on" if value else "off"
-    text = str(value).strip().lower()
-    if text in {"on", "true", "yes", "1"}:
-        return "on"
-    if text in {"off", "false", "no", "0", ""}:
-        return "off"
-    return text
+def first_text_field(row: dict[str, Any], field_names: tuple[str, ...]) -> str:
+    """Return the first non-empty text value from accepted field aliases."""
+    for field_name in field_names:
+        text = row.get(field_name, "").strip()
+        if text:
+            return text
+    return ""
 
 
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def split_chat_messages(row: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
-    messages = row.get("messages")
-    if not isinstance(messages, list):
-        return [], ""
-
-    normalized_messages: list[dict[str, str]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = normalize_text(message.get("role")).lower()
-        content = message.get("content")
-        text = normalize_text(content) if isinstance(content, str) else ""
-        if not role or not text:
-            continue
-        normalized_messages.append({"role": role, "content": text})
-
-    assistant_index = None
-    for index in range(len(normalized_messages) - 1, -1, -1):
-        if normalized_messages[index]["role"] == "assistant":
-            assistant_index = index
-            break
-
-    if assistant_index is None:
-        return [], ""
-
-    return normalized_messages[:assistant_index], normalized_messages[assistant_index]["content"]
-
-
-def extract_chat_supervised_pair(row: dict[str, Any]) -> tuple[str, str]:
-    prompt_messages, assistant_text = split_chat_messages(row)
-    user_text = ""
-    for message in prompt_messages:
-        if message["role"] == "user":
-            user_text = message["content"]
-            break
-    return user_text, assistant_text
+def build_prompt_messages(problem: str) -> list[dict[str, str]]:
+    """Wrap the dataset prompt in the single-turn chat contract used for SFT."""
+    return [{"role": "user", "content": problem}]
 
 
 def build_assistant_target(row: dict[str, Any], output_mode: str) -> str:
-    solution = normalize_text(row.get("qwen3-solution"))
-    reasoning = normalize_text(row.get("qwen3-reasoning"))
-    reasoning_flag = normalize_reasoning_flag(row.get("reasoning", "on"))
+    """Build the supervised assistant text for one raw row.
 
-    if not solution and "messages" in row:
-        _, assistant_text = extract_chat_supervised_pair(row)
-        return assistant_text
+    Canonical rows use `qwen3-solution` and optionally wrap `qwen3-reasoning`
+    in a visible thought block. A few alias names are accepted so rows loaded
+    from Hugging Face and transformed into the same contract do not need exact
+    hyphenated column names.
+    """
+    solution = first_text_field(row, SOLUTION_FIELDS)
+    reasoning = first_text_field(row, REASONING_FIELDS)
+    reasoning_flag = row.get("reasoning", "on").strip().lower()
 
     if output_mode == "solution_only" or not reasoning or reasoning_flag == "off":
         return solution
@@ -156,16 +130,23 @@ def build_assistant_target(row: dict[str, Any], output_mode: str) -> str:
 def should_keep_row(
     row: dict[str, Any], reasoning_filter: str, categories: set[str] | None
 ) -> bool:
-    if categories is not None and normalize_text(row.get("category")) not in categories:
+    if categories is not None and row.get("category", "").strip() not in categories:
         return False
     if reasoning_filter == "any":
         return True
-    return normalize_reasoning_flag(row.get("reasoning", "on")) == reasoning_filter
+    return row.get("reasoning", "on").strip().lower() == reasoning_filter
 
 
 def apply_chat_template_or_fallback(
     tokenizer: Any, messages: list[dict[str, str]], add_generation_prompt: bool
 ) -> list[int]:
+    """Tokenize chat messages with the model template when possible.
+
+    HF tokenizers differ in what `apply_chat_template(..., tokenize=True)`
+    returns: plain lists, tensors, batched lists, or dict-like outputs. This
+    function normalizes those cases and falls back to a simple readable chat
+    serialization if the model template is unavailable or incompatible.
+    """
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             output = tokenizer.apply_chat_template(
@@ -192,6 +173,7 @@ def apply_chat_template_or_fallback(
 def render_plain_supervised_messages(
     tokenizer: Any, prompt_messages: list[dict[str, str]], assistant_text: str
 ) -> tuple[list[int], list[int]]:
+    """Render a stable fallback prompt/full pair without a chat template."""
     prompt_lines = [f"{message['role'].capitalize()}: {message['content']}" for message in prompt_messages]
     prompt_lines.append("Assistant:")
     prompt_text = "\n".join(prompt_lines)
@@ -206,6 +188,13 @@ def render_plain_supervised_messages(
 def render_supervised_messages(
     tokenizer: Any, prompt_messages: list[dict[str, str]], assistant_text: str
 ) -> tuple[list[int], list[int]]:
+    """Return tokenized prompt and full supervised sequence.
+
+    The training loss depends on `prompt_ids` being an exact prefix of
+    `full_ids`; otherwise prompt masking would hide the wrong tokens. Some chat
+    templates render generation prompts differently from assistant messages, so
+    the plain fallback is used when prefix alignment fails.
+    """
     prompt_ids = apply_chat_template_or_fallback(tokenizer, prompt_messages, True)
     full_ids = apply_chat_template_or_fallback(
         tokenizer,
@@ -222,32 +211,31 @@ def render_supervised_messages(
 def tokenize_supervised_example(
     tokenizer: Any, row: dict[str, Any], max_length: int, output_mode: str
 ) -> dict[str, list[int]] | None:
-    prompt_messages = None
-    problem = normalize_text(row.get("problem"))
-    if not problem and "messages" in row:
-        prompt_messages, _ = split_chat_messages(row)
-        problem, _ = extract_chat_supervised_pair(row)
+    """Convert a raw row into token ids plus a completion supervision mask.
 
+    Overlength examples are dropped instead of truncated. Truncating the target
+    would silently train on partial answers; truncating the prompt could change
+    the task itself.
+    """
+    problem = first_text_field(row, PROMPT_FIELDS)
     assistant_text = build_assistant_target(row, output_mode)
     if not problem or not assistant_text:
         return None
 
-    if prompt_messages is None:
-        prompt_messages = [{"role": "user", "content": problem}]
-
+    prompt_messages = build_prompt_messages(problem)
     prompt_ids, full_ids = render_supervised_messages(tokenizer, prompt_messages, assistant_text)
     if len(prompt_ids) >= max_length:
         return None
     if len(full_ids) > max_length:
         return None
 
-    labels = full_ids.copy()
-    for idx in range(len(prompt_ids)):
-        labels[idx] = IGNORE_INDEX
-    return {"input_ids": full_ids, "labels": labels}
+    completion_mask = [0] * len(prompt_ids) + [1] * (len(full_ids) - len(prompt_ids))
+    return {"input_ids": full_ids, "completion_mask": completion_mask}
 
 
 class NemotronSFTDataset(Dataset):
+    """Eagerly tokenized supervised dataset with filtering diagnostics."""
+
     def __init__(
         self,
         tokenizer: Any,
@@ -279,25 +267,33 @@ class NemotronSFTDataset(Dataset):
 
 @dataclass
 class SFTCollator:
+    """Right-pad examples and derive labels from completion masks."""
+
     pad_token_id: int
 
     def __call__(self, examples: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
         max_len = max(len(example["input_ids"]) for example in examples)
         input_ids: list[list[int]] = []
         attention_mask: list[list[int]] = []
-        labels: list[list[int]] = []
+        completion_mask: list[list[int]] = []
         for example in examples:
             pad = max_len - len(example["input_ids"])
             input_ids.append(
                 example["input_ids"] + [self.pad_token_id] * pad
             )
             attention_mask.append([1] * len(example["input_ids"]) + [0] * pad)
-            labels.append(example["labels"] + [IGNORE_INDEX] * pad)
+            completion_mask.append(example["completion_mask"] + [0] * pad)
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask_tensor = torch.tensor(attention_mask, dtype=torch.long)
+        completion_mask_tensor = torch.tensor(completion_mask, dtype=torch.bool)
+        labels = input_ids_tensor.clone()
+        labels[~completion_mask_tensor] = IGNORE_INDEX
 
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "input_ids": input_ids_tensor,
+            "attention_mask": attention_mask_tensor,
+            "labels": labels,
         }
 
 
@@ -312,6 +308,7 @@ def read_jsonl(path: str | Path, max_rows: int | None = None) -> list[dict[str, 
 
 
 def resolve_pad_token_id(tokenizer: Any) -> int:
+    """Ensure decoder-only models have a usable pad id for batching."""
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or "<|pad|>"
     return int(tokenizer.pad_token_id)
@@ -336,9 +333,13 @@ def resolve_attn_implementation(device: str, requested: str) -> str:
 
 
 def build_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any, torch.dtype]:
+    """Load a causal LM and tokenizer with local-environment guardrails."""
     original_find_spec = importlib.util.find_spec
 
     def patched_find_spec(name: str, package: str | None = None):
+        # In this environment, `transformers` can discover an incompatible
+        # system `torchvision`. Hiding it keeps text-only causal LM loading on
+        # the path we actually need.
         if name == "torchvision" or name.startswith("torchvision."):
             return None
         return original_find_spec(name, package)
@@ -366,6 +367,8 @@ def build_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any, torch
                 args.model_name, **load_kwargs
             ), load_kwargs
         except TypeError as exc:
+            # Transformers versions straddle the `dtype` -> `torch_dtype`
+            # transition. Accept both without forcing a dependency pin.
             if "dtype" in str(exc) and "unexpected keyword argument" in str(exc):
                 fallback_kwargs = dict(load_kwargs)
                 fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
@@ -399,6 +402,7 @@ def lr_multiplier(step: int, warmup_steps: int) -> float:
 
 
 def should_step_optimizer(batch_index: int, num_batches: int, grad_accum_steps: int) -> bool:
+    """Decide whether accumulated gradients should be flushed this batch."""
     if grad_accum_steps <= 1:
         return True
     is_accum_boundary = (batch_index + 1) % grad_accum_steps == 0
@@ -420,6 +424,12 @@ def run_train_step(
     grad_accum_steps: int,
     max_grad_norm: float,
 ) -> float:
+    """Single optimizer step helper used by smoke tests.
+
+    The production `main()` loop keeps accumulation inline so it can delay the
+    optimizer step across microbatches; this helper exists for isolated
+    correctness checks of the basic loss/backward/clip/step path.
+    """
     with autocast_cm:
         outputs = model(**batch)
         loss = outputs.loss / grad_accum_steps
@@ -443,6 +453,7 @@ def run_train_step(
 
 
 def extract_gsm8k_answer(text: str) -> str | None:
+    """Extract the canonical GSM8K numeric answer string when possible."""
     marker = text.rfind(GSM_ANSWER_PREFIX)
     if marker >= 0:
         candidate = text[marker + len(GSM_ANSWER_PREFIX) :].strip().splitlines()[0]
@@ -460,6 +471,7 @@ def extract_gsm8k_answer(text: str) -> str | None:
 def prepare_gsm8k_rows(
     split: str, subset: str, max_samples: int, seed: int
 ) -> list[dict[str, str]]:
+    """Load a small shuffled GSM8K slice for generation-time validation."""
     if max_samples == 0:
         return []
     from datasets import load_dataset
@@ -473,6 +485,7 @@ def prepare_gsm8k_rows(
 def generate_completion(
     model: Any, tokenizer: Any, prompt: str, device: str, max_new_tokens: int
 ) -> str:
+    """Greedy completion used for deterministic validation."""
     prompt_ids = apply_chat_template_or_fallback(
         tokenizer, [{"role": "user", "content": prompt}], True
     )
@@ -498,6 +511,7 @@ def evaluate_gsm8k(
     device: str,
     max_new_tokens: int,
 ) -> float:
+    """Return exact numeric-answer accuracy on prepared GSM8K rows."""
     if not rows:
         return 0.0
     model.eval()
@@ -527,6 +541,7 @@ def save_checkpoint(
     args: argparse.Namespace,
     best_gsm8k_acc: float,
 ) -> Path:
+    """Save model/tokenizer plus trainer metadata without aborting on state errors."""
     checkpoint_dir = Path(output_dir) / f"step-{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -546,6 +561,8 @@ def save_checkpoint(
         "args": vars(args),
     }
     if args.save_optimizer_state:
+        # Optimizer states can be much larger than the model checkpoint during
+        # short experiments; keep them opt-in and tolerate save failures below.
         state["optimizer"] = optimizer.state_dict()
 
     tmp_path = checkpoint_dir / "trainer_state.pt.tmp"
@@ -586,6 +603,8 @@ def save_checkpoint(
             json.dump(fallback, handle, indent=2)
 
     latest_dir = Path(output_dir) / "latest"
+    # Use a relative symlink so moved output directories remain internally
+    # consistent.
     if latest_dir.exists() and latest_dir.is_symlink():
         latest_dir.unlink()
     elif latest_dir.exists():
@@ -597,6 +616,7 @@ def save_checkpoint(
 def build_dataloader(
     args: argparse.Namespace, tokenizer: Any
 ) -> tuple[DataLoader, NemotronSFTDataset]:
+    """Build the filtered/tokenized training dataloader."""
     rows = read_jsonl(args.train_file, args.max_train_samples)
     categories = set(args.categories) if args.categories else None
     dataset = NemotronSFTDataset(
@@ -619,6 +639,7 @@ def build_dataloader(
 
 
 def main() -> None:
+    """CLI entry point for baseline SFT."""
     args = parse_args()
     set_seed(args.seed)
 
@@ -669,6 +690,8 @@ def main() -> None:
 
             with autocast_cm:
                 outputs = model(**batch)
+                # Divide each microbatch loss so the accumulated gradient scale
+                # matches a larger effective batch on full accumulation windows.
                 loss = outputs.loss / args.grad_accum_steps
 
             if scaler is not None:
@@ -682,6 +705,8 @@ def main() -> None:
             if not should_step_optimizer(
                 batch_index, num_batches, args.grad_accum_steps
             ):
+                # Keep accumulating gradients until either the configured
+                # boundary or the final partial window of the epoch.
                 continue
 
             if args.max_grad_norm > 0:
