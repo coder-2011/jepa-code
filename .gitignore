@@ -6,6 +6,7 @@ lejepa/
 tmp/
 wandb/
 checkpoints/
+architechtures/v3/runs/
 llm-jepa/
 parameter-golf/
 __pycache__/
