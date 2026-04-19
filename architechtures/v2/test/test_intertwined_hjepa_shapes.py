@@ -387,13 +387,13 @@ def test_residual_stream_updates_decompose_per_layer():
         total_update = state_out - state_in
 
         assert torch.allclose(total_update, attn_update + block_update)
-    assert len(outputs["loss_jepa_layers"]) == config.depth - 1
-    assert len(outputs["loss_sigreg_layers"]) == config.depth - 1
-    assert len(outputs["z"]) == config.depth - 1
-    assert len(outputs["deltas"]) == config.depth - 1
-    assert len(outputs["targets"]) == config.depth - 1
-    assert len(outputs["states"]) == config.depth + 1
-    assert len(outputs["post_attn_states"]) == config.depth
+    assert len(outputs["loss_jepa_layers"]) == model.config.depth - 1
+    assert len(outputs["loss_sigreg_layers"]) == model.config.depth - 1
+    assert len(outputs["z"]) == model.config.depth - 1
+    assert len(outputs["deltas"]) == model.config.depth - 1
+    assert len(outputs["targets"]) == model.config.depth - 1
+    assert len(outputs["states"]) == model.config.depth + 1
+    assert len(outputs["post_attn_states"]) == model.config.depth
     assert outputs["jepa_valid_mask"].shape == input_ids.shape
     assert outputs["jepa_valid_mask"][:, :-1].all()
     assert not outputs["jepa_valid_mask"][:, -1].any()

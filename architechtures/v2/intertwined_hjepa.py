@@ -11,14 +11,6 @@ from torch import nn
 from sigreg import SlicedEppsPulleySIGReg
 from text_helpers import LMHead, TokenEmbeddings
 
-_flash_attn_func = None
-for _module_name in ("flash_attn.cute", "flash_attn"):
-    try:
-        _flash_attn_func = __import__(_module_name, fromlist=["flash_attn_func"]).flash_attn_func
-        break
-    except (ImportError, AttributeError):
-        pass
-
 """
 Notation used below:
     B: batch size
@@ -133,22 +125,13 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
 
-        if _flash_attn_func is not None and q.is_cuda and q.dtype in {torch.float16, torch.bfloat16}:
-            attn_out = _flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True,
-            )
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
-            ).transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        ).transpose(1, 2)
 
         attn_out = attn_out.reshape(batch_size, sequence_length, residual_dim)
         attn_out = self.out_proj(attn_out)
@@ -159,13 +142,11 @@ class CausalSelfAttention(nn.Module):
 
 
 def init_intertwined_weights(module: nn.Module) -> None:
-    if isinstance(module, nn.Linear):
-        std = float(getattr(module, "_init_std", 0.02))
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        std = float(getattr(module, "_init_std", 0.02)) if isinstance(module, nn.Linear) else 0.02
         nn.init.normal_(module.weight, mean=0.0, std=std)
-        if module.bias is not None:
+        if isinstance(module, nn.Linear) and module.bias is not None:
             nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.Embedding):
-        nn.init.normal_(module.weight, mean=0.0, std=0.02)
     elif isinstance(module, nn.RMSNorm) and module.weight is not None:
         nn.init.ones_(module.weight)
 
