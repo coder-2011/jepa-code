@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import yaml
 from torch import nn
 
-from sigreg import SlicedEppsPulleySIGReg
+from sigreg import SIGReg
 from text_helpers import LMHead, TokenEmbeddings
 
 """
@@ -379,10 +379,10 @@ class IntertwinedHJEPA(nn.Module):
             residual_branch_scale=residual_branch_scale,
         )
         self.final_norm = RMSNorm(config.residual_dim)
-        self.sigreg = SlicedEppsPulleySIGReg(
+        self.sigreg = SIGReg(
             num_slices=config.sigreg_num_slices,
             t_max=config.sigreg_t_max,
-            n_points=config.sigreg_n_points,
+            knots=config.sigreg_n_points,
         )
         self.lm_head = LMHead(
             residual_dim=config.residual_dim,

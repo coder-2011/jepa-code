@@ -7,7 +7,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 
 from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, next_token_loss, rms_normalize_last_dim
-from sigreg import SlicedEppsPulleySIGReg
+from sigreg import SIGReg
 
 YAML_CONFIG = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
 
@@ -160,7 +160,7 @@ def test_jepa_loss_updates_ce_path():
 
 
 def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
-    sigreg = SlicedEppsPulleySIGReg(num_slices=8, n_points=5)
+    sigreg = SIGReg(num_slices=8, knots=5)
     z = torch.randn(6, 4, requires_grad=True)
 
     loss = sigreg(z)
