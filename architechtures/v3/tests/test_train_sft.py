@@ -53,21 +53,45 @@ class TrainSFTTests(unittest.TestCase):
         self.assertFalse(train_sft.should_keep_row(row, "off", {"math"}))
         self.assertFalse(train_sft.should_keep_row(row, "on", {"chat"}))
 
-    def test_row_to_prompt_completion_uses_trl_prompt_completion_format(self) -> None:
+    def test_row_to_messages_uses_conversational_format(self) -> None:
         row = load_fixture_rows()[0]
 
-        record = train_sft.row_to_prompt_completion(row, "solution_only")
+        record = train_sft.row_to_messages(row, "solution_only")
 
         self.assertEqual(
             record,
             {
-                "prompt": [{"role": "user", "content": "What is 2 + 2?"}],
-                "completion": [{"role": "assistant", "content": "#### 4"}],
+                "messages": [
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "#### 4"},
+                ],
             },
         )
 
-    def test_row_to_prompt_completion_requires_prompt_and_completion(self) -> None:
-        self.assertIsNone(train_sft.row_to_prompt_completion({"messages": []}, "solution_only"))
+    def test_row_to_messages_requires_prompt_and_completion(self) -> None:
+        self.assertIsNone(train_sft.row_to_messages({"messages": []}, "solution_only"))
+
+    def test_row_to_messages_supports_chat_messages(self) -> None:
+        row = {
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+            ]
+        }
+
+        record = train_sft.row_to_messages(row, "solution_only")
+
+        self.assertEqual(
+            record,
+            {
+                "messages": [
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello"},
+                ]
+            },
+        )
 
     def test_build_sft_records_loads_filtered_jsonl(self) -> None:
         args = argparse.Namespace(
@@ -81,8 +105,36 @@ class TrainSFTTests(unittest.TestCase):
         records = train_sft.build_sft_records(args)
 
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["prompt"][0]["content"], "What is 2 + 2?")
-        self.assertEqual(records[0]["completion"][0]["content"], "#### 4")
+        self.assertEqual(records[0]["messages"][0]["content"], "What is 2 + 2?")
+        self.assertEqual(records[0]["messages"][1]["content"], "#### 4")
+
+    def test_tokenize_sft_record_masks_prompt_prefix(self) -> None:
+        class FakeTokenizer:
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_dict):
+                assert tokenize is True
+                assert add_generation_prompt is False
+                assert return_dict is True
+                tokens = []
+                for message in messages:
+                    tokens.extend([len(message["role"]), len(message["content"])])
+                return {
+                    "input_ids": tokens,
+                    "attention_mask": [1] * len(tokens),
+                }
+
+        record = {
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+            ]
+        }
+
+        tokenized = train_sft.tokenize_sft_record(FakeTokenizer(), record, max_length=32)
+
+        self.assertEqual(tokenized["input_ids"], [6, 9, 4, 2, 9, 5])
+        self.assertEqual(tokenized["attention_mask"], [1, 1, 1, 1, 1, 1])
+        self.assertEqual(tokenized["labels"], [-100, -100, -100, -100, 9, 5])
 
 
 if __name__ == "__main__":

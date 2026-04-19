@@ -6,8 +6,6 @@ import random
 from pathlib import Path
 from typing import Any
 
-import torch
-
 
 PROMPT_FIELDS = ("problem", "prompt", "question")
 SOLUTION_FIELDS = ("qwen3-solution", "qwen3_solution", "solution", "answer")
@@ -53,6 +51,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def set_seed(seed: int) -> None:
+    import torch
+
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -82,6 +82,26 @@ def first_text_field(row: dict[str, Any], field_names: tuple[str, ...]) -> str:
         if text:
             return text
     return ""
+
+
+def split_chat_messages(row: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+    messages = row.get("messages")
+    if not isinstance(messages, list):
+        return [], ""
+
+    normalized_messages: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = normalize_text(message.get("role")).lower()
+        content = normalize_text(message.get("content"))
+        if role and content:
+            normalized_messages.append({"role": role, "content": content})
+
+    for index in range(len(normalized_messages) - 1, -1, -1):
+        if normalized_messages[index]["role"] == "assistant":
+            return normalized_messages[:index], normalized_messages[index]["content"]
+    return [], ""
 
 
 def build_assistant_target(row: dict[str, Any], output_mode: str) -> str:
@@ -116,17 +136,23 @@ def read_jsonl(path: str | Path, max_rows: int | None = None) -> list[dict[str, 
     return rows
 
 
-def row_to_prompt_completion(
+def row_to_messages(
     row: dict[str, Any],
     output_mode: str,
 ) -> dict[str, list[dict[str, str]]] | None:
+    prompt_messages, assistant_text = split_chat_messages(row)
+    if prompt_messages and assistant_text:
+        return {"messages": prompt_messages + [{"role": "assistant", "content": assistant_text}]}
+
     prompt = first_text_field(row, PROMPT_FIELDS)
     completion = build_assistant_target(row, output_mode)
     if not prompt or not completion:
         return None
     return {
-        "prompt": [{"role": "user", "content": prompt}],
-        "completion": [{"role": "assistant", "content": completion}],
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": completion},
+        ]
     }
 
 
@@ -137,7 +163,7 @@ def build_sft_records(args: argparse.Namespace) -> list[dict[str, list[dict[str,
     for row in read_jsonl(args.train_file, args.max_train_samples):
         if not should_keep_row(row, args.reasoning_filter, categories):
             continue
-        record = row_to_prompt_completion(row, args.output_mode)
+        record = row_to_messages(row, args.output_mode)
         if record is None:
             skipped += 1
             continue
@@ -148,7 +174,9 @@ def build_sft_records(args: argparse.Namespace) -> list[dict[str, list[dict[str,
     return records
 
 
-def resolve_torch_dtype(requested: str) -> torch.dtype:
+def resolve_torch_dtype(requested: str):
+    import torch
+
     if requested == "float32":
         return torch.float32
     if requested == "float16":
@@ -162,16 +190,75 @@ def resolve_torch_dtype(requested: str) -> torch.dtype:
     return torch.float32
 
 
-def main() -> None:
-    # Heavy HF imports stay here so data-conversion tests remain lightweight.
-    from datasets import Dataset
-    from trl import SFTConfig, SFTTrainer
+def tokenize_sft_record(
+    tokenizer: Any,
+    record: dict[str, list[dict[str, str]]],
+    max_length: int,
+) -> dict[str, list[int]] | None:
+    messages = record["messages"]
+    if len(messages) < 2 or messages[-1]["role"] != "assistant":
+        raise ValueError("Expected messages ending in a single assistant turn.")
 
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+    )
+    prompt_encoded = tokenizer.apply_chat_template(
+        messages[:-1],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+    )
+    input_ids = list(encoded["input_ids"])
+    attention_mask = list(encoded["attention_mask"])
+    prompt_input_ids = list(prompt_encoded["input_ids"])
+    if len(input_ids) > max_length:
+        return None
+    if input_ids[: len(prompt_input_ids)] != prompt_input_ids:
+        raise ValueError("Prompt tokens are not a prefix of the full conversation tokens.")
+    labels = [-100] * len(prompt_input_ids) + input_ids[len(prompt_input_ids) :]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
+def build_tokenized_dataset(
+    tokenizer: Any,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, list[int]]], int]:
+    tokenized_rows: list[dict[str, list[int]]] = []
+    skipped = 0
+    for record in build_sft_records(args):
+        tokenized = tokenize_sft_record(tokenizer, record, args.max_length)
+        if tokenized is None:
+            skipped += 1
+            continue
+        tokenized_rows.append(tokenized)
+    if not tokenized_rows:
+        raise ValueError("No tokenized examples survived max_length filtering.")
+    return tokenized_rows, skipped
+
+
+def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    train_dataset = Dataset.from_list(build_sft_records(args))
+    # Heavy HF imports stay after argument parsing so `--help` remains instant.
+    from datasets import Dataset
+    from trl import SFTConfig, SFTTrainer
+    from transformers import AutoTokenizer
+
     torch_dtype = resolve_torch_dtype(args.dtype)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenized_rows, dropped_for_length = build_tokenized_dataset(tokenizer, args)
+    print(f"Tokenized {len(tokenized_rows)} rows (dropped {dropped_for_length} for max_length).")
+    train_dataset = Dataset.from_list(tokenized_rows)
 
     trainer = SFTTrainer(
         model=args.model_name,
@@ -184,7 +271,6 @@ def main() -> None:
             learning_rate=args.lr,
             logging_steps=args.logging_steps,
             save_steps=args.save_steps,
-            completion_only_loss=True,
             packing=False,
             report_to=[],
             model_init_kwargs={
@@ -194,6 +280,7 @@ def main() -> None:
             },
         ),
         train_dataset=train_dataset,
+        processing_class=tokenizer,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
