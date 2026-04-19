@@ -29,8 +29,14 @@ test-tokenization:
 test-train-checkpointing:
     source {{venv}}/bin/activate && pytest tests/test_train_checkpointing.py
 
+test-v3-sft:
+    source {{venv}}/bin/activate && python -m unittest discover -s architechtures/v3/tests -p 'test_train_sft.py'
+
 all-tests:
-    source {{venv}}/bin/activate && pytest tests/test_batching.py tests/test_benchmarking.py tests/test_embeddings.py tests/test_fineweb_dataloader.py tests/test_llm_jepa.py tests/test_masking.py tests/test_repro.py tests/test_tokenization.py tests/test_train_checkpointing.py
+    source {{venv}}/bin/activate && pytest tests/test_batching.py tests/test_benchmarking.py tests/test_embeddings.py tests/test_fineweb_dataloader.py tests/test_llm_jepa.py tests/test_masking.py tests/test_repro.py tests/test_tokenization.py tests/test_train_checkpointing.py architechtures/v3/tests/test_train_sft.py
+
+train-v3-sft train_file="architechtures/v3/tests/fixtures/nemotron_tiny.jsonl" output_dir="tmp/v3-sft" model_name="hf-internal-testing/tiny-random-gpt2" device="cpu" epochs="1" batch_size="1" eval_every="0" save_every="0" max_gsm8k_samples="0":
+    source {{venv}}/bin/activate && python architechtures/v3/train_sft.py --train-file {{train_file}} --output-dir {{output_dir}} --model-name {{model_name}} --device {{device}} --epochs {{epochs}} --batch-size {{batch_size}} --eval-every {{eval_every}} --save-every {{save_every}} --max-gsm8k-samples {{max_gsm8k_samples}}
 
 download-fineweb-sample max_bytes="5242880" name="CC-MAIN-2024-10" output="tmp/fineweb-sample.jsonl":
     source {{venv}}/bin/activate && python scripts/download_fineweb_sample.py --name {{name}} --max-bytes {{max_bytes}} --output {{output}}

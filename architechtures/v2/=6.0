@@ -1,0 +1,5 @@
+Looking in indexes: https://download.pytorch.org/whl/cu130
+Collecting torch==2.9.1
+  Downloading https://download-r2.pytorch.org/whl/cu130/torch-2.9.1%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (30 kB)
+Collecting numpy
+  Downloading numpy-2.4.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)

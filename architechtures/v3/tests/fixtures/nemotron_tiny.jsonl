@@ -1,0 +1,2 @@
+{"id":"nm-1","category":"math","problem":"What is 2 + 2?","qwen3-reasoning":"Add the two integers to get 4.","qwen3-solution":"#### 4","reasoning":"on"}
+{"id":"nm-2","category":"chat","problem":"Say hello politely.","qwen3-reasoning":"The user wants a polite greeting.","qwen3-solution":"Hello, nice to meet you.","reasoning":"off"}

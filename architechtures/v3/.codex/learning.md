@@ -1,0 +1,9 @@
+# Learning Log
+
+- In `architechtures/v3`, new work should stay outside the reference-only `jepa/` and `lejepa/` trees; this version is currently planning-only and starts from an otherwise empty workspace.
+- The initial method direction is answer-conditioned JEPA-style SFT: an EMA teacher sees prompt plus gold answer, while the student sees prompt only and matches teacher hidden states on prompt positions at selected upper transformer blocks.
+- The first runnable baseline in `architechtures/v3` is a minimal manual HF/PyTorch SFT loop, not a generalized trainer: Nemotron-style JSONL in, prompt-masked causal LM loss, and GSM8K numeric generation accuracy for validation.
+- The local HF stack needed a text-only import workaround: `transformers` detected system `torchvision`, but that package was incompatible with the installed `torch`; patching `importlib.util.find_spec` to hide `torchvision` during `transformers` import allowed causal LM loading to proceed.
+- The original `nvidia/Nemotron-Post-Training-Dataset-v2` is gated without Hugging Face auth in this environment; a runnable public fallback is `jacobmorrison/Nemotron-Post-Training-Dataset-v2-reasoning-chat`, whose split is `chat` and whose rows use a `messages` schema instead of `problem`/`solution`.
+- A real short Qwen run worked with `Qwen/Qwen3-0.6B` on CUDA and `max_length=2048`, but `torch.save` on the large optimizer state produced a zip writer error; saving the model/tokenizer succeeded, so checkpoints should tolerate optimizer-state save failure and write fallback metadata instead of aborting the run.
+- In the v3 SFT loop, overlength chat examples should be dropped rather than truncated, and gradient accumulation must flush the final partial accumulation at epoch end or the last few batches are silently ignored when `len(dataloader) % grad_accum_steps != 0`.

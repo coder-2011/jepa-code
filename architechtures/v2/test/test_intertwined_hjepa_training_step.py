@@ -271,6 +271,8 @@ def test_sigreg_loss_updates_encoder_path():
     assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
 
 
+
+
 def test_training_step_updates_students_then_ema():
     model = make_model()
     optimizer = torch.optim.AdamW(model.student_parameters(), lr=0.01)

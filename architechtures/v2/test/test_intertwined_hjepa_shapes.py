@@ -39,6 +39,28 @@ def make_config():
     )
 
 
+def manual_causal_attention_output(module: CausalSelfAttention, x: torch.Tensor) -> torch.Tensor:
+    batch_size, sequence_length, residual_dim = x.shape
+    q = module.q_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    k = module.k_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    v = module.v_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (module.head_dim ** -0.5)
+    causal_mask = torch.triu(torch.ones(sequence_length, sequence_length, device=x.device, dtype=torch.bool), diagonal=1)
+    probs = torch.softmax(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
+    attn_out = torch.matmul(probs, v).transpose(1, 2).contiguous().view(batch_size, sequence_length, residual_dim)
+    return module.out_proj(attn_out)
+
+
+class ConstantLike(nn.Module):
+    def __init__(self, out_dim: int, fill_value: float):
+        super().__init__()
+        self.out_dim = out_dim
+        self.fill_value = fill_value
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.full((*x.shape[:-1], self.out_dim), self.fill_value, dtype=x.dtype, device=x.device)
+
+
 def test_block_student_forward_shapes():
     config = make_config()
     block = IntertwinedBlock(
@@ -72,6 +94,83 @@ def test_final_residual_block_shapes():
 
     assert out["x_next"].shape == (batch_size, sequence_length, config.residual_dim)
     assert out["x_post_attn"].shape == (batch_size, sequence_length, config.residual_dim)
+
+
+def test_runtime_residual_branch_scaling_applies_to_jepa_block_updates():
+    block = IntertwinedBlock(
+        residual_dim=4,
+        compressed_dim=2,
+        predictor_hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        residual_branch_scale=0.5,
+    )
+    block.attn_norm = nn.Identity()
+    block.ce_norm = nn.Identity()
+    block.attn = ConstantLike(out_dim=4, fill_value=2.0)
+    block.compressor = ConstantLike(out_dim=2, fill_value=1.0)
+    block.predictor = ConstantLike(out_dim=2, fill_value=0.0)
+    block.projector = ConstantLike(out_dim=4, fill_value=4.0)
+    x = torch.zeros(1, 3, 4)
+
+    out = block.forward_student(x)
+
+    assert torch.allclose(out["x_post_attn"], torch.full_like(out["x_post_attn"], 1.0))
+    assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 3.0))
+
+
+def test_runtime_residual_branch_scaling_applies_to_final_block_updates():
+    block = FinalResidualBlock(
+        residual_dim=4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        residual_branch_scale=0.5,
+    )
+    block.attn_norm = nn.Identity()
+    block.attn = ConstantLike(out_dim=4, fill_value=2.0)
+    block.mlp = ConstantLike(out_dim=4, fill_value=4.0)
+    x = torch.zeros(1, 3, 4)
+
+    out = block(x)
+
+    assert torch.allclose(out["x_post_attn"], torch.full_like(out["x_post_attn"], 1.0))
+    assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 3.0))
+
+
+def test_causal_self_attention_matches_manual_reference():
+    config = make_config()
+    attention = CausalSelfAttention(
+        residual_dim=config.residual_dim,
+        num_heads=config.num_heads,
+        dropout=0.0,
+    ).eval()
+    x = torch.randn(2, 5, config.residual_dim)
+
+    with torch.no_grad():
+        direct = attention(x)
+        manual = manual_causal_attention_output(attention, x)
+
+    assert torch.allclose(direct, manual, atol=1e-6, rtol=1e-5)
+
+
+def test_causal_self_attention_ignores_future_tokens():
+    config = make_config()
+    attention = CausalSelfAttention(
+        residual_dim=config.residual_dim,
+        num_heads=config.num_heads,
+        dropout=0.0,
+    ).eval()
+    x = torch.randn(2, 5, config.residual_dim)
+    perturbed = x.clone()
+    perturbed[:, -1] += 1000.0
+
+    with torch.no_grad():
+        base = attention(x)
+        changed = attention(perturbed)
+
+    assert torch.allclose(base[:, :-1], changed[:, :-1], atol=1e-6, rtol=1e-5)
+    assert not torch.allclose(base[:, -1], changed[:, -1])
 
 
 def test_text_helpers_shapes():
@@ -163,6 +262,20 @@ def test_model_uses_explicit_small_initialization():
             assert torch.equal(student_parameter, ema_parameter)
         for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_block.compressor.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
+
+
+def test_residual_output_projections_use_scaled_init():
+    torch.manual_seed(0)
+    config = make_config()
+    model = IntertwinedHJEPA(config)
+    target_std = 0.02 / (2.0 * config.depth) ** 0.5
+
+    for block in model.blocks:
+        assert block.attn.out_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
+        assert block.projector[1].weight.std().item() == pytest.approx(target_std, rel=0.35)
+
+    assert model.final_block.attn.out_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
+    assert model.final_block.mlp[4].weight.std().item() == pytest.approx(target_std, rel=0.35)
 
 
 def test_rmsnorm_mixed_bf16_input_avoids_dtype_mismatch_warning():
@@ -258,6 +371,22 @@ def test_model_forward_returns_expected_shapes():
     assert outputs["loss_main"].ndim == 0
     assert outputs["loss_jepa"].ndim == 0
     assert outputs["loss_sigreg"].ndim == 0
+
+
+def test_residual_stream_updates_decompose_per_layer():
+    model = IntertwinedHJEPA(make_config())
+    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
+    outputs = model(input_ids=input_ids, labels=input_ids)
+
+    for index in range(model.config.depth):
+        state_in = outputs["states"][index]
+        post_attn = outputs["post_attn_states"][index]
+        state_out = outputs["states"][index + 1]
+        attn_update = post_attn - state_in
+        block_update = state_out - post_attn
+        total_update = state_out - state_in
+
+        assert torch.allclose(total_update, attn_update + block_update)
     assert len(outputs["loss_jepa_layers"]) == config.depth - 1
     assert len(outputs["loss_sigreg_layers"]) == config.depth - 1
     assert len(outputs["z"]) == config.depth - 1

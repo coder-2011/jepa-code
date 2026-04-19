@@ -1,4 +1,5 @@
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,7 +160,8 @@ class CausalSelfAttention(nn.Module):
 
 def init_intertwined_weights(module: nn.Module) -> None:
     if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        std = float(getattr(module, "_init_std", 0.02))
+        nn.init.normal_(module.weight, mean=0.0, std=std)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
@@ -176,8 +178,10 @@ class IntertwinedBlock(nn.Module):
         predictor_hidden_dim: int,
         num_heads: int = 1,
         dropout: float = 0.0,
+        residual_branch_scale: float = 1.0,
     ):
         super().__init__()
+        self.residual_branch_scale = float(residual_branch_scale)
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
@@ -195,7 +199,7 @@ class IntertwinedBlock(nn.Module):
         if squeeze_sequence:
             x_l = x_l.unsqueeze(1)
 
-        x_l_post_attn = x_l + self.attn(self.attn_norm(x_l))
+        x_l_post_attn = x_l + self.residual_branch_scale * self.attn(self.attn_norm(x_l))
         z_l = self.compressor(self.ce_norm(x_l_post_attn))
 
         if squeeze_sequence:
@@ -223,7 +227,7 @@ class IntertwinedBlock(nn.Module):
         delta_l = self.predictor(z_l)
         # Inject the compressed prediction back into the D-wide residual stream.
         update_l = self.projector(z_l + delta_l)
-        x_next = x_l_post_attn + update_l
+        x_next = x_l_post_attn + self.residual_branch_scale * update_l
 
         if squeeze_sequence:
             x_next = x_next.squeeze(1)
@@ -244,8 +248,10 @@ class FinalResidualBlock(nn.Module):
         hidden_dim: int,
         num_heads: int = 1,
         dropout: float = 0.0,
+        residual_branch_scale: float = 1.0,
     ):
         super().__init__()
+        self.residual_branch_scale = float(residual_branch_scale)
         self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
         self.mlp = nn.Sequential(
@@ -258,10 +264,10 @@ class FinalResidualBlock(nn.Module):
 
     def forward(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
         x_l_normed = self.attn_norm(x_l)
-        attn_out = self.attn(x_l_normed)
+        attn_out = self.residual_branch_scale * self.attn(x_l_normed)
         x_post_attn = x_l + attn_out
         return {
-            "x_next": x_post_attn + self.mlp(x_post_attn),
+            "x_next": x_post_attn + self.residual_branch_scale * self.mlp(x_post_attn),
             "x_post_attn": x_post_attn,
         }
 
@@ -362,6 +368,7 @@ class IntertwinedHJEPA(nn.Module):
         self.ema_momentum = float(config.ema_momentum)
         self.ema_momentum_final = float(config.ema_momentum_final)
         self.ema_warmup_steps = int(config.ema_warmup_steps)
+        residual_branch_scale = 1.0 / math.sqrt(config.depth)
 
         # Plain learned token + position embeddings for v1.
         self.embeddings = TokenEmbeddings(
@@ -378,6 +385,7 @@ class IntertwinedHJEPA(nn.Module):
                     predictor_hidden_dim=config.predictor_hidden_dim,
                     num_heads=config.num_heads,
                     dropout=config.dropout,
+                    residual_branch_scale=residual_branch_scale,
                 )
                 for _ in range(jepa_depth)
             ]
@@ -387,6 +395,7 @@ class IntertwinedHJEPA(nn.Module):
             hidden_dim=config.predictor_hidden_dim,
             num_heads=config.num_heads,
             dropout=config.dropout,
+            residual_branch_scale=residual_branch_scale,
         )
         self.final_norm = RMSNorm(config.residual_dim)
         self.sigreg = SlicedEppsPulleySIGReg(
@@ -408,6 +417,12 @@ class IntertwinedHJEPA(nn.Module):
             config.compressed_dim,
             dropout=0.0,
         )
+        residual_output_std = 0.02 / math.sqrt(2.0 * config.depth)
+        for block in self.blocks:
+            block.attn.out_proj._init_std = residual_output_std
+            block.projector[1]._init_std = residual_output_std
+        self.final_block.attn.out_proj._init_std = residual_output_std
+        self.final_block.mlp[4]._init_std = residual_output_std
         self.apply(init_intertwined_weights)
         self.output_target_norm.requires_grad_(False)
         self.output_target_norm.eval()

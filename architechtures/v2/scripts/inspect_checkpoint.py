@@ -29,6 +29,18 @@ LAYER_KEYS = (
     "target_delta_norm",
     "delta_target_ratio",
 )
+RESIDUAL_KEYS = (
+    "input_norm",
+    "post_attn_norm",
+    "output_norm",
+    "attn_update_norm",
+    "block_update_norm",
+    "total_update_norm",
+    "attn_update_ratio",
+    "block_update_ratio",
+    "total_update_ratio",
+    "attn_block_cosine",
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +166,46 @@ def add_layer_metrics(
     layer["delta_target_ratio"] += (delta_norm / target_delta_norm.clamp_min(1e-12)).item()
 
 
+def mean_token_norm(x: torch.Tensor) -> torch.Tensor:
+    assert x.ndim == 3, "expected (B, L, D) tensor"
+    return x.detach().float().norm(dim=-1).mean()
+
+
+def mean_centered_cosine(left: torch.Tensor, right: torch.Tensor) -> float:
+    assert left.shape == right.shape, "cosine inputs must have matching shape"
+    left_flat = left.detach().float().reshape(-1, left.shape[-1])
+    right_flat = right.detach().float().reshape(-1, right.shape[-1])
+    cosine = torch.nn.functional.cosine_similarity(left_flat, right_flat, dim=-1, eps=1e-8)
+    return float(cosine.mean())
+
+
+def add_residual_metrics(layer: dict[str, float], outputs: dict[str, Any], index: int) -> None:
+    state_in = outputs["states"][index].detach().float()
+    post_attn = outputs["post_attn_states"][index].detach().float()
+    state_out = outputs["states"][index + 1].detach().float()
+    attn_update = post_attn - state_in
+    block_update = state_out - post_attn
+    total_update = state_out - state_in
+
+    input_norm = mean_token_norm(state_in)
+    post_attn_norm = mean_token_norm(post_attn)
+    output_norm = mean_token_norm(state_out)
+    attn_update_norm = mean_token_norm(attn_update)
+    block_update_norm = mean_token_norm(block_update)
+    total_update_norm = mean_token_norm(total_update)
+
+    layer["input_norm"] += input_norm.item()
+    layer["post_attn_norm"] += post_attn_norm.item()
+    layer["output_norm"] += output_norm.item()
+    layer["attn_update_norm"] += attn_update_norm.item()
+    layer["block_update_norm"] += block_update_norm.item()
+    layer["total_update_norm"] += total_update_norm.item()
+    layer["attn_update_ratio"] += (attn_update_norm / input_norm.clamp_min(1e-12)).item()
+    layer["block_update_ratio"] += (block_update_norm / post_attn_norm.clamp_min(1e-12)).item()
+    layer["total_update_ratio"] += (total_update_norm / input_norm.clamp_min(1e-12)).item()
+    layer["attn_block_cosine"] += mean_centered_cosine(attn_update, block_update)
+
+
 def inspect_eval(
     model: IntertwinedHJEPA,
     loader,
@@ -164,6 +216,7 @@ def inspect_eval(
     config = model.config
     totals = new_metric_totals(EVAL_KEYS)
     layer_totals = [new_metric_totals(LAYER_KEYS) for _ in range(config.depth - 1)]
+    residual_totals = [new_metric_totals(RESIDUAL_KEYS) for _ in range(config.depth)]
     warnings: list[str] = []
     num_batches = 0
 
@@ -182,11 +235,14 @@ def inspect_eval(
 
             for index in range(config.depth - 1):
                 add_layer_metrics(layer_totals[index], outputs, index)
+            for index in range(config.depth):
+                add_residual_metrics(residual_totals[index], outputs, index)
 
             num_batches += 1
 
     totals = average_metrics(totals, num_batches)
     layer_totals = [average_metrics(layer, num_batches) for layer in layer_totals]
+    residual_totals = [average_metrics(layer, num_batches) for layer in residual_totals]
 
     lambda_eff = warmup_weight(config.lambda_jepa, step, config.jepa_warmup_steps)
     beta_eff = warmup_weight(config.beta_sigreg, step, config.sigreg_warmup_steps)
@@ -202,8 +258,14 @@ def inspect_eval(
             warnings.append(
                 f"layer {index} delta/target ratio looks off: {layer['delta_target_ratio']:.4f}"
             )
+    for index, layer in enumerate(residual_totals):
+        block_name = "final" if index == config.depth - 1 else f"jepa {index}"
+        if layer["attn_update_ratio"] < 1e-4:
+            warnings.append(f"{block_name} attention update is very small: {layer['attn_update_ratio']:.3e}")
+        if layer["block_update_ratio"] < 1e-4:
+            warnings.append(f"{block_name} block update is very small: {layer['block_update_ratio']:.3e}")
 
-    return totals, layer_totals, warnings
+    return totals, layer_totals, residual_totals, warnings
 
 
 def sample_next_id(logits: torch.Tensor, *, temperature: float, top_k: int) -> int:
@@ -299,6 +361,7 @@ def print_report(
     tokenizer_path: Path,
     eval_metrics: dict[str, float],
     layer_metrics: list[dict[str, float]],
+    residual_metrics: list[dict[str, float]],
     generations: list[dict[str, Any]],
     warnings: list[str],
 ) -> None:
@@ -333,6 +396,26 @@ def print_report(
                 f"delta/target={layer['delta_target_ratio']:.6f}"
             )
             for index, layer in enumerate(layer_metrics)
+        ],
+    )
+
+    print_section(
+        "Residual Stream",
+        [
+            (
+                f"layer {index if index < len(residual_metrics) - 1 else 'final'}: "
+                f"in={layer['input_norm']:.6f} "
+                f"post_attn={layer['post_attn_norm']:.6f} "
+                f"out={layer['output_norm']:.6f} "
+                f"attn_update={layer['attn_update_norm']:.6f} "
+                f"block_update={layer['block_update_norm']:.6f} "
+                f"total_update={layer['total_update_norm']:.6f} "
+                f"attn/input={layer['attn_update_ratio']:.6f} "
+                f"block/post={layer['block_update_ratio']:.6f} "
+                f"total/input={layer['total_update_ratio']:.6f} "
+                f"cos(attn,block)={layer['attn_block_cosine']:.6f}"
+            )
+            for index, layer in enumerate(residual_metrics)
         ],
     )
 
@@ -379,7 +462,7 @@ def main(argv: list[str] | None = None) -> None:
         pin_memory=device.type == "cuda",
     )
     step = int(checkpoint.get("step", 0))
-    eval_metrics, layer_metrics, warnings = inspect_eval(model, eval_loader, device=device, step=step)
+    eval_metrics, layer_metrics, residual_metrics, warnings = inspect_eval(model, eval_loader, device=device, step=step)
     if missing_config_fields:
         warnings.append(
             "checkpoint config was missing fields filled from current YAML: "
@@ -413,6 +496,7 @@ def main(argv: list[str] | None = None) -> None:
         assets.tokenizer_path,
         eval_metrics,
         layer_metrics,
+        residual_metrics,
         generations,
         warnings,
     )
