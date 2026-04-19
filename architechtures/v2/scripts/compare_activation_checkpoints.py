@@ -61,7 +61,7 @@ def collect_stats(model, loader, *, device: torch.device) -> dict[str, Any]:
     for batch in loader:
         input_ids, labels = (tensor.to(device) for tensor in batch)
         outputs = model(input_ids=input_ids, labels=labels)
-        jepa_valid_mask = outputs["jepa_valid_mask"].to(torch.bool)
+        jepa_valid_mask = outputs["jepa_valid_mask"].to(torch.bool)[:, :-1]
         tail_mask = ~jepa_valid_mask
         final_states = outputs["final_states"].detach().float()
         totals["num_batches"] += 1
@@ -76,8 +76,8 @@ def collect_stats(model, loader, *, device: torch.device) -> dict[str, Any]:
 
         for index, z in enumerate(outputs["z"]):
             z = z.detach().float()
-            delta = outputs["deltas"][index].detach().float()
-            target_delta = outputs["targets"][index].detach().float() - z
+            delta = outputs["deltas"][index].detach().float()[:, :-1]
+            target_delta = outputs["targets"][index].detach().float()[:, 1:] - z[:, :-1]
             z_flat = z.reshape(-1, z.shape[-1])
             z_std = z_flat.std(dim=0, unbiased=False)
             totals["z_std_mean"][index] += float(z_std.mean())

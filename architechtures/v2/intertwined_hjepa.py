@@ -176,22 +176,15 @@ class IntertwinedBlock(nn.Module):
         )
 
     def encode_context(self, x_l: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        squeeze_sequence = x_l.ndim == 2
-        if squeeze_sequence:
-            x_l = x_l.unsqueeze(1)
-
+        assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
         x_l_post_attn = x_l + self.residual_branch_scale * self.attn(self.attn_norm(x_l))
         z_l = self.compressor(self.ce_norm(x_l_post_attn))
-
-        if squeeze_sequence:
-            x_l_post_attn = x_l_post_attn.squeeze(1)
-            z_l = z_l.squeeze(1)
         return x_l_post_attn, z_l
 
     def forward_student(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Args:
-            x_l: (B, L, D) during training, or (B, D) for a single-token step.
+            x_l: (B, L, D)
 
         Returns:
             x_next:      same leading shape as x_l, residual width D
@@ -199,20 +192,12 @@ class IntertwinedBlock(nn.Module):
             z:           same leading shape as x_l, compressed width K
             delta:       same leading shape as x_l, compressed width K
         """
-        # Keep a tiny decode path for single-token stepping without a separate codepath.
-        squeeze_sequence = x_l.ndim == 2
-        if squeeze_sequence:
-            x_l = x_l.unsqueeze(1)
-
+        assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
         x_l_post_attn, z_l = self.encode_context(x_l)
         delta_l = self.predictor(z_l)
         # Inject the compressed prediction back into the D-wide residual stream.
         update_l = self.projector(z_l + delta_l)
         x_next = x_l_post_attn + self.residual_branch_scale * update_l
-
-        if squeeze_sequence:
-            x_next = x_next.squeeze(1)
-            delta_l = delta_l.squeeze(1)
 
         return {
             "x_next": x_next,
@@ -259,9 +244,8 @@ def jepa_delta_loss(
     target_z_l: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # Keep the JEPA contract exact: no silent broadcasting across batch, sequence, or compressed width.
-    if delta_l.shape != z_l.shape or delta_l.shape != target_z_l.shape:
-        raise ValueError("delta_l, z_l, and target_z_l must have exactly the same shape")
+    assert delta_l.shape == z_l.shape == target_z_l.shape, "delta_l, z_l, and target_z_l must have exactly the same shape"
+    assert delta_l.ndim >= 2, "delta_l, z_l, and target_z_l must have at least one sample axis and one feature axis"
 
     normalized_z_l = rms_normalize_last_dim(z_l)
     normalized_delta_l = rms_normalize_last_dim(delta_l)
@@ -271,13 +255,10 @@ def jepa_delta_loss(
         return F.mse_loss(normalized_delta_l, normalized_target_delta_l)
 
     assert valid_mask.shape == delta_l.shape[:-1], "valid_mask must match the leading shape of delta_l"
-    if not valid_mask.any():
-        raise ValueError("valid_mask selects no JEPA loss positions")
+    assert valid_mask.any(), "valid_mask selects no JEPA loss positions"
 
-    # valid_mask is over token positions (B, L); broadcast it across the compressed width K.
     error = F.mse_loss(normalized_delta_l, normalized_target_delta_l, reduction="none")
-    expanded_mask = valid_mask.unsqueeze(-1).expand_as(error)
-    return error.masked_select(expanded_mask).mean()
+    return error[valid_mask].mean()
 
 
 def next_token_loss(
@@ -302,14 +283,6 @@ def next_token_jepa_mask(input_ids: torch.Tensor) -> torch.Tensor:
     mask = torch.ones_like(input_ids, dtype=torch.bool)
     mask[:, -1] = False
     return mask
-
-
-def shift_targets_to_next_token(raw_target_z: torch.Tensor) -> torch.Tensor:
-    assert raw_target_z.ndim == 3, "raw_target_z must have shape (B, L, K)"
-    # The tail position is masked out by JEPA, so we only need to overwrite the valid prefix.
-    target_z = raw_target_z.clone()
-    target_z[:, :-1].copy_(raw_target_z[:, 1:])
-    return target_z
 
 
 def warmup_weight(weight: float, step: int | None, warmup_steps: int) -> float:
@@ -438,15 +411,6 @@ class IntertwinedHJEPA(nn.Module):
         target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index])[1]
         return target_z_l.detach()
 
-    @torch.no_grad()
-    def compute_jepa_target_for_layer(
-        self,
-        layer_index: int,
-        states: list[torch.Tensor],
-    ) -> torch.Tensor:
-        raw_target_z_l = self.compute_raw_jepa_target_for_layer(layer_index, states)
-        return shift_targets_to_next_token(raw_target_z_l)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -471,7 +435,7 @@ class IntertwinedHJEPA(nn.Module):
             post_attn_states:  depth states, each (B, L, D)
             z:                 depth - 1 JEPA compressed states, each (B, L, K)
             deltas:            depth - 1 predicted deltas, each (B, L, K)
-            targets:           depth - 1 stopped targets, each (B, L, K)
+            targets:           depth - 1 raw stopped EMA targets, each (B, L, K)
             loss_sigreg_layers: depth - 1 local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
@@ -504,18 +468,19 @@ class IntertwinedHJEPA(nn.Module):
 
         if compute_aux_losses:
             assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid future-token position"
+            aligned_jepa_valid_mask = jepa_valid_mask[:, :-1]
             targets = []
             jepa_losses = []
             sigreg_losses = []
             for layer_index in range(len(self.blocks)):
-                target_z_l = self.compute_jepa_target_for_layer(layer_index, states)
-                targets.append(target_z_l)
+                raw_target_z_l = self.compute_raw_jepa_target_for_layer(layer_index, states)
+                targets.append(raw_target_z_l)
                 jepa_losses.append(
                     jepa_delta_loss(
-                        deltas[layer_index],
-                        compressed[layer_index],
-                        target_z_l,
-                        valid_mask=jepa_valid_mask,
+                        deltas[layer_index][:, :-1],
+                        compressed[layer_index][:, :-1],
+                        raw_target_z_l[:, 1:],
+                        valid_mask=aligned_jepa_valid_mask,
                     )
                 )
             if self.config.beta_sigreg > 0:

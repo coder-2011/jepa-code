@@ -146,9 +146,9 @@ def add_layer_metrics(
     index: int,
 ) -> None:
     z = outputs["z"][index].detach().float()
-    delta = outputs["deltas"][index].detach().float()
-    target_delta = outputs["targets"][index].detach().float() - z
-    jepa_valid_mask = outputs["jepa_valid_mask"].to(torch.bool)
+    delta = outputs["deltas"][index].detach().float()[:, :-1]
+    target_delta = outputs["targets"][index].detach().float()[:, 1:] - z[:, :-1]
+    jepa_valid_mask = outputs["jepa_valid_mask"].to(torch.bool)[:, :-1]
     z_flat = z.reshape(-1, z.shape[-1])
     z_std = z_flat.std(dim=0, unbiased=False)
     delta_norm = delta[jepa_valid_mask].norm(dim=-1).mean()

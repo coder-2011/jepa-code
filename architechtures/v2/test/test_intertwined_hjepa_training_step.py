@@ -54,7 +54,7 @@ def test_jepa_delta_loss_rejects_empty_valid_mask():
 
     try:
         jepa_delta_loss(delta, z, target, valid_mask=valid_mask)
-    except ValueError as exc:
+    except AssertionError as exc:
         assert "valid_mask" in str(exc)
     else:
         raise AssertionError("Expected an empty valid_mask to be rejected")

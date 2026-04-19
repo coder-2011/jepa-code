@@ -305,16 +305,16 @@ def test_jepa_target_uses_same_layer_ema_context_path_on_next_token():
         model.blocks[1].attn_norm.weight.fill_(2.0)
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
-    target = model.compute_jepa_target_for_layer(0, outputs["states"])
+    target = model.compute_raw_jepa_target_for_layer(0, outputs["states"])
     ema_target = model.ema_target_blocks[0].encode_context(current_state)[1]
     live_post_attn = current_state + model.blocks[0].attn(model.blocks[0].attn_norm(current_state))
     live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(live_post_attn))
     next_block_target = model.ema_target_blocks[1].encode_context(current_state)[1]
 
-    assert torch.allclose(target[:, :-1], ema_target[:, 1:])
+    assert torch.allclose(target, ema_target)
     assert torch.equal(outputs["jepa_valid_mask"][:, -1], torch.zeros_like(outputs["jepa_valid_mask"][:, -1]))
-    assert not torch.allclose(target[:, :-1], live_target[:, :-1])
-    assert not torch.allclose(target[:, :-1], next_block_target[:, :-1])
+    assert not torch.allclose(target, live_target)
+    assert not torch.allclose(target, next_block_target)
 
 
 def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
@@ -323,10 +323,10 @@ def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
     outputs = model(input_ids=input_ids, labels=input_ids)
     current_state = outputs["states"][len(model.blocks) - 1]
 
-    target = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
+    target = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
     expected = model.ema_target_blocks[-1].encode_context(current_state)[1]
 
-    assert torch.allclose(target[:, :-1], expected[:, 1:])
+    assert torch.allclose(target, expected)
     assert not target.requires_grad
 
     with torch.no_grad():
@@ -335,7 +335,7 @@ def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
         for parameter in model.output_target_compressor.parameters():
             parameter.zero_()
 
-    unchanged = model.compute_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
+    unchanged = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
     assert torch.allclose(target, unchanged)
 
 
