@@ -1,4 +1,3 @@
-import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,35 +109,26 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = residual_dim // num_heads
         self.dropout = dropout
-        self.q_proj = nn.Linear(residual_dim, residual_dim, bias=False)
-        self.k_proj = nn.Linear(residual_dim, residual_dim, bias=False)
-        self.v_proj = nn.Linear(residual_dim, residual_dim, bias=False)
-        self.out_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.c_attn = nn.Linear(residual_dim, 3 * residual_dim, bias=False)
+        self.c_proj = nn.Linear(residual_dim, residual_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        squeeze_sequence = x.ndim == 2
-        if squeeze_sequence:
-            x = x.unsqueeze(1)
-
+        assert x.ndim == 3, "x must have shape (B, L, D)"
         batch_size, sequence_length, residual_dim = x.shape
-        q = self.q_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+        q, k, v = self.c_attn(x).chunk(3, dim=-1)
+        q = q.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_out = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
+            q,
+            k,
+            v,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=True,
-        ).transpose(1, 2)
+        )
 
-        attn_out = attn_out.reshape(batch_size, sequence_length, residual_dim)
-        attn_out = self.out_proj(attn_out)
-
-        if squeeze_sequence:
-            attn_out = attn_out.squeeze(1)
-        return attn_out
+        return self.c_proj(attn_out.transpose(1, 2).reshape(batch_size, sequence_length, residual_dim))
 
 
 def init_intertwined_weights(module: nn.Module) -> None:
@@ -156,7 +146,6 @@ def ema_update(ema_parameters: tuple[torch.Tensor, ...], student_parameters: tup
     assert len(ema_parameters) == len(student_parameters), "EMA and student parameter collections must match"
     torch._foreach_mul_(ema_parameters, decay)
     torch._foreach_add_(ema_parameters, student_parameters, alpha=1.0 - decay)
-
 
 class IntertwinedBlock(nn.Module):
     def __init__(
@@ -212,6 +201,28 @@ class IntertwinedBlock(nn.Module):
             "z": z_l,
             "delta": delta_l,
         }
+
+
+class JEPAEncoder(nn.Module):
+    def __init__(
+        self,
+        residual_dim: int,
+        compressed_dim: int,
+        num_heads: int = 1,
+        dropout: float = 0.0,
+        residual_branch_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.residual_branch_scale = float(residual_branch_scale)
+        self.attn_norm = RMSNorm(residual_dim)
+        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
+        self.ce_norm = RMSNorm(residual_dim)
+        self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
+
+    def forward(self, x_l: torch.Tensor) -> torch.Tensor:
+        assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
+        x_l_post_attn = x_l + self.residual_branch_scale * self.attn(self.attn_norm(x_l))
+        return self.compressor(self.ce_norm(x_l_post_attn))
 
 
 class FinalResidualBlock(nn.Module):
@@ -370,29 +381,40 @@ class IntertwinedHJEPA(nn.Module):
             token_embedding=self.embeddings.token_embedding,
             tie_weights=config.tie_weights,
         )
-        # Retained only for backward checkpoint compatibility; JEPA targets now
-        # come from same-depth EMA encoders for every JEPA block.
-        self.output_target_norm = RMSNorm(config.residual_dim)
-        self.output_target_compressor = SimpleCompressor(
-            config.residual_dim,
-            config.compressed_dim,
-            dropout=0.0,
-        )
         residual_output_std = 0.02 / math.sqrt(2.0 * config.depth)
         for block in self.blocks:
-            block.attn.out_proj._init_std = residual_output_std
+            block.attn.c_proj._init_std = residual_output_std
             block.projector[1]._init_std = residual_output_std
-        self.final_block.attn.out_proj._init_std = residual_output_std
+        self.final_block.attn.c_proj._init_std = residual_output_std
         self.final_block.mlp[4]._init_std = residual_output_std
         self.apply(init_intertwined_weights)
-        self.output_target_norm.requires_grad_(False)
-        self.output_target_norm.eval()
-        self.output_target_compressor.requires_grad_(False)
-        self.output_target_compressor.eval()
-        self.ema_target_blocks = nn.ModuleList(copy.deepcopy(block) for block in self.blocks)
-        for ema_block in self.ema_target_blocks:
-            ema_block.requires_grad_(False)
-            ema_block.eval()
+        self.ema_target_encoders = nn.ModuleList(
+            [
+                JEPAEncoder(
+                    residual_dim=config.residual_dim,
+                    compressed_dim=config.compressed_dim,
+                    num_heads=config.num_heads,
+                    dropout=config.dropout,
+                    residual_branch_scale=residual_branch_scale,
+                )
+                for _ in range(jepa_depth)
+            ]
+        )
+        for student_block, ema_encoder in zip(self.blocks, self.ema_target_encoders):
+            ema_encoder.load_state_dict(
+                {
+                    "attn_norm.weight": student_block.attn_norm.weight.detach().clone(),
+                    "attn.c_attn.weight": student_block.attn.c_attn.weight.detach().clone(),
+                    "attn.c_proj.weight": student_block.attn.c_proj.weight.detach().clone(),
+                    "ce_norm.weight": student_block.ce_norm.weight.detach().clone(),
+                    "compressor.net.0.weight": student_block.compressor.net[0].weight.detach().clone(),
+                    "compressor.net.0.bias": student_block.compressor.net[0].bias.detach().clone(),
+                    "compressor.net.3.weight": student_block.compressor.net[3].weight.detach().clone(),
+                    "compressor.net.3.bias": student_block.compressor.net[3].bias.detach().clone(),
+                }
+            )
+            ema_encoder.requires_grad_(False)
+            ema_encoder.eval()
 
     def student_parameters(self):
         # EMA parameters are frozen, so this naturally returns only trainable student weights.
@@ -415,7 +437,7 @@ class IntertwinedHJEPA(nn.Module):
         states: list[torch.Tensor],
     ) -> torch.Tensor:
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
-        target_z_l = self.ema_target_blocks[layer_index].encode_context(states[layer_index])[1]
+        target_z_l = self.ema_target_encoders[layer_index](states[layer_index])
         return target_z_l.detach()
 
     def forward(
@@ -575,22 +597,7 @@ class IntertwinedHJEPA(nn.Module):
         momentum = self.ema_momentum_at_step(step)
         ema_parameters = []
         student_parameters = []
-        for ema_block, block in zip(self.ema_target_blocks, self.blocks):
-            ema_parameters.extend((ema_block.attn_norm.weight, *ema_block.attn.parameters(), ema_block.ce_norm.weight, *ema_block.compressor.parameters()))
+        for ema_encoder, block in zip(self.ema_target_encoders, self.blocks):
+            ema_parameters.extend((ema_encoder.attn_norm.weight, *ema_encoder.attn.parameters(), ema_encoder.ce_norm.weight, *ema_encoder.compressor.parameters()))
             student_parameters.extend((block.attn_norm.weight, *block.attn.parameters(), block.ce_norm.weight, *block.compressor.parameters()))
         ema_update(tuple(ema_parameters), tuple(student_parameters), momentum)
-
-    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        upgraded = {
-            key: value
-            for key, value in state_dict.items()
-            if not key.startswith("ema_ce_norms.") and not key.startswith("ema_compressors.")
-        }
-        for layer_index in range(len(self.blocks)):
-            for parameter_name in self.blocks[layer_index].state_dict():
-                ema_key = f"ema_target_blocks.{layer_index}.{parameter_name}"
-                student_key = f"blocks.{layer_index}.{parameter_name}"
-                if ema_key not in upgraded and student_key in upgraded:
-                    upgraded[ema_key] = upgraded[student_key].detach().clone()
-
-        return super().load_state_dict(upgraded, strict=strict, assign=assign)

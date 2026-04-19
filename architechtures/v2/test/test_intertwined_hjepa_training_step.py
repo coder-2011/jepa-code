@@ -154,9 +154,7 @@ def test_jepa_loss_updates_ce_path():
     assert any(parameter.grad is not None for parameter in first_block.compressor.parameters())
     assert any(parameter.grad is not None for parameter in first_block.predictor.parameters())
     assert all(parameter.grad is None for parameter in model.final_block.parameters())
-    assert all(parameter.grad is None for parameter in model.ema_target_blocks.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
 
 def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
@@ -266,9 +264,7 @@ def test_sigreg_loss_updates_encoder_path():
 
     assert all(parameter.grad is None for parameter in model.final_block.parameters())
     assert any(parameter.grad is not None for parameter in model.embeddings.parameters())
-    assert all(parameter.grad is None for parameter in model.ema_target_blocks.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
 
 
@@ -279,36 +275,23 @@ def test_training_step_updates_students_then_ema():
     input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]], dtype=torch.long)
 
     student_before = [parameter.detach().clone() for parameter in model.student_parameters()]
-    ema_before = [parameter.detach().clone() for parameter in model.ema_target_blocks.parameters()]
-    output_target_before = [
-        parameter.detach().clone()
-        for parameter in list(model.output_target_norm.parameters())
-        + list(model.output_target_compressor.parameters())
-    ]
+    ema_before = [parameter.detach().clone() for parameter in model.ema_target_encoders.parameters()]
 
     outputs = model(input_ids=input_ids, labels=input_ids)
     outputs["loss"].backward()
 
     assert any(parameter.grad is not None for parameter in model.blocks.parameters())
     assert any(parameter.grad is not None for parameter in model.final_block.parameters())
-    assert all(parameter.grad is None for parameter in model.ema_target_blocks.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_norm.parameters())
-    assert all(parameter.grad is None for parameter in model.output_target_compressor.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
     optimizer.step()
     model.update_ema()
 
     student_after = [parameter.detach() for parameter in model.student_parameters()]
-    ema_after = [parameter.detach() for parameter in model.ema_target_blocks.parameters()]
-    output_target_after = [
-        parameter.detach()
-        for parameter in list(model.output_target_norm.parameters())
-        + list(model.output_target_compressor.parameters())
-    ]
+    ema_after = [parameter.detach() for parameter in model.ema_target_encoders.parameters()]
 
     assert any(not torch.equal(before, after) for before, after in zip(student_before, student_after))
     assert any(not torch.equal(before, after) for before, after in zip(ema_before, ema_after))
-    assert all(torch.equal(before, after) for before, after in zip(output_target_before, output_target_after))
 
 
 def test_scheduled_ema_update_uses_step():
@@ -334,7 +317,7 @@ def test_scheduled_ema_update_uses_step():
     )
 
     block = model.blocks[0]
-    ema_norm = model.ema_target_blocks[0].ce_norm
+    ema_norm = model.ema_target_encoders[0].ce_norm
     ema_before = ema_norm.weight.detach().clone()
 
     with torch.no_grad():

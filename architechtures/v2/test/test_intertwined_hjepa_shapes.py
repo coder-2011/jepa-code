@@ -41,14 +41,15 @@ def make_config():
 
 def manual_causal_attention_output(module: CausalSelfAttention, x: torch.Tensor) -> torch.Tensor:
     batch_size, sequence_length, residual_dim = x.shape
-    q = module.q_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
-    k = module.k_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
-    v = module.v_proj(x).view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    q, k, v = module.c_attn(x).chunk(3, dim=-1)
+    q = q.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    k = k.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    v = v.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
     scores = torch.matmul(q, k.transpose(-2, -1)) * (module.head_dim ** -0.5)
     causal_mask = torch.triu(torch.ones(sequence_length, sequence_length, device=x.device, dtype=torch.bool), diagonal=1)
     probs = torch.softmax(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
     attn_out = torch.matmul(probs, v).transpose(1, 2).contiguous().view(batch_size, sequence_length, residual_dim)
-    return module.out_proj(attn_out)
+    return module.c_proj(attn_out)
 
 
 class ConstantLike(nn.Module):
@@ -230,7 +231,7 @@ def test_config_loads_from_yaml_and_builds_model():
 
     assert len(model.blocks) == config.depth - 1
     assert isinstance(model.final_block, FinalResidualBlock)
-    assert len(model.ema_target_blocks) == config.depth - 1
+    assert len(model.ema_target_encoders) == config.depth - 1
     assert model.embeddings.token_embedding.num_embeddings == config.vocab_size
     assert model.embeddings.position_embedding.num_embeddings == config.max_length
     assert model.embeddings.token_embedding.embedding_dim == config.residual_dim
@@ -249,18 +250,16 @@ def test_model_uses_explicit_small_initialization():
             assert torch.allclose(module.weight, torch.ones_like(module.weight))
         if isinstance(module, CausalSelfAttention):
             for weight in (
-                module.q_proj.weight,
-                module.k_proj.weight,
-                module.v_proj.weight,
-                module.out_proj.weight,
+                module.c_attn.weight,
+                module.c_proj.weight,
             ):
                 assert 0.0 < weight.std().item() < 0.1
-    for block, ema_block in zip(model.blocks, model.ema_target_blocks):
-        assert torch.equal(block.attn_norm.weight, ema_block.attn_norm.weight)
-        assert torch.equal(block.ce_norm.weight, ema_block.ce_norm.weight)
-        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_block.attn.parameters()):
+    for block, ema_encoder in zip(model.blocks, model.ema_target_encoders):
+        assert torch.equal(block.attn_norm.weight, ema_encoder.attn_norm.weight)
+        assert torch.equal(block.ce_norm.weight, ema_encoder.ce_norm.weight)
+        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_encoder.attn.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
-        for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_block.compressor.parameters()):
+        for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_encoder.compressor.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
 
 
@@ -271,10 +270,10 @@ def test_residual_output_projections_use_scaled_init():
     target_std = 0.02 / (2.0 * config.depth) ** 0.5
 
     for block in model.blocks:
-        assert block.attn.out_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
+        assert block.attn.c_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
         assert block.projector[1].weight.std().item() == pytest.approx(target_std, rel=0.35)
 
-    assert model.final_block.attn.out_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
+    assert model.final_block.attn.c_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
     assert model.final_block.mlp[4].weight.std().item() == pytest.approx(target_std, rel=0.35)
 
 
@@ -306,10 +305,10 @@ def test_jepa_target_uses_same_layer_ema_context_path_on_next_token():
         model.blocks[1].ce_norm.weight.fill_(2.0)
 
     target = model.compute_raw_jepa_target_for_layer(0, outputs["states"])
-    ema_target = model.ema_target_blocks[0].encode_context(current_state)[1]
+    ema_target = model.ema_target_encoders[0](current_state)
     live_post_attn = current_state + model.blocks[0].attn(model.blocks[0].attn_norm(current_state))
     live_target = model.blocks[0].compressor(model.blocks[0].ce_norm(live_post_attn))
-    next_block_target = model.ema_target_blocks[1].encode_context(current_state)[1]
+    next_block_target = model.ema_target_encoders[1](current_state)
 
     assert torch.allclose(target, ema_target)
     assert torch.equal(outputs["jepa_valid_mask"][:, -1], torch.zeros_like(outputs["jepa_valid_mask"][:, -1]))
@@ -324,39 +323,10 @@ def test_last_jepa_target_uses_same_layer_next_token_ema_encoder():
     current_state = outputs["states"][len(model.blocks) - 1]
 
     target = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
-    expected = model.ema_target_blocks[-1].encode_context(current_state)[1]
+    expected = model.ema_target_encoders[-1](current_state)
 
     assert torch.allclose(target, expected)
     assert not target.requires_grad
-
-    with torch.no_grad():
-        for parameter in model.output_target_norm.parameters():
-            parameter.zero_()
-        for parameter in model.output_target_compressor.parameters():
-            parameter.zero_()
-
-    unchanged = model.compute_raw_jepa_target_for_layer(len(model.blocks) - 1, outputs["states"])
-    assert torch.allclose(target, unchanged)
-
-
-def test_load_legacy_state_without_ema_context_copies():
-    model = IntertwinedHJEPA(make_config())
-    legacy_state = {
-        key: value
-        for key, value in model.state_dict().items()
-        if not key.startswith("ema_target_blocks.")
-    }
-    loaded = IntertwinedHJEPA(make_config())
-
-    loaded.load_state_dict(legacy_state)
-
-    for block, ema_block in zip(loaded.blocks, loaded.ema_target_blocks):
-        assert torch.equal(block.attn_norm.weight, ema_block.attn_norm.weight)
-        assert torch.equal(block.ce_norm.weight, ema_block.ce_norm.weight)
-        for student_parameter, ema_parameter in zip(block.attn.parameters(), ema_block.attn.parameters()):
-            assert torch.equal(student_parameter, ema_parameter)
-        for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_block.compressor.parameters()):
-            assert torch.equal(student_parameter, ema_parameter)
 
 
 def test_model_forward_returns_expected_shapes():
