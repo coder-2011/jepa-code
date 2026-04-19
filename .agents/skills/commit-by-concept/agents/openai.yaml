@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit by Concept"
+  short_description: "Split git changes into many small concept commits"
+  default_prompt: "Use $commit-by-concept to review the worktree and commit and push changes separately by concept."
