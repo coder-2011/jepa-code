@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
 import unittest
 from pathlib import Path
-
-import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,52 +17,6 @@ sys.modules[SPEC.name] = train_sft
 SPEC.loader.exec_module(train_sft)
 
 
-class DummyTokenizer:
-    pad_token_id = 0
-    eos_token_id = 1
-    eos_token = "<eos>"
-    pad_token = "<pad>"
-    padding_side = "right"
-
-    def __init__(self) -> None:
-        self._vocab = {"<pad>": 0, "<eos>": 1}
-
-    def _token_id(self, token: str) -> int:
-        if token not in self._vocab:
-            self._vocab[token] = len(self._vocab)
-        return self._vocab[token]
-
-    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
-        tokens = text.replace("\n", " \n ").split()
-        token_ids = [self._token_id(token) for token in tokens]
-        if add_special_tokens:
-            token_ids.append(self.eos_token_id)
-        return token_ids
-
-    def apply_chat_template(
-        self,
-        messages: list[dict[str, str]],
-        tokenize: bool,
-        add_generation_prompt: bool,
-    ) -> list[int]:
-        assert tokenize
-        text = []
-        for message in messages:
-            text.append(f"{message['role']}: {message['content']}")
-        if add_generation_prompt:
-            text.append("assistant:")
-        return self.encode("\n".join(text), add_special_tokens=True)
-
-    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
-        inverse = {value: key for key, value in self._vocab.items()}
-        tokens = []
-        for token_id in token_ids:
-            if skip_special_tokens and token_id in {self.pad_token_id, self.eos_token_id}:
-                continue
-            tokens.append(inverse[token_id])
-        return " ".join(tokens)
-
-
 def load_fixture_rows() -> list[dict]:
     fixture_path = ROOT / "tests" / "fixtures" / "nemotron_tiny.jsonl"
     rows = []
@@ -73,46 +26,15 @@ def load_fixture_rows() -> list[dict]:
     return rows
 
 
-class TinyCausalLM(torch.nn.Module):
-    def __init__(self, vocab_size: int = 256, hidden_size: int = 32) -> None:
-        super().__init__()
-        self.embedding = torch.nn.Embedding(vocab_size, hidden_size)
-        self.lm_head = torch.nn.Linear(hidden_size, vocab_size)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-    ):
-        del attention_mask
-        hidden = self.embedding(input_ids)
-        logits = self.lm_head(hidden)
-        loss = None
-        if labels is not None:
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=train_sft.IGNORE_INDEX,
-            )
-        return type("CausalLMOutput", (), {"loss": loss, "logits": logits})()
-
-
 class TrainSFTTests(unittest.TestCase):
-    def test_first_text_field_supports_transformed_hf_aliases(self) -> None:
+    def test_first_text_field_supports_hf_aliases(self) -> None:
         row = {
             "question": "What is 1 + 1?",
             "qwen3_solution": "#### 2",
         }
 
-        tokenized = train_sft.tokenize_supervised_example(
-            tokenizer=DummyTokenizer(),
-            row=row,
-            max_length=128,
-            output_mode="solution_only",
-        )
-
-        self.assertIsNotNone(tokenized)
+        self.assertEqual(train_sft.first_text_field(row, train_sft.PROMPT_FIELDS), "What is 1 + 1?")
+        self.assertEqual(train_sft.first_text_field(row, train_sft.SOLUTION_FIELDS), "#### 2")
 
     def test_build_assistant_target_respects_reasoning_mode(self) -> None:
         rows = load_fixture_rows()
@@ -124,129 +46,43 @@ class TrainSFTTests(unittest.TestCase):
         self.assertNotIn("<thought>", without_reasoning)
         self.assertEqual(without_reasoning, "Hello, nice to meet you.")
 
-    def test_tokenize_supervised_example_marks_completion_tokens(self) -> None:
-        tokenizer = DummyTokenizer()
+    def test_should_keep_row_filters_reasoning_and_category(self) -> None:
         row = load_fixture_rows()[0]
 
-        tokenized = train_sft.tokenize_supervised_example(
-            tokenizer=tokenizer,
-            row=row,
-            max_length=128,
-            output_mode="solution_only",
+        self.assertTrue(train_sft.should_keep_row(row, "on", {"math"}))
+        self.assertFalse(train_sft.should_keep_row(row, "off", {"math"}))
+        self.assertFalse(train_sft.should_keep_row(row, "on", {"chat"}))
+
+    def test_row_to_prompt_completion_uses_trl_prompt_completion_format(self) -> None:
+        row = load_fixture_rows()[0]
+
+        record = train_sft.row_to_prompt_completion(row, "solution_only")
+
+        self.assertEqual(
+            record,
+            {
+                "prompt": [{"role": "user", "content": "What is 2 + 2?"}],
+                "completion": [{"role": "assistant", "content": "#### 4"}],
+            },
         )
 
-        self.assertIsNotNone(tokenized)
-        completion_mask = tokenized["completion_mask"]
-        self.assertEqual(completion_mask[0], 0)
-        self.assertTrue(any(completion_mask))
-        self.assertEqual(len(tokenized["input_ids"]), len(completion_mask))
+    def test_row_to_prompt_completion_requires_prompt_and_completion(self) -> None:
+        self.assertIsNone(train_sft.row_to_prompt_completion({"messages": []}, "solution_only"))
 
-    def test_tokenize_supervised_example_drops_truncated_examples(self) -> None:
-        tokenizer = DummyTokenizer()
-        row = {
-            "problem": "Short prompt",
-            "qwen3-solution": "one two three four five six seven eight",
-            "reasoning": "off",
-        }
-
-        tokenized = train_sft.tokenize_supervised_example(
-            tokenizer=tokenizer,
-            row=row,
-            max_length=6,
-            output_mode="solution_only",
-        )
-
-        self.assertIsNone(tokenized)
-
-    def test_tokenize_supervised_example_requires_dataset_contract(self) -> None:
-        tokenizer = DummyTokenizer()
-        row = {
-            "messages": [
-                {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": "Hello"},
-            ]
-        }
-
-        tokenized = train_sft.tokenize_supervised_example(
-            tokenizer=tokenizer,
-            row=row,
-            max_length=128,
-            output_mode="solution_only",
-        )
-
-        self.assertIsNone(tokenized)
-
-    def test_dataset_filters_reasoning_and_category(self) -> None:
-        tokenizer = DummyTokenizer()
-        rows = load_fixture_rows()
-        dataset = train_sft.NemotronSFTDataset(
-            tokenizer=tokenizer,
-            rows=rows,
-            max_length=128,
-            output_mode="solution_only",
+    def test_build_sft_records_loads_filtered_jsonl(self) -> None:
+        args = argparse.Namespace(
+            train_file=str(ROOT / "tests" / "fixtures" / "nemotron_tiny.jsonl"),
+            max_train_samples=None,
             reasoning_filter="on",
-            categories={"math"},
-        )
-
-        self.assertEqual(len(dataset), 1)
-
-    def test_collator_masks_prompt_and_padding_labels(self) -> None:
-        tokenizer = DummyTokenizer()
-        rows = load_fixture_rows()
-        dataset = train_sft.NemotronSFTDataset(
-            tokenizer=tokenizer,
-            rows=rows,
-            max_length=128,
+            categories=["math"],
             output_mode="solution_only",
         )
 
-        batch = train_sft.SFTCollator(pad_token_id=tokenizer.pad_token_id)(
-            [dataset[0], dataset[1]]
-        )
+        records = train_sft.build_sft_records(args)
 
-        self.assertEqual(batch["labels"][0, 0].item(), train_sft.IGNORE_INDEX)
-        self.assertTrue(torch.any(batch["labels"] != train_sft.IGNORE_INDEX))
-        self.assertTrue(
-            torch.all(batch["labels"][batch["attention_mask"] == 0] == train_sft.IGNORE_INDEX)
-        )
-
-    def test_extract_gsm8k_answer_supports_marker_and_fallback(self) -> None:
-        self.assertEqual(train_sft.extract_gsm8k_answer("work\n#### 12"), "12")
-        self.assertEqual(train_sft.extract_gsm8k_answer("The answer is 12."), "12")
-        self.assertIsNone(train_sft.extract_gsm8k_answer("No numeric answer"))
-
-    def test_should_step_optimizer_flushes_final_partial_accumulation(self) -> None:
-        decisions = [
-            train_sft.should_step_optimizer(batch_index=i, num_batches=7, grad_accum_steps=4)
-            for i in range(7)
-        ]
-
-        self.assertEqual(decisions, [False, False, False, True, False, False, True])
-
-    def test_run_train_step_smoke(self) -> None:
-        tokenizer = DummyTokenizer()
-        rows = load_fixture_rows()
-        dataset = train_sft.NemotronSFTDataset(
-            tokenizer=tokenizer,
-            rows=rows,
-            max_length=128,
-            output_mode="solution_only",
-        )
-        batch = train_sft.SFTCollator(pad_token_id=tokenizer.pad_token_id)([dataset[0], dataset[1]])
-
-        model = TinyCausalLM(vocab_size=256, hidden_size=32)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        loss = train_sft.run_train_step(
-            model=model,
-            optimizer=optimizer,
-            batch=batch,
-            scaler=None,
-            autocast_cm=train_sft.nullcontext(),
-            grad_accum_steps=1,
-            max_grad_norm=1.0,
-        )
-
-        self.assertTrue(torch.isfinite(torch.tensor(loss)))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["prompt"][0]["content"], "What is 2 + 2?")
+        self.assertEqual(records[0]["completion"][0]["content"], "#### 4")
 
 
 if __name__ == "__main__":
