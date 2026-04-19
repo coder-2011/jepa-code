@@ -1,0 +1,1 @@
+architechtures/v2/runs/**/*.pt filter=lfs diff=lfs merge=lfs -text
