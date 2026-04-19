@@ -151,6 +151,13 @@ def init_intertwined_weights(module: nn.Module) -> None:
         nn.init.ones_(module.weight)
 
 
+@torch.no_grad()
+def ema_update(ema_parameters: tuple[torch.Tensor, ...], student_parameters: tuple[torch.Tensor, ...], decay: float) -> None:
+    assert len(ema_parameters) == len(student_parameters), "EMA and student parameter collections must match"
+    torch._foreach_mul_(ema_parameters, decay)
+    torch._foreach_add_(ema_parameters, student_parameters, alpha=1.0 - decay)
+
+
 class IntertwinedBlock(nn.Module):
     def __init__(
         self,
@@ -566,13 +573,12 @@ class IntertwinedHJEPA(nn.Module):
     def update_ema(self, step: int | None = None) -> None:
         # Call after optimizer.step() so the EMA teacher lags the student encoder path.
         momentum = self.ema_momentum_at_step(step)
+        ema_parameters = []
+        student_parameters = []
         for ema_block, block in zip(self.ema_target_blocks, self.blocks):
-            ema_block.attn_norm.weight.lerp_(block.attn_norm.weight, 1.0 - momentum)
-            for ema_parameter, student_parameter in zip(ema_block.attn.parameters(), block.attn.parameters()):
-                ema_parameter.lerp_(student_parameter, 1.0 - momentum)
-            ema_block.ce_norm.weight.lerp_(block.ce_norm.weight, 1.0 - momentum)
-            for ema_parameter, student_parameter in zip(ema_block.compressor.parameters(), block.compressor.parameters()):
-                ema_parameter.lerp_(student_parameter, 1.0 - momentum)
+            ema_parameters.extend((ema_block.attn_norm.weight, *ema_block.attn.parameters(), ema_block.ce_norm.weight, *ema_block.compressor.parameters()))
+            student_parameters.extend((block.attn_norm.weight, *block.attn.parameters(), block.ce_norm.weight, *block.compressor.parameters()))
+        ema_update(tuple(ema_parameters), tuple(student_parameters), momentum)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         upgraded = {
