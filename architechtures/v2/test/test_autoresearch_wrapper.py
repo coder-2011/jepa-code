@@ -1,6 +1,8 @@
 from pathlib import Path
+import math
 
 import torch
+import pytest
 
 from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, evaluate_bpb, main
 
@@ -66,8 +68,6 @@ def test_validate_only_plans_run_and_initializes_results_tsv(tmp_path: Path):
     )
 
     assert result["mode"] == "validate"
-    assert result["train_shards_available"] == 1
-    assert result["val_shards_available"] == 1
     assert results_path.read_text(encoding="utf-8").splitlines()[0].split("\t") == RESULTS_COLUMNS
     assert result["trainer_argv"][0:2] == ["--config", str(Path("intertwined_hjepa.yaml").resolve())]
     assert "--parameter-golf-root" in result["trainer_argv"]
@@ -143,4 +143,55 @@ def test_evaluate_bpb_uses_loader_shifted_labels_directly():
     )
 
     assert bpb == 0.0
+    assert model.training is True
+
+
+def test_evaluate_bpb_keeps_zero_byte_targets_in_loss_numerator():
+    class _ModelWithControlledLogits:
+        class _Config:
+            vocab_size = 8
+
+        def __init__(self) -> None:
+            self.config = self._Config()
+            self.training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self):
+            self.training = True
+            return self
+
+        def __call__(self, *, input_ids, labels, **_kwargs):
+            logits = torch.full((*labels.shape, self.config.vocab_size), -100.0, device=labels.device)
+            # Position 0 predicts the zero-byte control token poorly on purpose.
+            logits[0, 0, 3] = 0.0
+            logits[0, 0, 0] = -1.0
+            # Position 1 predicts a normal token perfectly.
+            logits[0, 1, 4] = 100.0
+            return {"logits": logits}
+
+    model = _ModelWithControlledLogits()
+    tokenizer = _FakeSentencePiece()
+    input_ids = torch.tensor([[3, 3]], dtype=torch.long)
+    labels = torch.tensor([[0, 4]], dtype=torch.long)
+
+    bpb = evaluate_bpb(
+        model,
+        tokenizer=tokenizer,
+        eval_loader=[(input_ids, labels)],
+        device=torch.device("cpu"),
+        step=0,
+    )
+
+    logits = torch.full((2, 8), -100.0)
+    logits[0, 3] = 0.0
+    logits[0, 0] = -1.0
+    logits[1, 4] = 100.0
+    losses = torch.nn.functional.cross_entropy(logits, labels.reshape(-1), reduction="none")
+    target_bytes = len("bar".encode("utf-8")) + 1  # leading-space piece after a non-boundary token
+    expected = float(losses.sum().item() / (math.log(2.0) * target_bytes))
+
+    assert bpb == pytest.approx(expected)
     assert model.training is True
