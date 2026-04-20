@@ -11,11 +11,15 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from scripts.train_qwen_sft import row_messages, tokenize_messages
+from scripts.train_qwen_sft import load_rows as load_training_rows
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Clean and split post-training chat data for Qwen SFT experiments.")
-    parser.add_argument("--input-file", required=True)
+    parser.add_argument("--input-file")
+    parser.add_argument("--dataset-name")
+    parser.add_argument("--dataset-config")
+    parser.add_argument("--dataset-split", default="chat")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--max-length", type=int, default=2048)
@@ -23,10 +27,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reasoning-filter", default="any", choices=["any", "on", "off"])
     parser.add_argument("--category")
     parser.add_argument("--max-examples", type=int)
+    parser.add_argument("--max-raw-rows", type=int)
     parser.add_argument("--train-count", type=int)
     parser.add_argument("--val-count", type=int)
     parser.add_argument("--seed-tag", default="qwen-posttrain-v1")
-    return parser.parse_args(argv)
+    parser.add_argument("--hf-token", default=None)
+    args = parser.parse_args(argv)
+    if bool(args.input_file) == bool(args.dataset_name):
+        parser.error("Provide exactly one of --input-file or --dataset-name.")
+    return args
 
 
 def normalize_reasoning(value: Any) -> str:
@@ -81,7 +90,22 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    raw_rows = [json.loads(line) for line in Path(args.input_file).open("r", encoding="utf-8")]
+    if args.input_file:
+        raw_rows = [json.loads(line) for line in Path(args.input_file).open("r", encoding="utf-8")]
+        if args.max_raw_rows is not None:
+            raw_rows = raw_rows[: args.max_raw_rows]
+        input_descriptor = args.input_file
+    else:
+        loader_args = argparse.Namespace(
+            train_file=None,
+            dataset_name=args.dataset_name,
+            dataset_config=args.dataset_config,
+            dataset_split=args.dataset_split,
+            max_train_samples=args.max_raw_rows,
+            hf_token=args.hf_token,
+        )
+        raw_rows = load_training_rows(loader_args)
+        input_descriptor = args.dataset_name
 
     cleaned: list[dict[str, Any]] = []
     seen_signatures: set[str] = set()
@@ -156,7 +180,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     write_jsonl(val_path, strip_meta(val_rows))
 
     summary = {
-        "input_file": args.input_file,
+        "input_file": input_descriptor,
+        "dataset_split": args.dataset_split if args.dataset_name else None,
+        "dataset_config": args.dataset_config if args.dataset_name else None,
         "model_name": args.model_name,
         "max_length": args.max_length,
         "output_mode": args.output_mode,

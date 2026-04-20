@@ -33,6 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Full-model SFT for Qwen-style chat models.")
     parser.add_argument("--train-file")
     parser.add_argument("--dataset-name")
+    parser.add_argument("--dataset-config")
     parser.add_argument("--dataset-split", default="chat")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-0.8B")
@@ -151,16 +152,37 @@ def load_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
             if args.max_train_samples is not None:
                 rows = rows[: args.max_train_samples]
             return rows
-    if args.dataset_name == NVIDIA_DATASET:
+    if (
+        args.dataset_name == NVIDIA_DATASET
+        and getattr(args, "dataset_config", None) is None
+        and "," not in str(args.dataset_split)
+    ):
         return load_nvidia_rows(args.dataset_split, args.max_train_samples, args.hf_token)
 
     from datasets import load_dataset
 
-    split = args.dataset_split
+    split_names = [part.strip() for part in str(args.dataset_split).split(",") if part.strip()]
+    if not split_names:
+        raise ValueError("No dataset split names provided.")
+    per_split_limit = None
     if args.max_train_samples is not None:
-        split = f"{split}[:{args.max_train_samples}]"
-    dataset = load_dataset(args.dataset_name, split=split, token=args.hf_token or os.environ.get("HF_TOKEN"))
-    return [dict(row) for row in dataset]
+        per_split_limit = math.ceil(args.max_train_samples / len(split_names))
+
+    rows: list[dict[str, Any]] = []
+    for split_name in split_names:
+        split = split_name
+        if per_split_limit is not None:
+            split = f"{split_name}[:{per_split_limit}]"
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config,
+            split=split,
+            token=args.hf_token or os.environ.get("HF_TOKEN"),
+        )
+        rows.extend(dict(row) for row in dataset)
+        if args.max_train_samples is not None and len(rows) >= args.max_train_samples:
+            return rows[: args.max_train_samples]
+    return rows
 
 
 def load_nvidia_rows(split: str, max_rows: int | None, hf_token: str | None) -> list[dict[str, Any]]:
