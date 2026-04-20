@@ -191,8 +191,8 @@ class IntertwinedBlock(nn.Module):
         assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
         x_l_post_attn, z_l = self.encode_context(x_l)
         delta_l = self.predictor(z_l)
-        # Inject the compressed prediction back into the D-wide residual stream.
-        update_l = self.projector(z_l + delta_l)
+        # Only write the predicted change back into the residual stream.
+        update_l = self.projector(delta_l)
         x_next = x_l_post_attn + self.residual_branch_scale * update_l
 
         return {
@@ -322,7 +322,7 @@ class IntertwinedHJEPA(nn.Module):
     h_l_post_attn = h_l + Attention_l(RMSNorm(h_l))
     z_l = CE_l(RMSNorm(h_l_post_attn))
     d_l = Pred_l(z_l)
-    h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
+    h_{l+1} = h_l_post_attn + Proj_l(d_l)
 
     target_z_l[:, t] = sg(EMA_CE_l(h_l_post_attn)[:, t+1]) for every JEPA block
     L_jepa_l = MSE(d_l, target_z_l - z_l)
