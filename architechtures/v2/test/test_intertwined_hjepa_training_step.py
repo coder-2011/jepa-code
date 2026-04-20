@@ -153,6 +153,7 @@ def test_jepa_loss_updates_ce_path():
     assert any(parameter.grad is not None for parameter in first_block.ce_norm.parameters())
     assert any(parameter.grad is not None for parameter in first_block.compressor.parameters())
     assert any(parameter.grad is not None for parameter in first_block.predictor.parameters())
+    assert any(parameter.grad is not None for parameter in first_block.transition_mlp.parameters())
     assert all(parameter.grad is None for parameter in model.final_block.parameters())
     assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
@@ -309,6 +310,9 @@ def test_sigreg_loss_updates_encoder_path():
         assert any(parameter.grad is not None for parameter in block.attn.parameters())
         assert any(parameter.grad is not None for parameter in block.ce_norm.parameters())
         assert any(parameter.grad is not None for parameter in block.compressor.parameters())
+
+    assert any(parameter.grad is not None for parameter in model.blocks[0].transition_mlp.parameters())
+    assert all(parameter.grad is None for parameter in model.blocks[-1].transition_mlp.parameters())
 
     assert all(parameter.grad is None for parameter in model.final_block.parameters())
     assert any(parameter.grad is not None for parameter in model.embeddings.parameters())

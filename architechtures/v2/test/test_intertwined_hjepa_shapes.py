@@ -111,7 +111,7 @@ def test_runtime_residual_branch_scaling_applies_to_jepa_block_updates():
     block.attn = ConstantLike(out_dim=4, fill_value=2.0)
     block.compressor = ConstantLike(out_dim=2, fill_value=1.0)
     block.predictor = ConstantLike(out_dim=2, fill_value=0.0)
-    block.projector = ConstantLike(out_dim=4, fill_value=4.0)
+    block.transition_mlp = ConstantLike(out_dim=4, fill_value=4.0)
     x = torch.zeros(1, 3, 4)
 
     out = block.forward_student(x)
@@ -270,7 +270,7 @@ def test_residual_output_projections_use_scaled_init():
 
     for block in model.blocks:
         assert block.attn.c_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
-        assert block.projector[1].weight.std().item() == pytest.approx(target_std, rel=0.35)
+        assert block.transition_mlp[4].weight.std().item() == pytest.approx(target_std, rel=0.35)
 
     assert model.final_block.attn.c_proj.weight.std().item() == pytest.approx(target_std, rel=0.35)
     assert model.final_block.mlp[4].weight.std().item() == pytest.approx(target_std, rel=0.35)
@@ -374,6 +374,30 @@ def test_model_forward_without_labels_uses_jepa_loss():
     assert torch.equal(outputs["loss"], make_config().lambda_jepa * outputs["loss_jepa"])
     assert torch.equal(outputs["loss_jepa"], torch.stack(outputs["loss_jepa_layers"]).sum())
     assert torch.equal(outputs["loss_sigreg"], torch.zeros_like(outputs["loss_sigreg"]))
+
+
+def test_jepa_block_residual_transition_is_decoupled_from_auxiliary_latent_path():
+    block = IntertwinedBlock(
+        residual_dim=4,
+        compressed_dim=2,
+        predictor_hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        residual_branch_scale=1.0,
+    )
+    block.attn_norm = nn.Identity()
+    block.ce_norm = nn.Identity()
+    block.attn = ConstantLike(out_dim=4, fill_value=0.0)
+    block.compressor = ConstantLike(out_dim=2, fill_value=7.0)
+    block.predictor = ConstantLike(out_dim=2, fill_value=11.0)
+    block.transition_mlp = ConstantLike(out_dim=4, fill_value=5.0)
+    x = torch.zeros(1, 3, 4)
+
+    out = block.forward_student(x)
+
+    assert torch.allclose(out["z"], torch.full_like(out["z"], 7.0))
+    assert torch.allclose(out["delta"], torch.full_like(out["delta"], 11.0))
+    assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 5.0))
 
 
 def test_depth_must_allow_future_layer_target():
