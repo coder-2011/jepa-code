@@ -6,6 +6,32 @@ Intertwined H-JEPA is a predictive residual-stream language model. Each JEPA blo
 
 The predictor remains active at inference. This is not a standard JEPA setup where the predictor can be discarded after training.
 
+## Current Best Configs
+
+Current best compact config:
+
+```text
+compact_16m_auxlight.yaml
+```
+
+Current best compact run:
+
+```text
+compact16m-5k-rowwise-auxlight
+```
+
+with:
+
+```text
+val_bpb = 2.376269 at 5k steps
+```
+
+Current best production-size config:
+
+```text
+future_token_83m_auxlighter.yaml
+```
+
 ## Current Architecture
 
 For config `depth = N`, the implemented model contains:
