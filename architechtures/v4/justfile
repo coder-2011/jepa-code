@@ -1,0 +1,22 @@
+set shell := ["zsh", "-lc"]
+
+test:
+    ./.venv/bin/python -m pytest test test_dataset_helpers.py
+
+test-model:
+    ./.venv/bin/python -m pytest test/test_intertwined_hjepa_shapes.py test/test_intertwined_hjepa_training_step.py
+
+test-data:
+    ./.venv/bin/python -m pytest test_dataset_helpers.py
+
+test-trainer:
+    ./.venv/bin/python -m pytest test/test_train_intertwined_hjepa.py
+
+test-sft:
+    ./.venv/bin/python -m pytest test/test_train_qwen_sft.py
+
+eval-sft *ARGS:
+    ./.venv/bin/python -m scripts.eval_qwen_sft {{ARGS}}
+
+prepare-posttrain *ARGS:
+    ./.venv/bin/python -m scripts.prepare_qwen_posttrain_data {{ARGS}}

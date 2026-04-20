@@ -1,0 +1,36 @@
+[project]
+name = "intertwined-hjepa-v1"
+version = "0.1.0"
+description = "Intertwined H-JEPA training and inspection scripts"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.8.4",
+    "huggingface-hub>=1.11.0",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "sentencepiece>=0.2.0",
+    "torch==2.9.1",
+    "torchao>=0.15.0",
+    "transformers>=5.5.4",
+    "flash-attn-4==4.0.0b9",
+    "wandb>=0.21.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "tokenizers>=0.22.0",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+link-mode = "symlink"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
