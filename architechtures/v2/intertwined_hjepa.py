@@ -162,13 +162,16 @@ class IntertwinedBlock(nn.Module):
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
-        # Compressor path: D -> K, predictor path: K -> K, projector path: K -> D.
+        # Compressor path: D -> K, predictor path: K -> K.
         self.ce_norm = RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
         self.predictor = DeltaPredictor(compressed_dim, predictor_hidden_dim, dropout=dropout)
-        self.projector = nn.Sequential(
-            RMSNorm(compressed_dim),
-            nn.Linear(compressed_dim, residual_dim),
+        self.transition_mlp = nn.Sequential(
+            RMSNorm(residual_dim),
+            nn.Linear(residual_dim, predictor_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(predictor_hidden_dim, residual_dim),
         )
 
     def encode_context(self, x_l: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -191,8 +194,8 @@ class IntertwinedBlock(nn.Module):
         assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
         x_l_post_attn, z_l = self.encode_context(x_l)
         delta_l = self.predictor(z_l)
-        # Inject the compressed prediction back into the D-wide residual stream.
-        update_l = self.projector(z_l + delta_l)
+        # Keep the JEPA latent auxiliary-only; the residual stream has its own transition path.
+        update_l = self.transition_mlp(x_l_post_attn)
         x_next = x_l_post_attn + self.residual_branch_scale * update_l
 
         return {
@@ -322,7 +325,7 @@ class IntertwinedHJEPA(nn.Module):
     h_l_post_attn = h_l + Attention_l(RMSNorm(h_l))
     z_l = CE_l(RMSNorm(h_l_post_attn))
     d_l = Pred_l(z_l)
-    h_{l+1} = h_l_post_attn + Proj_l(z_l + d_l)
+    h_{l+1} = h_l_post_attn + MLP_l(h_l_post_attn)
 
     target_z_l[:, t] = sg(EMA_CE_l(h_l_post_attn)[:, t+1]) for every JEPA block
     L_jepa_l = MSE(d_l, target_z_l - z_l)
@@ -384,7 +387,7 @@ class IntertwinedHJEPA(nn.Module):
         residual_output_std = 0.02 / math.sqrt(2.0 * config.depth)
         for block in self.blocks:
             block.attn.c_proj._init_std = residual_output_std
-            block.projector[1]._init_std = residual_output_std
+            block.transition_mlp[4]._init_std = residual_output_std
         self.final_block.attn.c_proj._init_std = residual_output_std
         self.final_block.mlp[4]._init_std = residual_output_std
         self.apply(init_intertwined_weights)
