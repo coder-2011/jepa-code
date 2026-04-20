@@ -1,2 +1,4 @@
 nanochat/
 autoresearch/
+runs/intertwined_hjepa/best-yml-cpu-smoke/
+runs/intertwined_hjepa/ce-only-44m-10k-b80-20260419/*.pt
