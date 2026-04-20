@@ -1,0 +1,14 @@
+nanochat/
+autoresearch/
+.venv/
+.pytest_cache/
+__pycache__/
+.artifacts/
+.run_ckpts/
+.run_logs/
+.run_smoke_bestcfg/
+.tmpdata_bestcfg/
+runs/
+/1
+/=1.26
+/=6.0
