@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from dataclasses import asdict, replace
@@ -19,6 +20,7 @@ from data.dataset_helpers import (
     select_train_shards,
 )
 from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, warmup_weight
+os.environ.setdefault("TORCHAO_FORCE_SKIP_LOADING_SO_FILES", "1")
 
 
 class _DisabledWandbRun:
@@ -240,9 +242,13 @@ def load_checkpoint(
     rng_state = checkpoint["rng_state"]
     random.setstate(rng_state["python"])
     np.random.set_state(rng_state["numpy"])
-    torch.set_rng_state(rng_state["torch"])
+    # torch.set_rng_state expects a CPU ByteTensor even when the checkpoint was
+    # materialized on CUDA via map_location=device.
+    torch.set_rng_state(rng_state["torch"].to(device="cpu", dtype=torch.uint8))
     if "cuda" in rng_state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng_state["cuda"])
+        torch.cuda.set_rng_state_all(
+            [state.to(device="cpu", dtype=torch.uint8) for state in rng_state["cuda"]]
+        )
     return checkpoint
 
 
