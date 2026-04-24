@@ -54,6 +54,7 @@ class IntertwinedConfig:
     ema_warmup_steps: int = 0
     auxiliary_layer_start: int = 0
     auxiliary_layer_stride: int = 1
+    auxiliary_target_groups: list[dict[str, object]] | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "IntertwinedConfig":
@@ -61,6 +62,15 @@ class IntertwinedConfig:
             values = yaml.safe_load(handle)
         assert isinstance(values, dict), f"Expected mapping config in {path}"
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class AuxiliaryTargetSpec:
+    layer_index: int
+    target_type: str
+    horizon_start: int
+    horizon_end: int
+    weight: float = 1.0
 
 
 class SimpleCompressor(nn.Module):
@@ -387,6 +397,80 @@ def auxiliary_layer_indices(num_layers: int, start: int, stride: int) -> tuple[i
     return tuple(range(start, num_layers, stride))
 
 
+def auxiliary_target_specs(
+    num_layers: int,
+    groups: list[dict[str, object]] | None,
+    default_layer_indices: tuple[int, ...],
+) -> tuple[AuxiliaryTargetSpec, ...]:
+    if groups is None:
+        return tuple(
+            AuxiliaryTargetSpec(
+                layer_index=layer_index,
+                target_type="same_layer",
+                horizon_start=1,
+                horizon_end=1,
+            )
+            for layer_index in default_layer_indices
+        )
+
+    specs = []
+    seen_layers = set()
+    valid_target_types = {"same_layer", "final_layer", "none", "off"}
+    for group in groups:
+        assert isinstance(group, dict), "each auxiliary target group must be a mapping"
+        target_type = str(group.get("target_type", group.get("target", "same_layer")))
+        assert target_type in valid_target_types, f"unsupported auxiliary target_type {target_type!r}"
+        weight = float(group.get("weight", 1.0))
+        assert weight >= 0.0, "auxiliary target weight must be non-negative"
+        layers = group.get("layers")
+        horizon = group.get("horizon", [1, 1])
+        assert isinstance(layers, list) and layers, "auxiliary target group must define non-empty layers"
+        assert isinstance(horizon, list) and len(horizon) == 2, "auxiliary target horizon must be [start, end]"
+        horizon_start = int(horizon[0])
+        horizon_end = int(horizon[1])
+        assert 1 <= horizon_start <= horizon_end, "auxiliary target horizon must satisfy 1 <= start <= end"
+
+        if target_type in {"none", "off"} or weight == 0.0:
+            continue
+        for raw_layer_index in layers:
+            layer_index = int(raw_layer_index)
+            assert 0 <= layer_index < num_layers, "auxiliary target layer index is out of range"
+            assert layer_index not in seen_layers, "auxiliary target groups must not overlap layers"
+            seen_layers.add(layer_index)
+            specs.append(
+                AuxiliaryTargetSpec(
+                    layer_index=layer_index,
+                    target_type=target_type,
+                    horizon_start=horizon_start,
+                    horizon_end=horizon_end,
+                    weight=weight,
+                )
+            )
+    return tuple(sorted(specs, key=lambda spec: spec.layer_index))
+
+
+def future_target_summary(
+    target_sequence: torch.Tensor,
+    current_valid_mask: torch.Tensor,
+    future_valid_mask: torch.Tensor,
+    horizon_start: int,
+    horizon_end: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert target_sequence.ndim == 3, "target_sequence must have shape (B, L, K)"
+    assert current_valid_mask.shape == target_sequence.shape[:2], "current_valid_mask must have shape (B, L)"
+    assert future_valid_mask.shape == target_sequence.shape[:2], "future_valid_mask must have shape (B, L)"
+    total = target_sequence.new_zeros(target_sequence.shape)
+    counts = target_sequence.new_zeros(target_sequence.shape[:2])
+    for horizon in range(horizon_start, horizon_end + 1):
+        if horizon >= target_sequence.shape[1]:
+            continue
+        valid = current_valid_mask[:, :-horizon] & future_valid_mask[:, horizon:]
+        total[:, :-horizon] = total[:, :-horizon] + target_sequence[:, horizon:] * valid.unsqueeze(-1)
+        counts[:, :-horizon] = counts[:, :-horizon] + valid.to(dtype=counts.dtype)
+    summary = total / counts.clamp_min(1).unsqueeze(-1)
+    return summary, counts > 0
+
+
 def load_intertwined_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> list[str]:
     migrated_state_dict = dict(state_dict)
     ignored_legacy_keys = []
@@ -453,11 +537,17 @@ class IntertwinedHJEPA(nn.Module):
         )
         self.auxiliary_layer_start = int(config.auxiliary_layer_start)
         self.auxiliary_layer_stride = int(config.auxiliary_layer_stride)
-        self.auxiliary_layer_indices = auxiliary_layer_indices(
+        default_auxiliary_layer_indices = auxiliary_layer_indices(
             len(self.blocks),
             self.auxiliary_layer_start,
             self.auxiliary_layer_stride,
         )
+        self.auxiliary_target_specs = auxiliary_target_specs(
+            len(self.blocks),
+            config.auxiliary_target_groups,
+            default_auxiliary_layer_indices,
+        )
+        self.auxiliary_layer_indices = tuple(spec.layer_index for spec in self.auxiliary_target_specs)
         self.final_block = FinalResidualBlock(
             residual_dim=config.residual_dim,
             hidden_dim=config.predictor_hidden_dim,
@@ -528,10 +618,19 @@ class IntertwinedHJEPA(nn.Module):
         self,
         layer_index: int,
         post_attn_states: list[torch.Tensor],
+        final_states: torch.Tensor | None = None,
+        target_type: str = "same_layer",
     ) -> torch.Tensor:
-        """Return the unshifted same-layer EMA CE target sequence for a JEPA block."""
+        """Return the unshifted EMA CE target sequence for a JEPA block."""
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
-        target_z_l = self.ema_target_encoders[layer_index](post_attn_states[layer_index])
+        if target_type == "same_layer":
+            source_states = post_attn_states[layer_index]
+        elif target_type == "final_layer":
+            assert final_states is not None, "final_layer auxiliary targets require final_states"
+            source_states = final_states
+        else:
+            raise AssertionError(f"unsupported auxiliary target_type {target_type!r}")
+        target_z_l = self.ema_target_encoders[layer_index](source_states)
         return target_z_l.detach()
 
     def forward(
@@ -585,39 +684,51 @@ class IntertwinedHJEPA(nn.Module):
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
         sequence_valid_mask = None if valid_mask is None else valid_mask.to(torch.bool)
-        jepa_valid_mask = next_token_jepa_mask(input_ids)
+        jepa_current_valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
         if sequence_valid_mask is not None:
-            jepa_valid_mask &= sequence_valid_mask
+            jepa_current_valid_mask &= sequence_valid_mask
+            jepa_future_valid_mask = sequence_valid_mask
+        else:
+            jepa_future_valid_mask = jepa_current_valid_mask
 
         if compute_aux_losses:
-            assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid next-token position"
             zero_loss = logits.new_zeros(())
             jepa_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
             sigreg_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
             targets = [z.detach() for z in compressed]
             active_layer_indices = self.auxiliary_layer_indices
+            jepa_position_count = logits.new_zeros(())
 
             if active_layer_indices:
                 z_stack = torch.stack([compressed[index] for index in active_layer_indices])
-                delta_stack = torch.stack([deltas[index] for index in active_layer_indices])
-                target_stack = torch.stack(
-                    [
-                        self.compute_raw_jepa_target_for_layer(layer_index, post_attn_states)
-                        for layer_index in active_layer_indices
-                    ]
-                )
-                for offset, layer_index in enumerate(active_layer_indices):
-                    targets[layer_index] = target_stack[offset]
-
-                aligned_jepa_valid_mask = jepa_valid_mask[:, :-1].unsqueeze(0).expand(len(active_layer_indices), -1, -1)
-                normalized_z = rms_normalize_last_dim(z_stack[:, :, :-1])
-                normalized_delta = rms_normalize_last_dim(delta_stack[:, :, :-1])
-                normalized_target_delta = rms_normalize_last_dim(target_stack[:, :, 1:].detach()) - normalized_z
-                jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
-                mask = aligned_jepa_valid_mask.unsqueeze(-1)
-                jepa_loss_by_active_layer = (jepa_error * mask).sum(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3)).mul(jepa_error.shape[-1])
-                for loss, layer_index in zip(split_scalars(jepa_loss_by_active_layer), active_layer_indices):
-                    jepa_losses[layer_index] = loss
+                for spec in self.auxiliary_target_specs:
+                    layer_index = spec.layer_index
+                    target_sequence = self.compute_raw_jepa_target_for_layer(
+                        layer_index,
+                        post_attn_states,
+                        final_states=h,
+                        target_type=spec.target_type,
+                    )
+                    targets[layer_index] = target_sequence
+                    target_summary, layer_mask = future_target_summary(
+                        target_sequence,
+                        jepa_current_valid_mask,
+                        jepa_future_valid_mask,
+                        spec.horizon_start,
+                        spec.horizon_end,
+                    )
+                    assert layer_mask.any(), (
+                        "auxiliary target horizon selected no valid positions: "
+                        f"layer={layer_index}, horizon=[{spec.horizon_start}, {spec.horizon_end}]"
+                    )
+                    normalized_z = rms_normalize_last_dim(compressed[layer_index])
+                    normalized_delta = rms_normalize_last_dim(deltas[layer_index])
+                    normalized_target_delta = rms_normalize_last_dim(target_summary.detach()) - normalized_z
+                    jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
+                    mask = layer_mask.unsqueeze(-1)
+                    layer_loss = (jepa_error * mask).sum() / mask.sum().mul(jepa_error.shape[-1])
+                    jepa_losses[layer_index] = layer_loss * spec.weight
+                    jepa_position_count = jepa_position_count + layer_mask.sum()
 
                 if self.config.beta_sigreg > 0:
                     sigreg_input = rms_normalize_last_dim(z_stack)
@@ -629,14 +740,15 @@ class IntertwinedHJEPA(nn.Module):
                         )
                         sigreg_mask = sequence_valid_mask.unsqueeze(0).expand(len(active_layer_indices), -1, -1)
                         sigreg_loss_by_active_layer = self.sigreg(sigreg_input, sample_mask=sigreg_mask, per_layer=True)
-                    for loss, layer_index in zip(split_scalars(sigreg_loss_by_active_layer), active_layer_indices):
-                        sigreg_losses[layer_index] = loss
+                    for loss, spec in zip(split_scalars(sigreg_loss_by_active_layer), self.auxiliary_target_specs):
+                        sigreg_losses[spec.layer_index] = loss * spec.weight
         else:
             zero_loss = logits.new_zeros(())
             # Keep output structure stable on dropout steps without running the teacher path.
             targets = [z.detach() for z in compressed]
             jepa_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
             sigreg_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
+            jepa_position_count = zero_loss.clone()
 
         # Keep per-layer JEPA losses explicit and sum them into the total objective.
         loss_jepa = torch.stack(jepa_losses).sum()
@@ -674,12 +786,21 @@ class IntertwinedHJEPA(nn.Module):
             "auxiliary_layer_start": torch.tensor(self.auxiliary_layer_start, device=logits.device),
             "auxiliary_layer_stride": torch.tensor(self.auxiliary_layer_stride, device=logits.device),
             "num_auxiliary_layers": torch.tensor(len(self.auxiliary_layer_indices), device=logits.device),
+            "auxiliary_target_horizon_start": [
+                torch.tensor(spec.horizon_start, device=logits.device) for spec in self.auxiliary_target_specs
+            ],
+            "auxiliary_target_horizon_end": [
+                torch.tensor(spec.horizon_end, device=logits.device) for spec in self.auxiliary_target_specs
+            ],
+            "auxiliary_target_weight": [
+                torch.tensor(spec.weight, device=logits.device) for spec in self.auxiliary_target_specs
+            ],
             "lambda_jepa": lambda_eff.detach(),
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
             "loss_sigreg_layers": [loss.detach() for loss in sigreg_losses],
-            "jepa_valid_fraction": jepa_valid_mask.float().mean().detach(),
-            "jepa_positions": jepa_valid_mask.sum().detach(),
+            "jepa_valid_fraction": jepa_current_valid_mask.float().mean().detach(),
+            "jepa_positions": jepa_position_count.detach(),
             "z_variance": [z.detach().float().var() for z in compressed],
             "z_std_mean": [std.mean() for std in z_stds],
             "z_std_min": [std.min() for std in z_stds],
