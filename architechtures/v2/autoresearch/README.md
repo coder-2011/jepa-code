@@ -10,6 +10,7 @@ The key design decision is that `autoresearch/train.py` is **not** a second trai
 train.py         Wrapper entrypoint for autoresearch experiments
 program.md       Agent operating instructions for this repo
 results.tsv      Auto-initialized TSV ledger (ignored by git)
+experiment_log.md Human-readable summary of tested ideas and current beliefs
 analysis.ipynb   Optional notebook for post-run analysis
 prepare.py       Legacy upstream file; not used by this repo port
 ```
