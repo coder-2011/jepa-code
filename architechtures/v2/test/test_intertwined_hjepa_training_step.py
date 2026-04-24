@@ -6,7 +6,15 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, jepa_delta_loss, next_token_loss, rms_normalize_last_dim, split_scalars
+from intertwined_hjepa import (
+    IntertwinedConfig,
+    IntertwinedHJEPA,
+    auxiliary_layer_indices,
+    jepa_delta_loss,
+    next_token_loss,
+    rms_normalize_last_dim,
+    split_scalars,
+)
 from sigreg import SIGReg
 
 YAML_CONFIG = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
@@ -219,7 +227,18 @@ def test_stacked_auxiliary_losses_match_individual_layer_losses():
     assert torch.allclose(torch.stack(outputs["loss_sigreg_layers"]), torch.stack(individual_sigreg_losses))
 
 
-def test_auxiliary_losses_can_start_at_upper_layers_only():
+def test_auxiliary_layer_indices_use_start_and_stride():
+    assert auxiliary_layer_indices(num_layers=9, start=0, stride=1) == tuple(range(9))
+    assert auxiliary_layer_indices(num_layers=9, start=6, stride=1) == (6, 7, 8)
+    assert auxiliary_layer_indices(num_layers=9, start=3, stride=2) == (3, 5, 7)
+
+    with pytest.raises(AssertionError, match="start"):
+        auxiliary_layer_indices(num_layers=3, start=4, stride=1)
+    with pytest.raises(AssertionError, match="stride"):
+        auxiliary_layer_indices(num_layers=3, start=0, stride=0)
+
+
+def test_auxiliary_losses_can_start_and_stride_across_layers():
     torch.manual_seed(123)
     model = IntertwinedHJEPA(
         replace(
@@ -228,7 +247,7 @@ def test_auxiliary_losses_can_start_at_upper_layers_only():
             max_length=8,
             residual_dim=16,
             compressed_dim=8,
-            depth=4,
+            depth=5,
             num_heads=4,
             predictor_hidden_dim=32,
             dropout=0.0,
@@ -237,7 +256,8 @@ def test_auxiliary_losses_can_start_at_upper_layers_only():
             beta_sigreg=0.05,
             sigreg_num_slices=8,
             sigreg_n_points=5,
-            auxiliary_layer_start=2,
+            auxiliary_layer_start=1,
+            auxiliary_layer_stride=2,
         )
     )
     input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0]], dtype=torch.long)
@@ -245,12 +265,15 @@ def test_auxiliary_losses_can_start_at_upper_layers_only():
 
     outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
 
+    assert model.auxiliary_layer_indices == (1, 3)
     assert torch.equal(outputs["loss_jepa_layers"][0], torch.zeros_like(outputs["loss_jepa_layers"][0]))
-    assert torch.equal(outputs["loss_jepa_layers"][1], torch.zeros_like(outputs["loss_jepa_layers"][1]))
-    assert outputs["loss_jepa_layers"][2] > 0
+    assert outputs["loss_jepa_layers"][1] > 0
+    assert torch.equal(outputs["loss_jepa_layers"][2], torch.zeros_like(outputs["loss_jepa_layers"][2]))
+    assert outputs["loss_jepa_layers"][3] > 0
     assert torch.equal(outputs["loss_sigreg_layers"][0], torch.zeros_like(outputs["loss_sigreg_layers"][0]))
-    assert torch.equal(outputs["loss_sigreg_layers"][1], torch.zeros_like(outputs["loss_sigreg_layers"][1]))
-    assert outputs["loss_sigreg_layers"][2] > 0
+    assert outputs["loss_sigreg_layers"][1] > 0
+    assert torch.equal(outputs["loss_sigreg_layers"][2], torch.zeros_like(outputs["loss_sigreg_layers"][2]))
+    assert outputs["loss_sigreg_layers"][3] > 0
     assert torch.equal(outputs["loss_jepa"], torch.stack(outputs["loss_jepa_layers"]).sum())
     assert torch.equal(outputs["loss_sigreg"], torch.stack(outputs["loss_sigreg_layers"]).sum())
 

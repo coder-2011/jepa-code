@@ -427,7 +427,7 @@ def test_jepa_block_residual_transition_is_decoupled_from_auxiliary_latent_path(
     assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 5.0))
 
 
-def test_depth_must_allow_future_layer_target():
+def test_depth_must_leave_at_least_one_jepa_block():
     config = replace(make_config(), depth=1)
 
     try:

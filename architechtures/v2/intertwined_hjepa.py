@@ -23,7 +23,7 @@ Core v1 contract:
     h_l_post_attn:    (B, L, D)
     z_l:              (B, L, K)
     delta_l:          (B, L, K)
-    target_z_l:       (B, L, K)
+    target_z_l:       (B, L, K), same-layer EMA CE output before the next-token shift
     logits:           (B, L, vocab_size)
 """
 
@@ -53,6 +53,7 @@ class IntertwinedConfig:
     ema_momentum_final: float = 0.996
     ema_warmup_steps: int = 0
     auxiliary_layer_start: int = 0
+    auxiliary_layer_stride: int = 1
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "IntertwinedConfig":
@@ -86,7 +87,7 @@ class RMSNorm(nn.RMSNorm):
 class DeltaPredictor(nn.Module):
     def __init__(self, compressed_dim: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
-        # Predict the "one-layer-future" delta directly in compressed space.
+        # Predict the same-layer next-token delta directly in compressed space.
         self.net = nn.Sequential(
             RMSNorm(compressed_dim),
             nn.Linear(compressed_dim, hidden_dim),
@@ -314,6 +315,11 @@ def jepa_delta_loss(
     target_z_l: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Loss for already-aligned JEPA tensors.
+
+    In the model forward path, the caller aligns same-layer targets by passing
+    `z_l[:, :-1]`, `delta_l[:, :-1]`, and `target_z_l[:, 1:]`.
+    """
     assert delta_l.shape == z_l.shape == target_z_l.shape, "delta_l, z_l, and target_z_l must have exactly the same shape"
     assert delta_l.ndim >= 2, "delta_l, z_l, and target_z_l must have at least one sample axis and one feature axis"
 
@@ -349,6 +355,7 @@ def next_token_loss(
 
 
 def next_token_jepa_mask(input_ids: torch.Tensor) -> torch.Tensor:
+    """Mask positions that have a next-token JEPA target."""
     assert input_ids.ndim == 2, "input_ids must have shape (B, L)"
     mask = torch.ones_like(input_ids, dtype=torch.bool)
     mask[:, -1] = False
@@ -371,6 +378,13 @@ def split_scalars(x: torch.Tensor) -> list[torch.Tensor]:
     assert x.ndim == 1, "split_scalars expects a 1D tensor"
     # `unbind()` returns scalar views, which can trip torch.compile alias handling.
     return [x[index].clone() for index in range(x.shape[0])]
+
+
+def auxiliary_layer_indices(num_layers: int, start: int, stride: int) -> tuple[int, ...]:
+    assert num_layers >= 0, "num_layers must be non-negative"
+    assert 0 <= start <= num_layers, "auxiliary_layer_start must select a valid JEPA block boundary"
+    assert stride > 0, "auxiliary_layer_stride must be positive"
+    return tuple(range(start, num_layers, stride))
 
 
 def load_intertwined_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> list[str]:
@@ -397,8 +411,8 @@ class IntertwinedHJEPA(nn.Module):
     d_l = Pred_l(z_l)
     h_{l+1} = h_l_post_attn + MLP_l(h_l_post_attn)
 
-    target_z_l[:, t] = sg(EMA_CE_l(h_l_post_attn)[:, t+1]) for every JEPA block
-    L_jepa_l = MSE(d_l, target_z_l - z_l)
+    target_z_l = sg(EMA_CE_l(h_l_post_attn)) for the same JEPA block
+    L_jepa_l = MSE(d_l[:, t], target_z_l[:, t+1] - z_l[:, t])
     """
 
     def __init__(self, config: IntertwinedConfig):
@@ -437,10 +451,13 @@ class IntertwinedHJEPA(nn.Module):
                 for _ in range(jepa_depth)
             ]
         )
-        assert 0 <= config.auxiliary_layer_start <= len(self.blocks), (
-            "auxiliary_layer_start must select a valid JEPA block boundary"
-        )
         self.auxiliary_layer_start = int(config.auxiliary_layer_start)
+        self.auxiliary_layer_stride = int(config.auxiliary_layer_stride)
+        self.auxiliary_layer_indices = auxiliary_layer_indices(
+            len(self.blocks),
+            self.auxiliary_layer_start,
+            self.auxiliary_layer_stride,
+        )
         self.final_block = FinalResidualBlock(
             residual_dim=config.residual_dim,
             hidden_dim=config.predictor_hidden_dim,
@@ -512,6 +529,7 @@ class IntertwinedHJEPA(nn.Module):
         layer_index: int,
         post_attn_states: list[torch.Tensor],
     ) -> torch.Tensor:
+        """Return the unshifted same-layer EMA CE target sequence for a JEPA block."""
         assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
         target_z_l = self.ema_target_encoders[layer_index](post_attn_states[layer_index])
         return target_z_l.detach()
@@ -540,7 +558,7 @@ class IntertwinedHJEPA(nn.Module):
             post_attn_states:  depth states, each (B, L, D)
             z:                 depth - 1 JEPA compressed states, each (B, L, K)
             deltas:            depth - 1 predicted deltas, each (B, L, K)
-            targets:           depth - 1 raw stopped EMA targets, each (B, L, K)
+            targets:           depth - 1 raw stopped same-layer EMA targets, each (B, L, K)
             loss_sigreg_layers: depth - 1 local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
@@ -572,12 +590,12 @@ class IntertwinedHJEPA(nn.Module):
             jepa_valid_mask &= sequence_valid_mask
 
         if compute_aux_losses:
-            assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid future-token position"
+            assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid next-token position"
             zero_loss = logits.new_zeros(())
             jepa_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
             sigreg_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
             targets = [z.detach() for z in compressed]
-            active_layer_indices = list(range(self.auxiliary_layer_start, len(self.blocks)))
+            active_layer_indices = self.auxiliary_layer_indices
 
             if active_layer_indices:
                 z_stack = torch.stack([compressed[index] for index in active_layer_indices])
@@ -654,6 +672,8 @@ class IntertwinedHJEPA(nn.Module):
         diagnostics = {
             "compute_aux_losses": compute_aux_losses,
             "auxiliary_layer_start": torch.tensor(self.auxiliary_layer_start, device=logits.device),
+            "auxiliary_layer_stride": torch.tensor(self.auxiliary_layer_stride, device=logits.device),
+            "num_auxiliary_layers": torch.tensor(len(self.auxiliary_layer_indices), device=logits.device),
             "lambda_jepa": lambda_eff.detach(),
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
