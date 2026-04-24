@@ -4,12 +4,14 @@
 
 This note maps the literature that should inform Intertwined H-JEPA.
 
-The architecture we are considering has three unusual commitments:
+This note includes both the current implementation and older design hypotheses. Current implementation notes should be read as the source of truth when they differ from the proposed cross-depth residual-delta variants below.
+
+Current implementation commitments:
 
 1. JEPA-style prediction happens inside the residual stream, not only at the output.
-2. The target for layer `l` is produced by an EMA copy of the layer `l + 1` compressor, applied to the future residual state from the same forward pass.
-3. The predictor persists at inference and contributes a delta in compressed space.
-4. The residual update projects the enriched compressed state `z_l + delta_l` back into the residual stream.
+2. The target for layer `l` is produced by an EMA copy of the same layer's compressor, applied to that layer's post-attention states.
+3. The JEPA loss predicts the next-token latent delta: `delta_l[:, t] -> target_z_l[:, t+1] - z_l[:, t]`.
+4. The predictor is auxiliary-only; the residual stream is updated by a separate transition MLP, not by projecting `z_l + delta_l`.
 
 That puts the design between JEPA, EMA/self-distillation, predictive coding, residual dynamics, and language-model auxiliary losses.
 
@@ -108,7 +110,7 @@ Core idea:
 
 Design implication:
 
-- The "world model" framing is relevant, but only after the small residual-delta mechanism works.
+- The "world model" framing is relevant, but only after the small auxiliary next-latent mechanism works.
 - Do not overbuild planning/world-model infrastructure in v1.
 
 #### LeJEPA
@@ -123,7 +125,7 @@ Core idea:
 Design implication:
 
 - Collapse diagnostics are mandatory.
-- SIGReg is a serious later addition, but v1 should not depend on it before the basic residual-delta mechanism is proven.
+- SIGReg is a serious later addition, but v1 should not depend on it before the basic auxiliary next-latent mechanism is proven.
 - If EMA plus gating still collapses, SIGReg or a VICReg-style variance/covariance loss becomes a top-priority fix.
 
 #### C-JEPA
@@ -167,7 +169,7 @@ Core idea:
 
 Design implication:
 
-- Keep our implementation modular: compressor, EMA compressor, predictor, projector, regularizer.
+- Keep our implementation modular: compressor, EMA compressor, predictor, transition MLP, regularizer.
 - Avoid hiding the energy/loss contract inside opaque trainer code.
 
 ### Tier 3: Collapse Prevention and Siamese/Masked Precedent
@@ -217,8 +219,8 @@ Core idea:
 
 Design implication:
 
-- Our "predictor delta added into residual stream" is closer to predictive coding than ordinary JEPA heads.
-- We should track whether residual deltas behave like useful correction signals or destabilizing updates.
+- The earlier residual-delta-injection design was closer to predictive coding than ordinary JEPA heads.
+- In the current implementation, the auxiliary predictor does not update the residual stream; track whether the separate transition MLP and auxiliary JEPA loss still produce useful latent dynamics.
 
 #### Dynamic Predictive Coding
 
@@ -231,7 +233,7 @@ Core idea:
 Design implication:
 
 - Supports the idea that prediction should be layer-local and hierarchical.
-- For v1, keep the coupling one-directional and simple: layer `l` predicts a target derived from layer `l + 1`; do not introduce bidirectional recurrent inference yet.
+- Current v1 keeps coupling simple in time rather than depth: layer `l` predicts the next-token target from the same layer's EMA encoder; do not introduce bidirectional recurrent inference yet.
 
 #### NextLat
 
@@ -245,8 +247,8 @@ Core idea:
 Design implication:
 
 - Relevant to our LM-head addition.
-- Key difference: our predictor delta changes inference computation, while NextLat keeps inference unchanged.
-- This is a strong baseline idea: if our delta path is unstable, compare against auxiliary next-latent loss without injecting the delta.
+- Key similarity: the current predictor is an auxiliary next-latent loss and does not change inference computation directly.
+- The older residual-delta-injection variant remains an ablation idea, not the current implementation.
 
 ### Tier 5: Generative and Bidirectional JEPA Variants
 
@@ -298,28 +300,35 @@ Decision:
 - Keep the borrowed tokenizer path and LM head in v1.
 - Test LM-only, JEPA-only, and combined objectives.
 
-### 3. Delta Injection Is The Novel Risk
+### 3. Residual Delta Injection Was The Novel Risk
 
 Most JEPA/data2vec/BYOL systems use predictor heads for training, not as persistent inference-time residual updates. PredNet and predictive coding are the closest precedent for prediction-error dynamics, while NextLat is the closest language adjacent baseline.
 
 Decision:
 
-- Treat residual-delta injection as part of the architecture in the first pass.
+- Current implementation removed residual-delta injection from the base path. Treat it as a controlled ablation if revisited.
 
 ### 4. Teacher Target Placement Needs A Controlled Ablation
 
-The current design says:
+The older cross-depth target design said:
 
 ```text
 y_l = CEbar_{l+1}(h_{l+1})
 delta_target_l = y_l - stopgrad(z_l)
 ```
 
-But literature does not directly settle whether the teacher should be a next-layer compressor, a projected next residual, a frozen teacher, or a projection head.
+The current implementation instead says:
+
+```text
+y_l = CEbar_l(h_l_post_attn)
+delta_target_l[:, t] = y_l[:, t+1] - z_l[:, t]
+```
+
+Literature does not directly settle whether the teacher should be a same-layer next-token compressor, a next-layer compressor, a projected next residual, a frozen teacher, or a projection head.
 
 Decision:
 
-- v1 target: EMA copy of the next compressor applied to `h_{l+1}`. Use `Identity` target projection by keeping one shared `K`.
+- v1 target: EMA copy of the same layer compressor applied to `h_l_post_attn`, shifted by one token in the loss. Use `Identity` target projection by keeping one shared `K`.
 - ablation A: target is normalized `h_{l+1}` projected to `K`.
 - ablation B: target is frozen-teacher compression of `h_{l+1}`.
 - ablation C: target is current student future compression `CE_{l+1}(h_{l+1})` with stop-gradient.
@@ -344,17 +353,18 @@ Add these from the literature pass:
    - norm ratio `||pred|| / ||target||`
 
 2. Delta checks:
-   - direct residual injection changes the residual state
-   - delta norm stays finite
+   - auxiliary predictor delta norm stays finite
+   - transition MLP updates the residual state independently from the auxiliary latent path
 
 3. Objective ablations:
    - LM only
    - JEPA only
    - LM + JEPA
-   - LM + JEPA with residual delta
+   - LM + JEPA with residual-delta injection as an ablation
 
 4. Teacher ablations:
-   - EMA next compressor
+   - EMA same-layer next-token compressor
+   - EMA next-layer compressor
    - projected next residual
    - frozen teacher later if EMA is unstable
 

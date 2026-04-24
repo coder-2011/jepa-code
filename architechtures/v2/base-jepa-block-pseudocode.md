@@ -4,7 +4,7 @@
 
 This file describes the current base Intertwined H-JEPA block implemented in `intertwined_hjepa.py`.
 
-The block is part of an autoregressive language model. Its predictor is not a disposable training head: the predicted compressed delta is projected back into the residual stream during training and inference.
+The block is part of an autoregressive language model. Its JEPA predictor is an auxiliary training head: the predicted compressed delta is used by the JEPA loss, but it is not projected back into the residual stream.
 
 Notation:
 
@@ -30,7 +30,7 @@ h_l_normed     = RMSNorm(h_l)
 h_l_post_attn  = h_l + CausalAttention_l(h_l_normed)
 z_l            = CE_l(h_l_post_attn)
 delta_l        = Pred_l(z_l)
-update_l       = Proj_l(z_l + delta_l)
+update_l       = MLP_l(h_l_post_attn)
 h_{l+1}        = h_l_post_attn + update_l
 ```
 
@@ -43,7 +43,7 @@ delta_l:   (B, L, K)
 update_l:  (B, L, D)
 ```
 
-The residual stream receives `Proj_l(z_l + delta_l)`, not `Proj_l(delta_l)`.
+The residual stream is updated by its own transition MLP. The auxiliary latent path (`z_l`, `delta_l`) is decoupled from the residual update.
 
 ## Block Modules
 
@@ -55,10 +55,10 @@ attn:       causal MultiheadAttention(D), bias=False
 ce_norm:    RMSNorm(D)
 compressor: Linear(D, K) -> GELU -> Dropout -> Linear(K, K)
 predictor:  RMSNorm(K) -> Linear(K, H) -> GELU -> Dropout -> Linear(H, K)
-projector:  RMSNorm(K) -> Linear(K, D)
+transition: RMSNorm(D) -> Linear(D, H) -> GELU -> Dropout -> Linear(H, D)
 ```
 
-The compressor output `z_l` is the JEPA embedding for that layer.
+The compressor output `z_l` is the JEPA embedding for that layer. The predictor output `delta_l` is trained to match the next-token delta in that same layer's EMA-compressed representation.
 
 ## Full Model Shape
 
@@ -71,43 +71,44 @@ N - 1 JEPA blocks
 
 The final block is causal attention plus an MLP. It does not produce `z_l` or `delta_l`.
 
-This gives every JEPA block a future target:
+This gives every JEPA block a same-layer next-token target:
 
 ```text
-JEPA block 0 targets JEPA block 1
-...
-top JEPA block targets the frozen output target encoder applied after the final block
+JEPA block l uses EMA_CE_l(h_l_post_attn) as its target sequence
+delta_l[:, t] predicts EMA_CE_l(h_l_post_attn)[:, t+1] - z_l[:, t]
 ```
 
 ## Teacher Targets
 
-For non-top JEPA block `l`:
+For JEPA block `l`:
 
 ```text
-target_z_l = stopgrad(CEbar_{l+1}(h_{l+1}_post_attn))
+target_z_l = stopgrad(EMA_CE_l(h_l_post_attn))
 ```
 
-`CEbar_{l+1}` is the EMA copy of the next block's full CE path:
+`EMA_CE_l` is the EMA copy of the same block's CE path:
 
 ```text
 EMA CE path = ema_ce_norm + ema_compressor
 ```
 
-For the top JEPA block, there is no next JEPA block. Its target is:
+The temporal shift happens in the loss:
 
 ```text
-target_z_top = stopgrad(output_target_compressor(output_target_norm(h_final_post_attn)))
+target_delta_l[:, t] = target_z_l[:, t+1] - z_l[:, t]
 ```
 
-The output target modules are frozen after initialization.
+The last sequence position has no next-token JEPA target and is masked out.
 
 ## JEPA Loss
 
 Current JEPA loss:
 
 ```text
-L_jepa_l = MSE(delta_l, stopgrad(target_z_l) - z_l)
+L_jepa_l = MSE(delta_l[:, t], stopgrad(target_z_l[:, t+1]) - z_l[:, t])
 ```
+
+In the vectorized implementation this is evaluated at positions `t = 0..L-2`.
 
 Only the teacher target is stopped. The student `z_l` is live, so JEPA gradients train:
 
@@ -138,7 +139,6 @@ SIGReg is not applied to:
 ```text
 delta_l
 z_l + delta_l
-projector(z_l + delta_l)
 h_l_post_attn
 the residual stream directly
 ```
@@ -159,11 +159,9 @@ EMA excludes:
 ```text
 attention
 predictor
-projector
 embeddings
 LM head
 final block
-output target modules
 ```
 
 The EMA update runs after `optimizer.step()`.
