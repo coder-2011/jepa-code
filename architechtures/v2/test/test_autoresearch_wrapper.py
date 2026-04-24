@@ -3,6 +3,7 @@ import math
 
 import torch
 import pytest
+import yaml
 
 from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, evaluate_bpb, main, parse_args as parse_autoresearch_args
 from scripts.train_intertwined_hjepa import parse_args as parse_trainer_args
@@ -74,6 +75,40 @@ def test_validate_only_plans_run_and_initializes_results_tsv(tmp_path: Path):
     assert "--parameter-golf-root" in result["trainer_argv"]
     assert "--max-steps" in result["trainer_argv"]
     assert "--no-compile" not in result["trainer_argv"]
+
+
+def test_validate_only_materializes_autoresearch_config_overrides(tmp_path: Path):
+    results_path = tmp_path / "results.tsv"
+    out_dir = tmp_path / "runs"
+
+    result = main(
+        [
+            "--validate-only",
+            "--profile",
+            "smoke",
+            "--parameter-golf-root",
+            str(tmp_path / "parameter-golf"),
+            "--results-path",
+            str(results_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-name",
+            "override-smoke",
+            "--jepa-dropout-rate",
+            "0.1",
+            "--auxiliary-layer-start",
+            "3",
+            "--auxiliary-layer-stride",
+            "2",
+        ]
+    )
+
+    config_path = Path(result["trainer_argv"][result["trainer_argv"].index("--config") + 1])
+    assert config_path == out_dir / "override-smoke" / "autoresearch_config.yaml"
+    config_values = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config_values["jepa_dropout_rate"] == 0.1
+    assert config_values["auxiliary_layer_start"] == 3
+    assert config_values["auxiliary_layer_stride"] == 2
 
 
 def test_no_compile_flag_is_not_supported():
