@@ -684,12 +684,12 @@ class IntertwinedHJEPA(nn.Module):
         # Final norm stays in the model; the helper only does the D -> vocab projection.
         logits = self.lm_head(self.final_norm(h))
         sequence_valid_mask = None if valid_mask is None else valid_mask.to(torch.bool)
+        jepa_valid_mask = next_token_jepa_mask(input_ids)
         jepa_current_valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        jepa_future_valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
         if sequence_valid_mask is not None:
+            jepa_valid_mask &= sequence_valid_mask
             jepa_current_valid_mask &= sequence_valid_mask
-            jepa_future_valid_mask = sequence_valid_mask
-        else:
-            jepa_future_valid_mask = jepa_current_valid_mask
 
         if compute_aux_losses:
             zero_loss = logits.new_zeros(())
@@ -799,8 +799,9 @@ class IntertwinedHJEPA(nn.Module):
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
             "loss_sigreg_layers": [loss.detach() for loss in sigreg_losses],
-            "jepa_valid_fraction": jepa_current_valid_mask.float().mean().detach(),
-            "jepa_positions": jepa_position_count.detach(),
+            "jepa_valid_fraction": jepa_valid_mask.float().mean().detach(),
+            "jepa_positions": jepa_valid_mask.sum().detach(),
+            "auxiliary_target_positions": jepa_position_count.detach(),
             "z_variance": [z.detach().float().var() for z in compressed],
             "z_std_mean": [std.mean() for std in z_stds],
             "z_std_min": [std.min() for std in z_stds],
