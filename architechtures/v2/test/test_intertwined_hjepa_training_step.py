@@ -219,6 +219,42 @@ def test_stacked_auxiliary_losses_match_individual_layer_losses():
     assert torch.allclose(torch.stack(outputs["loss_sigreg_layers"]), torch.stack(individual_sigreg_losses))
 
 
+def test_auxiliary_losses_can_start_at_upper_layers_only():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.05,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            auxiliary_layer_start=2,
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0]], dtype=torch.long)
+    valid_mask = torch.tensor([[True, True, True, True, True, True], [True, True, True, False, False, False]])
+
+    outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
+
+    assert torch.equal(outputs["loss_jepa_layers"][0], torch.zeros_like(outputs["loss_jepa_layers"][0]))
+    assert torch.equal(outputs["loss_jepa_layers"][1], torch.zeros_like(outputs["loss_jepa_layers"][1]))
+    assert outputs["loss_jepa_layers"][2] > 0
+    assert torch.equal(outputs["loss_sigreg_layers"][0], torch.zeros_like(outputs["loss_sigreg_layers"][0]))
+    assert torch.equal(outputs["loss_sigreg_layers"][1], torch.zeros_like(outputs["loss_sigreg_layers"][1]))
+    assert outputs["loss_sigreg_layers"][2] > 0
+    assert torch.equal(outputs["loss_jepa"], torch.stack(outputs["loss_jepa_layers"]).sum())
+    assert torch.equal(outputs["loss_sigreg"], torch.stack(outputs["loss_sigreg_layers"]).sum())
+
+
 def test_total_loss_includes_local_sigreg_when_enabled():
     model = IntertwinedHJEPA(
         replace(

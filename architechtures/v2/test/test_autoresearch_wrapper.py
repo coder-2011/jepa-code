@@ -4,7 +4,8 @@ import math
 import torch
 import pytest
 
-from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, evaluate_bpb, main
+from autoresearch.train import RESULTS_COLUMNS, build_sentencepiece_luts, evaluate_bpb, main, parse_args as parse_autoresearch_args
+from scripts.train_intertwined_hjepa import parse_args as parse_trainer_args
 
 
 class _FakeSentencePiece:
@@ -72,6 +73,14 @@ def test_validate_only_plans_run_and_initializes_results_tsv(tmp_path: Path):
     assert result["trainer_argv"][0:2] == ["--config", str(Path("intertwined_hjepa.yaml").resolve())]
     assert "--parameter-golf-root" in result["trainer_argv"]
     assert "--max-steps" in result["trainer_argv"]
+    assert "--no-compile" not in result["trainer_argv"]
+
+
+def test_no_compile_flag_is_not_supported():
+    with pytest.raises(SystemExit):
+        parse_trainer_args(["--no-compile"])
+    with pytest.raises(SystemExit):
+        parse_autoresearch_args(["--parameter-golf-root", "/tmp/parameter-golf", "--no-compile"])
 
 
 def test_build_sentencepiece_luts_matches_parameter_golf_semantics():

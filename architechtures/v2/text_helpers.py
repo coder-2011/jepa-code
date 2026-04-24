@@ -43,13 +43,11 @@ class TokenEmbeddings(nn.Module):
         super().__init__()
         self.max_length = max_length
         self.token_embedding = nn.Embedding(vocab_size, residual_dim)
-        self.position_embedding = nn.Embedding(max_length, residual_dim)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         sequence_length = input_ids.shape[1]
         assert sequence_length <= self.max_length, "sequence length exceeds max_length"
-        position_ids = torch.arange(sequence_length, device=input_ids.device)[None, :]
-        return self.token_embedding(input_ids) + self.position_embedding(position_ids)
+        return self.token_embedding(input_ids)
 
 
 class LMHead(nn.Module):

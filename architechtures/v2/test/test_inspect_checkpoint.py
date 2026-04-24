@@ -37,6 +37,19 @@ def test_load_checkpoint_fills_missing_sigreg_config_from_yaml(tmp_path: Path):
     }
 
 
+def test_load_checkpoint_ignores_legacy_absolute_position_embedding(tmp_path: Path):
+    config = IntertwinedConfig.from_yaml("intertwined_hjepa.yaml")
+    model = IntertwinedHJEPA(config)
+    state_dict = model.state_dict()
+    state_dict["embeddings.position_embedding.weight"] = torch.randn(config.max_length, config.residual_dim)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"config": dict(config.__dict__), "model": state_dict}, checkpoint_path)
+
+    _, _, missing_fields = load_checkpoint(checkpoint_path, torch.device("cpu"))
+
+    assert "embeddings.position_embedding.weight" in missing_fields
+
+
 def test_resolve_parameter_golf_assets(tmp_path: Path):
     root = tmp_path / "parameter-golf"
     dataset_root = root / "data" / "datasets" / "fineweb10B_sp1024"

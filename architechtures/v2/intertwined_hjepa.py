@@ -9,6 +9,7 @@ from torch import nn
 
 from sigreg import SIGReg
 from text_helpers import LMHead, TokenEmbeddings
+from utils.flash_attention import flash_attn
 
 """
 Notation used below:
@@ -48,8 +49,10 @@ class IntertwinedConfig:
     sigreg_t_max: float
     sigreg_n_points: int
     tie_weights: bool
+    rope_base: float = 10000.0
     ema_momentum_final: float = 0.996
     ema_warmup_steps: int = 0
+    auxiliary_layer_start: int = 0
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "IntertwinedConfig":
@@ -97,20 +100,55 @@ class DeltaPredictor(nn.Module):
         return self.net(x)
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int, base: float = 10000.0):
+        super().__init__()
+        assert dim % 2 == 0, "RoPE requires an even head dimension"
+        self.max_seq_len = max_seq_len
+        inv_freq = 1.0 / (float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        angles = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("cos_cached", angles.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", angles.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, seq_len: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        assert seq_len <= self.max_seq_len, f"sequence length {seq_len} exceeds RoPE cache length {self.max_seq_len}"
+        return (
+            self.cos_cached[:, :, :seq_len, :].to(dtype=dtype),
+            self.sin_cached[:, :, :seq_len, :].to(dtype=dtype),
+        )
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def apply_rotary_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    assert x.shape[-1] % 2 == 0, "RoPE requires an even last dimension"
+    return (x * cos) + (rotate_half(x) * sin)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
         residual_dim: int,
         num_heads: int,
+        max_length: int,
+        rope_base: float = 10000.0,
         dropout: float = 0.0,
     ):
         super().__init__()
         assert residual_dim % num_heads == 0, "residual_dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = residual_dim // num_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.dropout = dropout
         self.c_attn = nn.Linear(residual_dim, 3 * residual_dim, bias=False)
         self.c_proj = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.rotary = RotaryEmbedding(self.head_dim, max_seq_len=max_length, base=rope_base)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.ndim == 3, "x must have shape (B, L, D)"
@@ -119,16 +157,17 @@ class CausalSelfAttention(nn.Module):
         q = q.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+        cos, sin = self.rotary(sequence_length, dtype=q.dtype)
+        q = apply_rotary_embedding(q, cos, sin)
+        k = apply_rotary_embedding(k, cos, sin)
+        attn_out = flash_attn.flash_attn_func(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            causal=True,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
         )
-
-        return self.c_proj(attn_out.transpose(1, 2).reshape(batch_size, sequence_length, residual_dim))
+        return self.c_proj(attn_out.reshape(batch_size, sequence_length, residual_dim))
 
 
 def init_intertwined_weights(module: nn.Module) -> None:
@@ -153,7 +192,9 @@ class IntertwinedBlock(nn.Module):
         residual_dim: int,
         compressed_dim: int,
         predictor_hidden_dim: int,
+        max_length: int,
         num_heads: int = 1,
+        rope_base: float = 10000.0,
         dropout: float = 0.0,
         residual_branch_scale: float = 1.0,
     ):
@@ -161,7 +202,13 @@ class IntertwinedBlock(nn.Module):
         self.residual_branch_scale = float(residual_branch_scale)
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = RMSNorm(residual_dim)
-        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
+        self.attn = CausalSelfAttention(
+            residual_dim=residual_dim,
+            num_heads=num_heads,
+            max_length=max_length,
+            rope_base=rope_base,
+            dropout=dropout,
+        )
         # Compressor path: D -> K, predictor path: K -> K.
         self.ce_norm = RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
@@ -227,14 +274,22 @@ class FinalResidualBlock(nn.Module):
         self,
         residual_dim: int,
         hidden_dim: int,
+        max_length: int,
         num_heads: int = 1,
+        rope_base: float = 10000.0,
         dropout: float = 0.0,
         residual_branch_scale: float = 1.0,
     ):
         super().__init__()
         self.residual_branch_scale = float(residual_branch_scale)
         self.attn_norm = RMSNorm(residual_dim)
-        self.attn = CausalSelfAttention(residual_dim=residual_dim, num_heads=num_heads, dropout=dropout)
+        self.attn = CausalSelfAttention(
+            residual_dim=residual_dim,
+            num_heads=num_heads,
+            max_length=max_length,
+            rope_base=rope_base,
+            dropout=dropout,
+        )
         self.mlp = nn.Sequential(
             RMSNorm(residual_dim),
             nn.Linear(residual_dim, hidden_dim),
@@ -318,6 +373,21 @@ def split_scalars(x: torch.Tensor) -> list[torch.Tensor]:
     return [x[index].clone() for index in range(x.shape[0])]
 
 
+def load_intertwined_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> list[str]:
+    migrated_state_dict = dict(state_dict)
+    ignored_legacy_keys = []
+    legacy_position_key = "embeddings.position_embedding.weight"
+    if legacy_position_key in migrated_state_dict:
+        migrated_state_dict.pop(legacy_position_key)
+        ignored_legacy_keys.append(legacy_position_key)
+    incompatible = model.load_state_dict(migrated_state_dict, strict=False)
+    assert not incompatible.missing_keys and not incompatible.unexpected_keys, (
+        "Unexpected checkpoint mismatch after RoPE migration: "
+        f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+    )
+    return ignored_legacy_keys
+
+
 class IntertwinedHJEPA(nn.Module):
     """
     For depth=N, the model has N-1 JEPA blocks and one normal final residual block.
@@ -345,7 +415,7 @@ class IntertwinedHJEPA(nn.Module):
         self.ema_warmup_steps = int(config.ema_warmup_steps)
         residual_branch_scale = 1.0 / math.sqrt(config.depth)
 
-        # Plain learned token + position embeddings for v1.
+        # Token embeddings stay learned; positions enter through RoPE inside attention.
         self.embeddings = TokenEmbeddings(
             vocab_size=config.vocab_size,
             max_length=config.max_length,
@@ -358,17 +428,25 @@ class IntertwinedHJEPA(nn.Module):
                     residual_dim=config.residual_dim,
                     compressed_dim=config.compressed_dim,
                     predictor_hidden_dim=config.predictor_hidden_dim,
+                    max_length=config.max_length,
                     num_heads=config.num_heads,
+                    rope_base=config.rope_base,
                     dropout=config.dropout,
                     residual_branch_scale=residual_branch_scale,
                 )
                 for _ in range(jepa_depth)
             ]
         )
+        assert 0 <= config.auxiliary_layer_start <= len(self.blocks), (
+            "auxiliary_layer_start must select a valid JEPA block boundary"
+        )
+        self.auxiliary_layer_start = int(config.auxiliary_layer_start)
         self.final_block = FinalResidualBlock(
             residual_dim=config.residual_dim,
             hidden_dim=config.predictor_hidden_dim,
+            max_length=config.max_length,
             num_heads=config.num_heads,
+            rope_base=config.rope_base,
             dropout=config.dropout,
             residual_branch_scale=residual_branch_scale,
         )
@@ -495,38 +573,46 @@ class IntertwinedHJEPA(nn.Module):
 
         if compute_aux_losses:
             assert jepa_valid_mask.any(), "next-token JEPA requires at least one valid future-token position"
-            z_stack = torch.stack(compressed)
-            delta_stack = torch.stack(deltas)
-            target_stack = torch.stack(
-                [
-                    self.compute_raw_jepa_target_for_layer(layer_index, post_attn_states)
-                    for layer_index in range(len(self.blocks))
-                ]
-            )
-            targets = list(target_stack.unbind(dim=0))
+            zero_loss = logits.new_zeros(())
+            jepa_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
+            sigreg_losses = [zero_loss.clone() for _ in range(len(self.blocks))]
+            targets = [z.detach() for z in compressed]
+            active_layer_indices = list(range(self.auxiliary_layer_start, len(self.blocks)))
 
-            aligned_jepa_valid_mask = jepa_valid_mask[:, :-1].unsqueeze(0).expand(len(self.blocks), -1, -1)
-            normalized_z = rms_normalize_last_dim(z_stack[:, :, :-1])
-            normalized_delta = rms_normalize_last_dim(delta_stack[:, :, :-1])
-            normalized_target_delta = rms_normalize_last_dim(target_stack[:, :, 1:].detach()) - normalized_z
-            jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
-            mask = aligned_jepa_valid_mask.unsqueeze(-1)
-            jepa_loss_by_layer = (jepa_error * mask).sum(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3)).mul(jepa_error.shape[-1])
-            jepa_losses = split_scalars(jepa_loss_by_layer)
+            if active_layer_indices:
+                z_stack = torch.stack([compressed[index] for index in active_layer_indices])
+                delta_stack = torch.stack([deltas[index] for index in active_layer_indices])
+                target_stack = torch.stack(
+                    [
+                        self.compute_raw_jepa_target_for_layer(layer_index, post_attn_states)
+                        for layer_index in active_layer_indices
+                    ]
+                )
+                for offset, layer_index in enumerate(active_layer_indices):
+                    targets[layer_index] = target_stack[offset]
 
-            if self.config.beta_sigreg > 0:
-                sigreg_input = rms_normalize_last_dim(z_stack)
-                if sequence_valid_mask is None:
-                    sigreg_loss_by_layer = self.sigreg(sigreg_input, per_layer=True)
-                else:
-                    assert sequence_valid_mask.shape == sigreg_input.shape[1:-1], (
-                        "valid_mask must match batch and sequence dimensions of SIGReg inputs"
-                    )
-                    sigreg_mask = sequence_valid_mask.unsqueeze(0).expand(len(self.blocks), -1, -1)
-                    sigreg_loss_by_layer = self.sigreg(sigreg_input, sample_mask=sigreg_mask, per_layer=True)
-                sigreg_losses = split_scalars(sigreg_loss_by_layer)
-            else:
-                sigreg_losses = []
+                aligned_jepa_valid_mask = jepa_valid_mask[:, :-1].unsqueeze(0).expand(len(active_layer_indices), -1, -1)
+                normalized_z = rms_normalize_last_dim(z_stack[:, :, :-1])
+                normalized_delta = rms_normalize_last_dim(delta_stack[:, :, :-1])
+                normalized_target_delta = rms_normalize_last_dim(target_stack[:, :, 1:].detach()) - normalized_z
+                jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
+                mask = aligned_jepa_valid_mask.unsqueeze(-1)
+                jepa_loss_by_active_layer = (jepa_error * mask).sum(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3)).mul(jepa_error.shape[-1])
+                for loss, layer_index in zip(split_scalars(jepa_loss_by_active_layer), active_layer_indices):
+                    jepa_losses[layer_index] = loss
+
+                if self.config.beta_sigreg > 0:
+                    sigreg_input = rms_normalize_last_dim(z_stack)
+                    if sequence_valid_mask is None:
+                        sigreg_loss_by_active_layer = self.sigreg(sigreg_input, per_layer=True)
+                    else:
+                        assert sequence_valid_mask.shape == sigreg_input.shape[1:-1], (
+                            "valid_mask must match batch and sequence dimensions of SIGReg inputs"
+                        )
+                        sigreg_mask = sequence_valid_mask.unsqueeze(0).expand(len(active_layer_indices), -1, -1)
+                        sigreg_loss_by_active_layer = self.sigreg(sigreg_input, sample_mask=sigreg_mask, per_layer=True)
+                    for loss, layer_index in zip(split_scalars(sigreg_loss_by_active_layer), active_layer_indices):
+                        sigreg_losses[layer_index] = loss
         else:
             zero_loss = logits.new_zeros(())
             # Keep output structure stable on dropout steps without running the teacher path.
@@ -567,6 +653,7 @@ class IntertwinedHJEPA(nn.Module):
         z_stds = [z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in compressed]
         diagnostics = {
             "compute_aux_losses": compute_aux_losses,
+            "auxiliary_layer_start": torch.tensor(self.auxiliary_layer_start, device=logits.device),
             "lambda_jepa": lambda_eff.detach(),
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],

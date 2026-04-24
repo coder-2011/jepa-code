@@ -11,7 +11,7 @@ import sentencepiece as spm
 import torch
 
 from data.dataset_helpers import build_eval_dataloader, dataset_dir_for_variant, list_split_shards
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, warmup_weight
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, load_intertwined_state_dict, warmup_weight
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -112,9 +112,9 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[IntertwinedHJEPA,
         config_values[name] = getattr(yaml_config, name)
     config = IntertwinedConfig(**config_values)
     model = IntertwinedHJEPA(config).to(device)
-    model.load_state_dict(checkpoint["model"])
+    ignored_state_keys = load_intertwined_state_dict(model, checkpoint["model"])
     model.eval()
-    return model, checkpoint, missing_fields
+    return model, checkpoint, missing_fields + ignored_state_keys
 
 
 def move_batch(batch: tuple[torch.Tensor, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

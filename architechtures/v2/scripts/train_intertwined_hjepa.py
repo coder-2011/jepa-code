@@ -19,7 +19,7 @@ from data.dataset_helpers import (
     resolve_dataset_root,
     select_train_shards,
 )
-from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, warmup_weight
+from intertwined_hjepa import IntertwinedConfig, IntertwinedHJEPA, load_intertwined_state_dict, warmup_weight
 os.environ.setdefault("TORCHAO_FORCE_SKIP_LOADING_SO_FILES", "1")
 
 
@@ -64,9 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="tensorwise",
         choices=["tensorwise", "rowwise", "rowwise_with_gw_hp"],
     )
-    parser.add_argument("--compile", dest="compile_model", action="store_true")
-    parser.add_argument("--no-compile", dest="compile_model", action="store_false")
-    parser.set_defaults(compile_model=None)
+    parser.add_argument("--compile", action="store_true", help="Compile training on non-CUDA devices; CUDA always compiles")
     return parser.parse_args(argv)
 
 
@@ -237,8 +235,16 @@ def load_checkpoint(
     device: torch.device,
 ) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    ignored_state_keys = load_intertwined_state_dict(model, checkpoint["model"])
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    except ValueError as exc:
+        if ignored_state_keys:
+            raise ValueError(
+                "Checkpoint uses the legacy absolute-position embedding layout; model weights were migrated to RoPE, "
+                "but optimizer-state resume is not supported for that legacy checkpoint."
+            ) from exc
+        raise
     rng_state = checkpoint["rng_state"]
     random.setstate(rng_state["python"])
     np.random.set_state(rng_state["numpy"])
@@ -346,7 +352,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     config = merge_config(load_config(Path(args.config)), args)
     device = torch.device(args.device or default_device())
     compute_dtype = detect_compute_dtype(device, args.dtype)
-    compile_model = args.compile_model if args.compile_model is not None else device.type == "cuda"
+    compile_model = device.type == "cuda" or args.compile
     non_blocking = device.type == "cuda"
     synchronize = build_synchronize(device)
     if device.type == "cuda":

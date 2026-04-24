@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from intertwined_hjepa import (
+    apply_rotary_embedding,
     CausalSelfAttention,
     FinalResidualBlock,
     IntertwinedBlock,
@@ -45,6 +46,9 @@ def manual_causal_attention_output(module: CausalSelfAttention, x: torch.Tensor)
     q = q.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
     k = k.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
     v = v.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    cos, sin = module.rotary(sequence_length, dtype=q.dtype)
+    q = apply_rotary_embedding(q, cos, sin)
+    k = apply_rotary_embedding(k, cos, sin)
     scores = torch.matmul(q, k.transpose(-2, -1)) * (module.head_dim ** -0.5)
     causal_mask = torch.triu(torch.ones(sequence_length, sequence_length, device=x.device, dtype=torch.bool), diagonal=1)
     probs = torch.softmax(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
@@ -68,6 +72,7 @@ def test_block_student_forward_shapes():
         residual_dim=config.residual_dim,
         compressed_dim=config.compressed_dim,
         predictor_hidden_dim=config.predictor_hidden_dim,
+        max_length=config.max_length,
         num_heads=config.num_heads,
         dropout=config.dropout,
     )
@@ -86,6 +91,7 @@ def test_final_residual_block_shapes():
     block = FinalResidualBlock(
         residual_dim=config.residual_dim,
         hidden_dim=config.predictor_hidden_dim,
+        max_length=config.max_length,
         num_heads=config.num_heads,
         dropout=config.dropout,
     )
@@ -102,6 +108,7 @@ def test_runtime_residual_branch_scaling_applies_to_jepa_block_updates():
         residual_dim=4,
         compressed_dim=2,
         predictor_hidden_dim=8,
+        max_length=8,
         num_heads=2,
         dropout=0.0,
         residual_branch_scale=0.5,
@@ -124,6 +131,7 @@ def test_runtime_residual_branch_scaling_applies_to_final_block_updates():
     block = FinalResidualBlock(
         residual_dim=4,
         hidden_dim=8,
+        max_length=8,
         num_heads=2,
         dropout=0.0,
         residual_branch_scale=0.5,
@@ -144,6 +152,7 @@ def test_causal_self_attention_matches_manual_reference():
     attention = CausalSelfAttention(
         residual_dim=config.residual_dim,
         num_heads=config.num_heads,
+        max_length=config.max_length,
         dropout=0.0,
     ).eval()
     x = torch.randn(2, 5, config.residual_dim)
@@ -160,6 +169,7 @@ def test_causal_self_attention_ignores_future_tokens():
     attention = CausalSelfAttention(
         residual_dim=config.residual_dim,
         num_heads=config.num_heads,
+        max_length=config.max_length,
         dropout=0.0,
     ).eval()
     x = torch.randn(2, 5, config.residual_dim)
@@ -201,6 +211,20 @@ def test_text_helpers_shapes():
     assert untied_head(hidden_states).shape == (*input_ids.shape, config.vocab_size)
 
 
+def test_token_embeddings_are_position_free():
+    embeddings = TokenEmbeddings(vocab_size=16, max_length=8, residual_dim=6)
+    input_ids = torch.tensor([[3, 3, 3]], dtype=torch.long)
+    hidden_states = embeddings(input_ids)
+
+    assert torch.allclose(hidden_states[:, 0], hidden_states[:, 1])
+    assert torch.allclose(hidden_states[:, 1], hidden_states[:, 2])
+
+
+def test_causal_self_attention_requires_even_head_dim_for_rope():
+    with pytest.raises(AssertionError, match="head_dim must be even for RoPE"):
+        CausalSelfAttention(residual_dim=6, num_heads=2, max_length=8)
+
+
 def test_hf_tokenizer_wrapper_offline():
     tokenizers = pytest.importorskip("tokenizers")
     transformers = pytest.importorskip("transformers")
@@ -233,8 +257,10 @@ def test_config_loads_from_yaml_and_builds_model():
     assert isinstance(model.final_block, FinalResidualBlock)
     assert len(model.ema_target_encoders) == config.depth - 1
     assert model.embeddings.token_embedding.num_embeddings == config.vocab_size
-    assert model.embeddings.position_embedding.num_embeddings == config.max_length
     assert model.embeddings.token_embedding.embedding_dim == config.residual_dim
+    for block in model.blocks:
+        assert block.attn.rotary.cos_cached.shape == (1, 1, config.max_length, block.attn.head_dim)
+    assert model.final_block.attn.rotary.cos_cached.shape == (1, 1, config.max_length, model.final_block.attn.head_dim)
 
 
 def test_model_uses_explicit_small_initialization():
@@ -242,7 +268,7 @@ def test_model_uses_explicit_small_initialization():
     model = IntertwinedHJEPA(make_config())
 
     assert 0.0 < model.embeddings.token_embedding.weight.std().item() < 0.1
-    assert 0.0 < model.embeddings.position_embedding.weight.std().item() < 0.1
+    assert not hasattr(model.embeddings, "position_embedding")
     for module in model.modules():
         if isinstance(module, nn.Linear) and module.bias is not None:
             assert torch.count_nonzero(module.bias) == 0
@@ -381,6 +407,7 @@ def test_jepa_block_residual_transition_is_decoupled_from_auxiliary_latent_path(
         residual_dim=4,
         compressed_dim=2,
         predictor_hidden_dim=8,
+        max_length=8,
         num_heads=2,
         dropout=0.0,
         residual_branch_scale=1.0,
