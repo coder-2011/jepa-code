@@ -172,6 +172,17 @@ Top-third projected residual-stream delta target over mean future span t+1..t+4:
 - Final eval: `loss_lm=3.646943`, `loss_jepa=0.897406`, `loss_sigreg=4.559570`
 - Conclusion: not competitive with best current mean target; weaker LM auxiliary tradeoff.
 
+Top-third same-layer mean target with stronger auxiliary weights:
+
+- `compact16m-5k-topthird-mean-t1-t4-auxup-20260425`: `val_bpb=2.120223`
+- Config: `sweep_configs/compact_16m_topthird_mean_t1_t4_auxup.yaml`
+- Change tested: same current-best top-third mean target (`layers 6,7,8`, horizon `t+1..t+4`, 10% aux dropout), but increased auxiliary weights from `lambda_jepa=0.2`, `beta_sigreg=0.005` to `lambda_jepa=0.25`, `beta_sigreg=0.0075`.
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.641958`, `loss_jepa=1.818791`, `loss_sigreg=7.882812`
+- Throughput: `21686.934701` tokens/sec, wall time `295.211317` seconds
+- Runtime note: FA-4 attempted and failed internally, then the attention wrapper fell back to PyTorch SDPA; the run completed normally.
+- Conclusion: heavier auxiliary weighting regressed versus the current best by `0.008236` BPB. Keep the current-best `lambda_jepa=0.2`, `beta_sigreg=0.005` unless another architecture changes the loss balance.
+
 Top-third + 25% dropout vs alternatives:
 
 - `compact16m-5k-topthird-drop25-20260425`: `val_bpb=2.117229`, effective dropout fraction `0.247800`
@@ -206,6 +217,29 @@ Direct final-layer span state prediction:
 - Final eval: `loss_lm=3.659471`, `loss_jepa=1.937029`, `loss_sigreg=44.171875`
 - Throughput: `22414.918147` tokens/sec, wall time `292.154382` seconds
 - Conclusion: this was worse than top-third + 10% delta prediction by `0.016229` BPB. The lower JEPA loss did not translate to better LM BPB, and SIGReg pressure rose sharply. The implementation was committed for history and then reverted from the active code.
+
+Final-layer future teacher without SIGReg:
+
+- `compact16m-5k-topthird-final-future-nosigreg-t1-t4-20260425`: `val_bpb=2.143707`
+- Config: `sweep_configs/compact_16m_topthird_final_future_nosigreg_t1_t4.yaml`
+- Change tested: layers `6,7,8` predicted a final-layer future teacher over `t+1..t+4`; SIGReg was disabled for this teacher objective (`beta_sigreg=0.0`).
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.682296`, `loss_jepa=0.738716`, `loss_sigreg=0.000000`
+- Throughput: `24074.658894` tokens/sec, wall time `326.998018` seconds
+- Conclusion: clean final-layer future teacher without SIGReg was substantially worse than the current same-layer mean target by `0.031720` BPB. Low JEPA loss here was not a useful signal; this objective made LM worse and should stay reverted from the active path.
+
+Split content+dynamics latents:
+
+- Implementation status: supported in code, not yet measured by a full autoresearch run.
+- Config prepared: `sweep_configs/compact_16m_topthird_mean_t1_t4_split_latents.yaml`
+- Intended run target: current-best top-third mean setup (`layers 6,7,8`, horizon `t+1..t+4`, 10% aux dropout), with the latent budget split into `content_dim=112` and `dynamics_dim=112` while preserving the old total `compressed_dim=224`.
+- Contract:
+  - `z_content` feeds SIGReg / stable representation pressure.
+  - `z_dynamics` feeds JEPA prediction, EMA targets, and predicted deltas.
+  - Non-split configs retain the old single-latent behavior.
+- Why this is worth testing: the previous single latent had to be both stable under SIGReg and predictive under JEPA. Splitting the same total width tests whether role conflict, not total width, is limiting the current best.
+- Verification: focused model tests passed (`46 passed`) and `autoresearch/train.py --validate-only --profile smoke` accepted the split config.
+- Current state: implementation is smoke-checked but not yet measured by a full training run. Do not compare it to BPB results until a completed row exists in `results.tsv`.
 
 Still unrun but now supported:
 
@@ -271,6 +305,9 @@ uv run -- python autoresearch/train.py \
 - Auxiliaries are useful, but too much auxiliary weight is harmful.
 - Layer selection is the strongest recent gain; 10% auxiliary dropout is a consistent gain on top-third setups.
 - 25% auxiliary dropout is too high or at least not beneficial at the current 5k-step budget.
+- Increasing the current-best auxiliary weights to `lambda_jepa=0.25`, `beta_sigreg=0.0075` regressed BPB.
 - Broad six-layer multi-horizon supervision regressed; if trying horizons again, keep the active layer count closer to the top-third winner.
 - Directly matching top-third states to final-layer future spans regressed at unchanged SIGReg weighting.
+- Final-layer future teacher without SIGReg also regressed; low JEPA loss from that objective did not mean better LM.
+- Split content+dynamics latents are implemented for a same-total-width test, but are not yet a measured result.
 - Float8 and FA-4 are not current wins in this environment; PyTorch bf16 compile with SDPA fallback is the practical path.
