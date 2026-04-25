@@ -8,14 +8,21 @@ This is the human-readable log for what has been tried. The row-level source of 
 
 Best compact run so far:
 
-- Run: `compact16m-5k-topthird-drop10-20260424`
-- Config: `runs/autoresearch/compact16m-5k-topthird-drop10-20260424/autoresearch_config.yaml`
+- Run: `compact16m-5k-topthird-mean-t1-t4-20260425`
+- Config: `sweep_configs/compact_16m_topthird_mean_t1_t4.yaml`
 - Training: `5000` steps, `5.12M` tokens, CUDA bf16, compile on
 - Active auxiliary layers: JEPA blocks `6, 7, 8` only
 - Effective auxiliary dropout fraction: `0.098600`
+- Result: `val_bpb=2.111987`
+- Final eval: `loss_lm=3.627675`, `loss_jepa=1.883511`, `loss_sigreg=8.630859`
+- Note: this replaced top-third+10% dropout (`2.114118`) as the current best compact BPB. Margin is small (`0.002131` BPB), but consistently strongest among tested 5k compact runs so far.
+
+Second-best compact result to compare against:
+
+- Run: `compact16m-5k-topthird-drop10-20260424`
+- Config: `runs/autoresearch/compact16m-5k-topthird-drop10-20260424/autoresearch_config.yaml`
 - Result: `val_bpb=2.114118`
 - Final eval: `loss_lm=3.631544`, `loss_jepa=2.351347`, `loss_sigreg=7.630859`
-- Note: this beat no-dropout top-third JEPA by `0.003073` BPB. Treat the 10% dropout win as real but small.
 
 Best prior compact reference:
 
@@ -134,15 +141,51 @@ Top-third JEPA plus 10% auxiliary dropout:
 - `compact16m-5k-topthird-drop10-20260424`: `val_bpb=2.114118`
 - Effective dropout fraction: `0.098600`
 - Final eval: `loss_lm=3.631544`, `loss_jepa=2.351347`, `loss_sigreg=7.630859`
-- Conclusion: this is the new best compact result, but only by `0.003073 BPB` over no-dropout top-third. Treat it as a small positive signal, not a decisive architectural jump.
+- Conclusion: this is the historical top-third baseline, and set the reference for 10% dropout in this branch.
 
-Top-third JEPA plus 25% auxiliary dropout:
+Top-third same-layer mean target over future span t+1..t+4:
 
-- `compact16m-5k-topthird-drop25-20260425`: `val_bpb=2.117229`
-- Effective dropout fraction: `0.247800`
-- Final eval: `loss_lm=3.636989`, `loss_jepa=2.367961`, `loss_sigreg=8.066406`
-- Throughput: `22368.689305` tokens/sec, wall time `288.335386` seconds
-- Conclusion: 25% dropout was basically tied with no-dropout top-third and worse than 10% dropout. Do not promote it as the default.
+- `compact16m-5k-topthird-mean-t1-t4-20260425`: `val_bpb=2.111987`
+- Config: `sweep_configs/compact_16m_topthird_mean_t1_t4.yaml`
+- Change tested: target for layers `6,7,8` replaced with same-layer average of future compressed states
+  over `t+1 : t+5` (`t+1`, `t+2`, `t+3`, `t+4`).
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.627675`, `loss_jepa=1.883511`, `loss_sigreg=8.630859`
+- Throughput: `16700.368212` tokens/sec, wall time `317.295727` seconds
+- Conclusion: this is the current best compact result. Despite slightly higher SIGReg than top-third baseline, the BPB gain is best-in-class.
+
+Top-third same-layer mean target with normalized cosine:
+
+- `compact16m-5k-topthird-mean-t1-t4-cosine-20260425`: `val_bpb=2.123667`
+- Config: `sweep_configs/compact_16m_topthird_mean_t1_t4_cosine.yaml`
+- Change tested: JEPA loss is normalized cosine on the same top-third+mean-span target (`t+1..t+4`).
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.647982`, `loss_jepa=0.787334`, `loss_sigreg=5.210938`
+- Conclusion: very low JEPA/SIGReg magnitudes but worse BPB than delta mean target; does not beat best compact yet.
+
+Top-third projected residual-stream delta target over mean future span t+1..t+4:
+
+- `compact16m-5k-topthird-residual-delta-t1-t4-20260425`: `val_bpb=2.123149`
+- Config: `sweep_configs/compact_16m_topthird_residual_delta_t1_t4.yaml`
+- Change tested: project `h_final[t+1:t+5]` mean before forming delta target in residual space.
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.646943`, `loss_jepa=0.897406`, `loss_sigreg=4.559570`
+- Conclusion: not competitive with best current mean target; weaker LM auxiliary tradeoff.
+
+Top-third + 25% dropout vs alternatives:
+
+- `compact16m-5k-topthird-drop25-20260425`: `val_bpb=2.117229`, effective dropout fraction `0.247800`
+  - Final eval: `loss_lm=3.636989`, `loss_jepa=2.367961`, `loss_sigreg=8.066406`
+  - Throughput: `22368.689305` tokens/sec, wall time `288.335386` seconds
+- `compact16m-5k-layers6-8-mean-t1-t4-drop25-20260425`: `val_bpb=2.118200`, effective dropout fraction `0.247800` (only layers `6,8`)
+  - Config: `sweep_configs/compact_16m_layers_6_8_mean_t1_t4_drop25.yaml`
+  - Final eval: `loss_lm=3.638445`, `loss_jepa=1.585545`, `loss_sigreg=5.869141`
+  - Throughput: `22745.394200` tokens/sec, wall time `316.397741` seconds
+- `compact16m-5k-layers4-8-mean-t1-t4-drop20-20260425`: `val_bpb=2.116224`, effective dropout fraction `0.197000` (layers `4,5,6,7,8`)
+  - Config: `sweep_configs/compact_16m_layers_4_8_mean_t1_t4_drop20.yaml`
+  - Final eval: `loss_lm=3.635137`, `loss_jepa=3.050288`, `loss_sigreg=16.685547`
+  - Throughput: `21657.626851` tokens/sec, wall time `317.225610` seconds
+- Conclusion: wider/deeper active layer sets and higher dropout did not beat the 10% top-third mean-target path; they are currently lower-priority baselines.
 
 Multi-horizon grouped JEPA:
 
@@ -223,10 +266,10 @@ uv run -- python autoresearch/train.py \
 
 ## Current Beliefs
 
-- Best BPB currently comes from compact 16M aux-light with JEPA/SIGReg only on top JEPA blocks `6, 7, 8` plus 10% auxiliary dropout.
+- Best BPB currently comes from compact 16M aux-light with JEPA/SIGReg only on top JEPA blocks `6, 7, 8`, 10% dropout, and mean-span target (`t+1..t+4`).
 - Supervising all JEPA blocks is not automatically better.
 - Auxiliaries are useful, but too much auxiliary weight is harmful.
-- Layer selection is the strongest recent gain; 10% auxiliary dropout is a small win on the best top-third setup.
+- Layer selection is the strongest recent gain; 10% auxiliary dropout is a consistent gain on top-third setups.
 - 25% auxiliary dropout is too high or at least not beneficial at the current 5k-step budget.
 - Broad six-layer multi-horizon supervision regressed; if trying horizons again, keep the active layer count closer to the top-third winner.
 - Directly matching top-third states to final-layer future spans regressed at unchanged SIGReg weighting.
