@@ -154,10 +154,20 @@ Multi-horizon grouped JEPA:
 - Throughput: `20507.106141` tokens/sec, wall time `329.740579` seconds
 - Conclusion: this was worse than top-third + 10% dropout by `0.012238` BPB. The six-layer grouped horizon setup is too much auxiliary pressure at this budget, even though it ran correctly and stayed stable.
 
+Direct final-layer span state prediction:
+
+- `compact16m-5k-topthird-finalspan-state-20260425`: `val_bpb=2.130347`
+- Config: `sweep_configs/compact_16m_topthird_final_span_state.yaml`
+- Change tested: top-third layers `6,7,8` directly aligned their compressed state to a final-layer EMA future summary over `t+2..t+9` instead of predicting a delta to the target.
+- Effective dropout fraction: `0.098600`
+- Final eval: `loss_lm=3.659471`, `loss_jepa=1.937029`, `loss_sigreg=44.171875`
+- Throughput: `22414.918147` tokens/sec, wall time `292.154382` seconds
+- Conclusion: this was worse than top-third + 10% delta prediction by `0.016229` BPB. The lower JEPA loss did not translate to better LM BPB, and SIGReg pressure rose sharply. The implementation was committed for history and then reverted from the active code.
+
 Still unrun but now supported:
 
 - alternating blocks such as one-based 4/6/8 via `auxiliary_layer_start=3`, `auxiliary_layer_stride=2`
-- narrower horizon ablations that keep top-third layer count, such as layers `6,7,8` only with final-layer `t+2..t+12`
+- weighted or lower-SIGReg horizon ablations, since direct final-layer span state prediction caused high SIGReg loss at unchanged `beta_sigreg`
 
 ## Optimization And Runtime Tests
 
@@ -219,4 +229,5 @@ uv run -- python autoresearch/train.py \
 - Layer selection is the strongest recent gain; 10% auxiliary dropout is a small win on the best top-third setup.
 - 25% auxiliary dropout is too high or at least not beneficial at the current 5k-step budget.
 - Broad six-layer multi-horizon supervision regressed; if trying horizons again, keep the active layer count closer to the top-third winner.
+- Directly matching top-third states to final-layer future spans regressed at unchanged SIGReg weighting.
 - Float8 and FA-4 are not current wins in this environment; PyTorch bf16 compile with SDPA fallback is the practical path.
