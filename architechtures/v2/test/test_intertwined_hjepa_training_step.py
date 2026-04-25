@@ -11,6 +11,7 @@ from intertwined_hjepa import (
     IntertwinedHJEPA,
     auxiliary_layer_indices,
     jepa_delta_loss,
+    jepa_prepared_delta_loss,
     next_token_loss,
     rms_normalize_last_dim,
     split_scalars,
@@ -97,6 +98,59 @@ def test_jepa_delta_loss_can_use_normalized_cosine():
     loss = jepa_delta_loss(delta, z, target, valid_mask=valid_mask, loss_type="normalized_cosine")
 
     assert torch.allclose(loss, expected)
+
+
+def test_residual_delta_target_predicts_projected_future_residual_movement():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            auxiliary_target_groups=[
+                {
+                    "layers": [1],
+                    "target_type": "same_layer_residual_delta",
+                    "horizon": [1, 2],
+                }
+            ],
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids)
+    valid_mask = torch.tensor([[True, True, True, True, True, False]])
+    source_states = outputs["post_attn_states"][1]
+    future_summary = torch.zeros_like(source_states)
+    future_summary[:, 0] = (source_states[:, 1] + source_states[:, 2]) / 2
+    future_summary[:, 1] = (source_states[:, 2] + source_states[:, 3]) / 2
+    future_summary[:, 2] = (source_states[:, 3] + source_states[:, 4]) / 2
+    future_summary[:, 3] = (source_states[:, 4] + source_states[:, 5]) / 2
+    future_summary[:, 4] = source_states[:, 5]
+    manual_target = rms_normalize_last_dim(model.ema_target_encoders[1](future_summary - source_states)).detach()
+    expected = jepa_prepared_delta_loss(
+        outputs["deltas"][1],
+        manual_target,
+        valid_mask=valid_mask,
+    )
+
+    assert outputs["targets"][1].shape == outputs["deltas"][1].shape
+    assert not outputs["targets"][1].requires_grad
+    assert torch.allclose(outputs["targets"][1], manual_target)
+    assert torch.equal(outputs["loss_jepa_layers"][0], torch.zeros_like(outputs["loss_jepa_layers"][0]))
+    assert torch.allclose(outputs["loss_jepa_layers"][1], expected)
+    assert torch.equal(outputs["loss_jepa_layers"][2], torch.zeros_like(outputs["loss_jepa_layers"][2]))
 
 
 def test_next_token_loss_uses_already_shifted_labels_without_second_shift():

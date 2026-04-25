@@ -336,14 +336,26 @@ def jepa_delta_loss(
     assert delta_l.ndim >= 2, "delta_l, z_l, and target_z_l must have at least one sample axis and one feature axis"
 
     normalized_z_l = rms_normalize_last_dim(z_l)
-    normalized_delta_l = rms_normalize_last_dim(delta_l)
     normalized_target_delta_l = rms_normalize_last_dim(target_z_l.detach()) - normalized_z_l
+    return jepa_prepared_delta_loss(delta_l, normalized_target_delta_l, valid_mask=valid_mask, loss_type=loss_type)
+
+
+def jepa_prepared_delta_loss(
+    delta_l: torch.Tensor,
+    target_delta_l: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    loss_type: str = "normalized_mse",
+) -> torch.Tensor:
+    assert delta_l.shape == target_delta_l.shape, "delta_l and target_delta_l must have exactly the same shape"
+    assert delta_l.ndim >= 2, "delta_l and target_delta_l must have at least one sample axis and one feature axis"
+
+    normalized_delta_l = rms_normalize_last_dim(delta_l)
     assert loss_type in {"normalized_mse", "normalized_cosine"}, f"unsupported JEPA loss type {loss_type!r}"
 
     if loss_type == "normalized_mse":
-        error = F.mse_loss(normalized_delta_l, normalized_target_delta_l, reduction="none")
+        error = F.mse_loss(normalized_delta_l, target_delta_l, reduction="none")
     else:
-        error = 1.0 - F.cosine_similarity(normalized_delta_l, normalized_target_delta_l, dim=-1).unsqueeze(-1)
+        error = 1.0 - F.cosine_similarity(normalized_delta_l, target_delta_l, dim=-1).unsqueeze(-1)
 
     if valid_mask is None:
         return error.mean()
@@ -421,7 +433,7 @@ def auxiliary_target_specs(
 
     specs = []
     seen_layers = set()
-    valid_target_types = {"same_layer", "final_layer", "none", "off"}
+    valid_target_types = {"same_layer", "final_layer", "same_layer_residual_delta", "none", "off"}
     for group in groups:
         assert isinstance(group, dict), "each auxiliary target group must be a mapping"
         target_type = str(group.get("target_type", group.get("target", "same_layer")))
@@ -640,6 +652,30 @@ class IntertwinedHJEPA(nn.Module):
         target_z_l = self.ema_target_encoders[layer_index](source_states)
         return target_z_l.detach()
 
+    @torch.no_grad()
+    def compute_residual_delta_target_for_layer(
+        self,
+        layer_index: int,
+        post_attn_states: list[torch.Tensor],
+        current_valid_mask: torch.Tensor,
+        future_valid_mask: torch.Tensor,
+        horizon_start: int,
+        horizon_end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project mean future residual movement into the layer's compressed target space."""
+        assert 0 <= layer_index < len(self.blocks), "layer_index must point to a JEPA block"
+        source_states = post_attn_states[layer_index]
+        future_summary, layer_mask = future_target_summary(
+            source_states,
+            current_valid_mask,
+            future_valid_mask,
+            horizon_start,
+            horizon_end,
+        )
+        residual_delta = future_summary - source_states
+        target_delta = self.ema_target_encoders[layer_index](residual_delta)
+        return rms_normalize_last_dim(target_delta.detach()), layer_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -710,31 +746,50 @@ class IntertwinedHJEPA(nn.Module):
                 z_stack = torch.stack([compressed[index] for index in active_layer_indices])
                 for spec in self.auxiliary_target_specs:
                     layer_index = spec.layer_index
-                    target_sequence = self.compute_raw_jepa_target_for_layer(
-                        layer_index,
-                        post_attn_states,
-                        final_states=h,
-                        target_type=spec.target_type,
-                    )
-                    targets[layer_index] = target_sequence
-                    target_summary, layer_mask = future_target_summary(
-                        target_sequence,
-                        jepa_current_valid_mask,
-                        jepa_future_valid_mask,
-                        spec.horizon_start,
-                        spec.horizon_end,
-                    )
+                    if spec.target_type == "same_layer_residual_delta":
+                        target_delta, layer_mask = self.compute_residual_delta_target_for_layer(
+                            layer_index,
+                            post_attn_states,
+                            jepa_current_valid_mask,
+                            jepa_future_valid_mask,
+                            spec.horizon_start,
+                            spec.horizon_end,
+                        )
+                        targets[layer_index] = target_delta
+                    else:
+                        target_sequence = self.compute_raw_jepa_target_for_layer(
+                            layer_index,
+                            post_attn_states,
+                            final_states=h,
+                            target_type=spec.target_type,
+                        )
+                        targets[layer_index] = target_sequence
+                        target_summary, layer_mask = future_target_summary(
+                            target_sequence,
+                            jepa_current_valid_mask,
+                            jepa_future_valid_mask,
+                            spec.horizon_start,
+                            spec.horizon_end,
+                        )
                     assert layer_mask.any(), (
                         "auxiliary target horizon selected no valid positions: "
                         f"layer={layer_index}, horizon=[{spec.horizon_start}, {spec.horizon_end}]"
                     )
-                    layer_loss = jepa_delta_loss(
-                        deltas[layer_index],
-                        compressed[layer_index],
-                        target_summary,
-                        valid_mask=layer_mask,
-                        loss_type=self.config.jepa_loss_type,
-                    )
+                    if spec.target_type == "same_layer_residual_delta":
+                        layer_loss = jepa_prepared_delta_loss(
+                            deltas[layer_index],
+                            target_delta,
+                            valid_mask=layer_mask,
+                            loss_type=self.config.jepa_loss_type,
+                        )
+                    else:
+                        layer_loss = jepa_delta_loss(
+                            deltas[layer_index],
+                            compressed[layer_index],
+                            target_summary,
+                            valid_mask=layer_mask,
+                            loss_type=self.config.jepa_loss_type,
+                        )
                     jepa_losses[layer_index] = layer_loss * spec.weight
                     jepa_position_count = jepa_position_count + layer_mask.sum()
 
