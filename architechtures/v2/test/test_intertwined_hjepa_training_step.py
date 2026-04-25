@@ -11,6 +11,7 @@ from intertwined_hjepa import (
     IntertwinedHJEPA,
     auxiliary_layer_indices,
     jepa_delta_loss,
+    jepa_state_loss,
     next_token_loss,
     rms_normalize_last_dim,
     split_scalars,
@@ -78,6 +79,19 @@ def test_jepa_delta_loss_uses_normalized_latents():
     expected = torch.nn.functional.mse_loss(normalized_delta, normalized_target_delta)
 
     assert torch.allclose(jepa_delta_loss(delta, z, target), expected)
+
+
+def test_jepa_state_loss_aligns_student_state_to_future_target_directly():
+    z = torch.tensor([[[1.0, 0.0], [0.0, 2.0]]], requires_grad=True)
+    target = torch.tensor([[[3.0, 0.0], [2.0, 0.0]]], requires_grad=True)
+
+    expected = torch.nn.functional.mse_loss(rms_normalize_last_dim(z), rms_normalize_last_dim(target.detach()))
+    loss = jepa_state_loss(z, target)
+    loss.backward()
+
+    assert torch.allclose(loss, expected)
+    assert z.grad is not None
+    assert target.grad is None
 
 
 def test_next_token_loss_uses_already_shifted_labels_without_second_shift():
@@ -276,6 +290,56 @@ def test_auxiliary_losses_can_start_and_stride_across_layers():
     assert outputs["loss_sigreg_layers"][3] > 0
     assert torch.equal(outputs["loss_jepa"], torch.stack(outputs["loss_jepa_layers"]).sum())
     assert torch.equal(outputs["loss_sigreg"], torch.stack(outputs["loss_sigreg_layers"]).sum())
+
+
+def test_auxiliary_target_groups_can_use_direct_state_prediction():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=5,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            auxiliary_target_groups=[
+                {"layers": [2, 3], "target_type": "final_layer", "prediction": "state", "horizon": [2, 4]},
+            ],
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids)
+
+    assert [(spec.layer_index, spec.target_type, spec.prediction_type, spec.horizon_start, spec.horizon_end) for spec in model.auxiliary_target_specs] == [
+        (2, "final_layer", "state", 2, 4),
+        (3, "final_layer", "state", 2, 4),
+    ]
+    assert outputs["diagnostics"]["auxiliary_prediction_type"] == ["state", "state"]
+    assert [index for index, loss in enumerate(outputs["loss_jepa_layers"]) if loss.item() > 0.0] == [2, 3]
+    assert torch.equal(outputs["loss_jepa_layers"][0], torch.zeros_like(outputs["loss_jepa_layers"][0]))
+
+    spec = model.auxiliary_target_specs[0]
+    target_sequence = model.compute_raw_jepa_target_for_layer(
+        spec.layer_index,
+        outputs["post_attn_states"],
+        final_states=outputs["final_states"],
+        target_type=spec.target_type,
+    )
+    assert not torch.allclose(target_sequence, outputs["targets"][0])
+
+    outputs["loss"].backward()
+    assert any(parameter.grad is not None for parameter in model.blocks[2].compressor.parameters())
+    assert all(parameter.grad is None for parameter in model.blocks[2].predictor.parameters())
+    assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
 
 def test_total_loss_includes_local_sigreg_when_enabled():
