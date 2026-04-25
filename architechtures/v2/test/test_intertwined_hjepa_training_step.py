@@ -80,6 +80,25 @@ def test_jepa_delta_loss_uses_normalized_latents():
     assert torch.allclose(jepa_delta_loss(delta, z, target), expected)
 
 
+def test_jepa_delta_loss_can_use_normalized_cosine():
+    delta = torch.tensor([[[1.0, 1.0], [1.0, 0.0]]])
+    z = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    target = torch.tensor([[[0.0, 1.0], [1.0, 1.0]]])
+    valid_mask = torch.tensor([[True, False]])
+
+    normalized_delta = rms_normalize_last_dim(delta)
+    normalized_target_delta = rms_normalize_last_dim(target) - rms_normalize_last_dim(z)
+    expected = 1.0 - torch.nn.functional.cosine_similarity(
+        normalized_delta[:, :1],
+        normalized_target_delta[:, :1],
+        dim=-1,
+    ).mean()
+
+    loss = jepa_delta_loss(delta, z, target, valid_mask=valid_mask, loss_type="normalized_cosine")
+
+    assert torch.allclose(loss, expected)
+
+
 def test_next_token_loss_uses_already_shifted_labels_without_second_shift():
     labels = torch.tensor([[11, 12, 13, 14]], dtype=torch.long)
     logits = torch.full((1, 4, 20), -100.0)

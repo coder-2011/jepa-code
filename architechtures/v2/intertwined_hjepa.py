@@ -49,6 +49,7 @@ class IntertwinedConfig:
     sigreg_t_max: float
     sigreg_n_points: int
     tie_weights: bool
+    jepa_loss_type: str = "normalized_mse"
     rope_base: float = 10000.0
     ema_momentum_final: float = 0.996
     ema_warmup_steps: int = 0
@@ -324,6 +325,7 @@ def jepa_delta_loss(
     z_l: torch.Tensor,
     target_z_l: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
+    loss_type: str = "normalized_mse",
 ) -> torch.Tensor:
     """Loss for already-aligned JEPA tensors.
 
@@ -336,14 +338,18 @@ def jepa_delta_loss(
     normalized_z_l = rms_normalize_last_dim(z_l)
     normalized_delta_l = rms_normalize_last_dim(delta_l)
     normalized_target_delta_l = rms_normalize_last_dim(target_z_l.detach()) - normalized_z_l
+    assert loss_type in {"normalized_mse", "normalized_cosine"}, f"unsupported JEPA loss type {loss_type!r}"
+
+    if loss_type == "normalized_mse":
+        error = F.mse_loss(normalized_delta_l, normalized_target_delta_l, reduction="none")
+    else:
+        error = 1.0 - F.cosine_similarity(normalized_delta_l, normalized_target_delta_l, dim=-1).unsqueeze(-1)
 
     if valid_mask is None:
-        return F.mse_loss(normalized_delta_l, normalized_target_delta_l)
+        return error.mean()
 
     assert valid_mask.shape == delta_l.shape[:-1], "valid_mask must match the leading shape of delta_l"
     assert valid_mask.any(), "valid_mask selects no JEPA loss positions"
-
-    error = F.mse_loss(normalized_delta_l, normalized_target_delta_l, reduction="none")
     return error[valid_mask].mean()
 
 
@@ -503,6 +509,7 @@ class IntertwinedHJEPA(nn.Module):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
         assert 0.0 <= config.jepa_dropout_rate <= 1.0, "jepa_dropout_rate must be between 0 and 1"
+        assert config.jepa_loss_type in {"normalized_mse", "normalized_cosine"}, "unsupported jepa_loss_type"
         assert 0.0 <= config.ema_momentum <= 1.0 and 0.0 <= config.ema_momentum_final <= 1.0 and config.ema_warmup_steps >= 0, (
             "EMA momentum must be in [0, 1] and ema_warmup_steps must be non-negative"
         )
@@ -721,12 +728,13 @@ class IntertwinedHJEPA(nn.Module):
                         "auxiliary target horizon selected no valid positions: "
                         f"layer={layer_index}, horizon=[{spec.horizon_start}, {spec.horizon_end}]"
                     )
-                    normalized_z = rms_normalize_last_dim(compressed[layer_index])
-                    normalized_delta = rms_normalize_last_dim(deltas[layer_index])
-                    normalized_target_delta = rms_normalize_last_dim(target_summary.detach()) - normalized_z
-                    jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
-                    mask = layer_mask.unsqueeze(-1)
-                    layer_loss = (jepa_error * mask).sum() / mask.sum().mul(jepa_error.shape[-1])
+                    layer_loss = jepa_delta_loss(
+                        deltas[layer_index],
+                        compressed[layer_index],
+                        target_summary,
+                        valid_mask=layer_mask,
+                        loss_type=self.config.jepa_loss_type,
+                    )
                     jepa_losses[layer_index] = layer_loss * spec.weight
                     jepa_position_count = jepa_position_count + layer_mask.sum()
 
