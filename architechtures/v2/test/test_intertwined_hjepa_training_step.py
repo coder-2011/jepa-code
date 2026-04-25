@@ -13,6 +13,7 @@ from intertwined_hjepa import (
     jepa_delta_loss,
     jepa_prepared_delta_loss,
     next_token_loss,
+    resolve_latent_dims,
     rms_normalize_last_dim,
     split_scalars,
 )
@@ -151,6 +152,61 @@ def test_residual_delta_target_predicts_projected_future_residual_movement():
     assert torch.equal(outputs["loss_jepa_layers"][0], torch.zeros_like(outputs["loss_jepa_layers"][0]))
     assert torch.allclose(outputs["loss_jepa_layers"][1], expected)
     assert torch.equal(outputs["loss_jepa_layers"][2], torch.zeros_like(outputs["loss_jepa_layers"][2]))
+
+
+def test_split_latent_dims_keep_total_budget():
+    config = replace(YAML_CONFIG, compressed_dim=9, split_latents=True)
+
+    assert resolve_latent_dims(config) == (4, 5)
+    assert resolve_latent_dims(replace(config, content_dim=3)) == (3, 6)
+    assert resolve_latent_dims(replace(config, dynamics_dim=2)) == (7, 2)
+
+    with pytest.raises(AssertionError, match="sum"):
+        resolve_latent_dims(replace(config, content_dim=3, dynamics_dim=3))
+
+
+def test_split_latents_route_sigreg_to_content_and_jepa_to_dynamics():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            content_dim=3,
+            dynamics_dim=5,
+            split_latents=True,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.05,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0]], dtype=torch.long)
+    valid_mask = torch.tensor([[True, True, True, True, True, True], [True, True, True, False, False, False]])
+
+    torch.manual_seed(999)
+    outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
+
+    assert model.content_dim + model.dynamics_dim == model.config.compressed_dim
+    assert outputs["z_content"][0].shape[-1] == 3
+    assert outputs["z"][0].shape[-1] == 5
+    assert outputs["deltas"][0].shape[-1] == 5
+    assert outputs["targets"][0].shape[-1] == 5
+
+    sigreg_input = rms_normalize_last_dim(torch.stack(outputs["z_content"]))
+    sigreg_mask = valid_mask.unsqueeze(0).expand(len(model.blocks), -1, -1)
+    torch.manual_seed(999)
+    expected_sigreg = model.sigreg(sigreg_input, sample_mask=sigreg_mask, per_layer=True)
+
+    assert torch.allclose(torch.stack(outputs["loss_sigreg_layers"]), expected_sigreg)
+    assert torch.equal(outputs["z"][0], outputs["z_dynamics"][0])
 
 
 def test_next_token_loss_uses_already_shifted_labels_without_second_shift():

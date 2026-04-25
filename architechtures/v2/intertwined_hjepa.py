@@ -50,6 +50,9 @@ class IntertwinedConfig:
     sigreg_n_points: int
     tie_weights: bool
     jepa_loss_type: str = "normalized_mse"
+    split_latents: bool = False
+    content_dim: int | None = None
+    dynamics_dim: int | None = None
     rope_base: float = 10000.0
     ema_momentum_final: float = 0.996
     ema_warmup_steps: int = 0
@@ -87,6 +90,37 @@ class SimpleCompressor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+def resolve_latent_dims(config: IntertwinedConfig) -> tuple[int, int]:
+    """Return (content_dim, dynamics_dim) while preserving compressed_dim as total budget."""
+    assert config.compressed_dim > 0, "compressed_dim must be positive"
+    if not config.split_latents:
+        assert config.content_dim is None and config.dynamics_dim is None, (
+            "content_dim/dynamics_dim are only valid when split_latents is true"
+        )
+        return config.compressed_dim, config.compressed_dim
+
+    content_dim = config.content_dim
+    dynamics_dim = config.dynamics_dim
+    if content_dim is None and dynamics_dim is None:
+        content_dim = config.compressed_dim // 2
+        dynamics_dim = config.compressed_dim - content_dim
+    elif content_dim is None:
+        dynamics_dim = int(dynamics_dim)
+        content_dim = config.compressed_dim - dynamics_dim
+    elif dynamics_dim is None:
+        content_dim = int(content_dim)
+        dynamics_dim = config.compressed_dim - content_dim
+    else:
+        content_dim = int(content_dim)
+        dynamics_dim = int(dynamics_dim)
+
+    assert content_dim > 0 and dynamics_dim > 0, "content_dim and dynamics_dim must be positive"
+    assert content_dim + dynamics_dim == config.compressed_dim, (
+        "split latent dimensions must sum to compressed_dim so the total latent budget stays fixed"
+    )
+    return content_dim, dynamics_dim
 
 
 class RMSNorm(nn.RMSNorm):
@@ -209,9 +243,20 @@ class IntertwinedBlock(nn.Module):
         rope_base: float = 10000.0,
         dropout: float = 0.0,
         residual_branch_scale: float = 1.0,
+        split_latents: bool = False,
+        content_dim: int | None = None,
+        dynamics_dim: int | None = None,
     ):
         super().__init__()
         self.residual_branch_scale = float(residual_branch_scale)
+        self.split_latents = bool(split_latents)
+        if self.split_latents:
+            assert content_dim is not None and dynamics_dim is not None
+            self.content_dim = int(content_dim)
+            self.dynamics_dim = int(dynamics_dim)
+        else:
+            self.content_dim = int(compressed_dim)
+            self.dynamics_dim = int(compressed_dim)
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(
@@ -223,8 +268,12 @@ class IntertwinedBlock(nn.Module):
         )
         # Compressor path: D -> K, predictor path: K -> K.
         self.ce_norm = RMSNorm(residual_dim)
-        self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
-        self.predictor = DeltaPredictor(compressed_dim, predictor_hidden_dim, dropout=dropout)
+        if self.split_latents:
+            self.content_compressor = SimpleCompressor(residual_dim, self.content_dim, dropout=dropout)
+            self.dynamics_compressor = SimpleCompressor(residual_dim, self.dynamics_dim, dropout=dropout)
+        else:
+            self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
+        self.predictor = DeltaPredictor(self.dynamics_dim, predictor_hidden_dim, dropout=dropout)
         self.transition_mlp = nn.Sequential(
             RMSNorm(residual_dim),
             nn.Linear(residual_dim, predictor_hidden_dim),
@@ -233,11 +282,17 @@ class IntertwinedBlock(nn.Module):
             nn.Linear(predictor_hidden_dim, residual_dim),
         )
 
-    def encode_context(self, x_l: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_context(self, x_l: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
         x_l_post_attn = x_l + self.residual_branch_scale * self.attn(self.attn_norm(x_l))
-        z_l = self.compressor(self.ce_norm(x_l_post_attn))
-        return x_l_post_attn, z_l
+        normalized_context = self.ce_norm(x_l_post_attn)
+        if self.split_latents:
+            z_content_l = self.content_compressor(normalized_context)
+            z_dynamics_l = self.dynamics_compressor(normalized_context)
+        else:
+            z_dynamics_l = self.compressor(normalized_context)
+            z_content_l = z_dynamics_l
+        return x_l_post_attn, z_content_l, z_dynamics_l
 
     def forward_student(self, x_l: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -247,12 +302,13 @@ class IntertwinedBlock(nn.Module):
         Returns:
             x_next:      same leading shape as x_l, residual width D
             x_post_attn: same leading shape as x_l, residual width D
-            z:           same leading shape as x_l, compressed width K
-            delta:       same leading shape as x_l, compressed width K
+            z:           dynamics latent, same leading shape as x_l, compressed width Kd
+            z_content:   content latent used by SIGReg, same leading shape as x_l, compressed width Kc
+            delta:       predicted dynamics delta, same leading shape as x_l, compressed width Kd
         """
         assert x_l.ndim == 3, "x_l must have shape (B, L, D)"
-        x_l_post_attn, z_l = self.encode_context(x_l)
-        delta_l = self.predictor(z_l)
+        x_l_post_attn, z_content_l, z_dynamics_l = self.encode_context(x_l)
+        delta_l = self.predictor(z_dynamics_l)
         # Keep the JEPA latent auxiliary-only; the residual stream has its own transition path.
         update_l = self.transition_mlp(x_l_post_attn)
         x_next = x_l_post_attn + self.residual_branch_scale * update_l
@@ -260,7 +316,9 @@ class IntertwinedBlock(nn.Module):
         return {
             "x_next": x_next,
             "x_post_attn": x_l_post_attn,
-            "z": z_l,
+            "z": z_dynamics_l,
+            "z_content": z_content_l,
+            "z_dynamics": z_dynamics_l,
             "delta": delta_l,
         }
 
@@ -530,6 +588,7 @@ class IntertwinedHJEPA(nn.Module):
         self.ema_momentum = float(config.ema_momentum)
         self.ema_momentum_final = float(config.ema_momentum_final)
         self.ema_warmup_steps = int(config.ema_warmup_steps)
+        self.content_dim, self.dynamics_dim = resolve_latent_dims(config)
         residual_branch_scale = 1.0 / math.sqrt(config.depth)
 
         # Token embeddings stay learned; positions enter through RoPE inside attention.
@@ -550,6 +609,9 @@ class IntertwinedHJEPA(nn.Module):
                     rope_base=config.rope_base,
                     dropout=config.dropout,
                     residual_branch_scale=residual_branch_scale,
+                    split_latents=config.split_latents,
+                    content_dim=self.content_dim,
+                    dynamics_dim=self.dynamics_dim,
                 )
                 for _ in range(jepa_depth)
             ]
@@ -599,20 +661,23 @@ class IntertwinedHJEPA(nn.Module):
             [
                 JEPAEncoder(
                     residual_dim=config.residual_dim,
-                    compressed_dim=config.compressed_dim,
+                    compressed_dim=self.dynamics_dim,
                     dropout=config.dropout,
                 )
                 for _ in range(jepa_depth)
             ]
         )
         for student_block, ema_encoder in zip(self.blocks, self.ema_target_encoders):
+            student_compressor = (
+                student_block.dynamics_compressor if student_block.split_latents else student_block.compressor
+            )
             ema_encoder.load_state_dict(
                 {
                     "ce_norm.weight": student_block.ce_norm.weight.detach().clone(),
-                    "compressor.net.0.weight": student_block.compressor.net[0].weight.detach().clone(),
-                    "compressor.net.0.bias": student_block.compressor.net[0].bias.detach().clone(),
-                    "compressor.net.3.weight": student_block.compressor.net[3].weight.detach().clone(),
-                    "compressor.net.3.bias": student_block.compressor.net[3].bias.detach().clone(),
+                    "compressor.net.0.weight": student_compressor.net[0].weight.detach().clone(),
+                    "compressor.net.0.bias": student_compressor.net[0].bias.detach().clone(),
+                    "compressor.net.3.weight": student_compressor.net[3].weight.detach().clone(),
+                    "compressor.net.3.bias": student_compressor.net[3].bias.detach().clone(),
                 }
             )
             ema_encoder.requires_grad_(False)
@@ -698,9 +763,10 @@ class IntertwinedHJEPA(nn.Module):
             final_states:      (B, L, D)
             states:            depth + 1 residual states, each (B, L, D)
             post_attn_states:  depth states, each (B, L, D)
-            z:                 depth - 1 JEPA compressed states, each (B, L, K)
-            deltas:            depth - 1 predicted deltas, each (B, L, K)
-            targets:           depth - 1 raw stopped same-layer EMA targets, each (B, L, K)
+            z:                 depth - 1 JEPA dynamics states, each (B, L, Kd)
+            z_content:         depth - 1 SIGReg content states, each (B, L, Kc)
+            deltas:            depth - 1 predicted deltas, each (B, L, Kd)
+            targets:           depth - 1 raw stopped same-layer EMA targets, each (B, L, Kd)
             loss_sigreg_layers: depth - 1 local SIGReg losses
         """
         # h starts as h_0: dense token states of shape (B, L, D).
@@ -708,6 +774,7 @@ class IntertwinedHJEPA(nn.Module):
         states = []
         post_attn_states = []
         compressed = []
+        content_latents = []
         deltas = []
 
         # JEPA blocks preserve the dense residual stream and expose compressed local predictions.
@@ -717,6 +784,7 @@ class IntertwinedHJEPA(nn.Module):
             h = out["x_next"]
             post_attn_states.append(out["x_post_attn"])
             compressed.append(out["z"])
+            content_latents.append(out["z_content"])
             deltas.append(out["delta"])
 
         states.append(h)
@@ -743,7 +811,7 @@ class IntertwinedHJEPA(nn.Module):
             jepa_position_count = logits.new_zeros(())
 
             if active_layer_indices:
-                z_stack = torch.stack([compressed[index] for index in active_layer_indices])
+                content_stack = torch.stack([content_latents[index] for index in active_layer_indices])
                 for spec in self.auxiliary_target_specs:
                     layer_index = spec.layer_index
                     if spec.target_type == "same_layer_residual_delta":
@@ -794,7 +862,7 @@ class IntertwinedHJEPA(nn.Module):
                     jepa_position_count = jepa_position_count + layer_mask.sum()
 
                 if self.config.beta_sigreg > 0:
-                    sigreg_input = rms_normalize_last_dim(z_stack)
+                    sigreg_input = rms_normalize_last_dim(content_stack)
                     if sequence_valid_mask is None:
                         sigreg_loss_by_active_layer = self.sigreg(sigreg_input, per_layer=True)
                     else:
@@ -844,8 +912,14 @@ class IntertwinedHJEPA(nn.Module):
 
         # Keep a few cheap summaries around for smoke tests and debugging.
         z_stds = [z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in compressed]
+        z_content_stds = [
+            z.detach().float().reshape(-1, z.shape[-1]).std(dim=0, unbiased=False) for z in content_latents
+        ]
         diagnostics = {
             "compute_aux_losses": compute_aux_losses,
+            "split_latents": torch.tensor(self.config.split_latents, device=logits.device),
+            "content_dim": torch.tensor(self.content_dim, device=logits.device),
+            "dynamics_dim": torch.tensor(self.dynamics_dim, device=logits.device),
             "auxiliary_layer_start": torch.tensor(self.auxiliary_layer_start, device=logits.device),
             "auxiliary_layer_stride": torch.tensor(self.auxiliary_layer_stride, device=logits.device),
             "num_auxiliary_layers": torch.tensor(len(self.auxiliary_layer_indices), device=logits.device),
@@ -868,6 +942,9 @@ class IntertwinedHJEPA(nn.Module):
             "z_variance": [z.detach().float().var() for z in compressed],
             "z_std_mean": [std.mean() for std in z_stds],
             "z_std_min": [std.min() for std in z_stds],
+            "z_content_variance": [z.detach().float().var() for z in content_latents],
+            "z_content_std_mean": [std.mean() for std in z_content_stds],
+            "z_content_std_min": [std.min() for std in z_content_stds],
             "delta_norm": [delta.detach().float().norm() for delta in deltas],
         }
 
@@ -883,6 +960,8 @@ class IntertwinedHJEPA(nn.Module):
             "states": states,
             "post_attn_states": post_attn_states,
             "z": compressed,
+            "z_content": content_latents,
+            "z_dynamics": compressed,
             "deltas": deltas,
             "targets": targets,
             "jepa_valid_mask": jepa_valid_mask,
@@ -896,6 +975,7 @@ class IntertwinedHJEPA(nn.Module):
         ema_parameters = []
         student_parameters = []
         for ema_encoder, block in zip(self.ema_target_encoders, self.blocks):
+            student_compressor = block.dynamics_compressor if block.split_latents else block.compressor
             ema_parameters.extend((ema_encoder.ce_norm.weight, *ema_encoder.compressor.parameters()))
-            student_parameters.extend((block.ce_norm.weight, *block.compressor.parameters()))
+            student_parameters.extend((block.ce_norm.weight, *student_compressor.parameters()))
         ema_update(tuple(ema_parameters), tuple(student_parameters), momentum)
