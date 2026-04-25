@@ -68,7 +68,6 @@ class IntertwinedConfig:
 class AuxiliaryTargetSpec:
     layer_index: int
     target_type: str
-    prediction_type: str
     horizon_start: int
     horizon_end: int
     weight: float = 1.0
@@ -348,28 +347,6 @@ def jepa_delta_loss(
     return error[valid_mask].mean()
 
 
-def jepa_state_loss(
-    z_l: torch.Tensor,
-    target_z_l: torch.Tensor,
-    valid_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Directly align a student state with an already-aligned future target."""
-    assert z_l.shape == target_z_l.shape, "z_l and target_z_l must have exactly the same shape"
-    assert z_l.ndim >= 2, "z_l and target_z_l must have at least one sample axis and one feature axis"
-
-    normalized_z_l = rms_normalize_last_dim(z_l)
-    normalized_target_z_l = rms_normalize_last_dim(target_z_l.detach())
-
-    if valid_mask is None:
-        return F.mse_loss(normalized_z_l, normalized_target_z_l)
-
-    assert valid_mask.shape == z_l.shape[:-1], "valid_mask must match the leading shape of z_l"
-    assert valid_mask.any(), "valid_mask selects no JEPA loss positions"
-
-    error = F.mse_loss(normalized_z_l, normalized_target_z_l, reduction="none")
-    return error[valid_mask].mean()
-
-
 def next_token_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -430,7 +407,6 @@ def auxiliary_target_specs(
             AuxiliaryTargetSpec(
                 layer_index=layer_index,
                 target_type="same_layer",
-                prediction_type="delta",
                 horizon_start=1,
                 horizon_end=1,
             )
@@ -440,15 +416,10 @@ def auxiliary_target_specs(
     specs = []
     seen_layers = set()
     valid_target_types = {"same_layer", "final_layer", "none", "off"}
-    valid_prediction_types = {"delta", "state", "direct"}
     for group in groups:
         assert isinstance(group, dict), "each auxiliary target group must be a mapping"
         target_type = str(group.get("target_type", group.get("target", "same_layer")))
         assert target_type in valid_target_types, f"unsupported auxiliary target_type {target_type!r}"
-        prediction_type = str(group.get("prediction_type", group.get("prediction", "delta")))
-        assert prediction_type in valid_prediction_types, f"unsupported auxiliary prediction_type {prediction_type!r}"
-        if prediction_type == "direct":
-            prediction_type = "state"
         weight = float(group.get("weight", 1.0))
         assert weight >= 0.0, "auxiliary target weight must be non-negative"
         layers = group.get("layers")
@@ -470,7 +441,6 @@ def auxiliary_target_specs(
                 AuxiliaryTargetSpec(
                     layer_index=layer_index,
                     target_type=target_type,
-                    prediction_type=prediction_type,
                     horizon_start=horizon_start,
                     horizon_end=horizon_end,
                     weight=weight,
@@ -752,15 +722,9 @@ class IntertwinedHJEPA(nn.Module):
                         f"layer={layer_index}, horizon=[{spec.horizon_start}, {spec.horizon_end}]"
                     )
                     normalized_z = rms_normalize_last_dim(compressed[layer_index])
-                    normalized_target = rms_normalize_last_dim(target_summary.detach())
-                    if spec.prediction_type == "delta":
-                        normalized_delta = rms_normalize_last_dim(deltas[layer_index])
-                        prediction_error = normalized_delta - (normalized_target - normalized_z)
-                    elif spec.prediction_type == "state":
-                        prediction_error = normalized_z - normalized_target
-                    else:
-                        raise AssertionError(f"unsupported auxiliary prediction_type {spec.prediction_type!r}")
-                    jepa_error = prediction_error.square()
+                    normalized_delta = rms_normalize_last_dim(deltas[layer_index])
+                    normalized_target_delta = rms_normalize_last_dim(target_summary.detach()) - normalized_z
+                    jepa_error = F.mse_loss(normalized_delta, normalized_target_delta, reduction="none")
                     mask = layer_mask.unsqueeze(-1)
                     layer_loss = (jepa_error * mask).sum() / mask.sum().mul(jepa_error.shape[-1])
                     jepa_losses[layer_index] = layer_loss * spec.weight
@@ -831,7 +795,6 @@ class IntertwinedHJEPA(nn.Module):
             "auxiliary_target_weight": [
                 torch.tensor(spec.weight, device=logits.device) for spec in self.auxiliary_target_specs
             ],
-            "auxiliary_prediction_type": [spec.prediction_type for spec in self.auxiliary_target_specs],
             "lambda_jepa": lambda_eff.detach(),
             "beta_sigreg": beta_eff.detach(),
             "loss_jepa_layers": [loss.detach() for loss in jepa_losses],
