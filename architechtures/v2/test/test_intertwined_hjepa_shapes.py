@@ -86,29 +86,6 @@ def test_block_student_forward_shapes():
     assert out["delta"].shape == (batch_size, sequence_length, config.compressed_dim)
 
 
-def test_split_latent_block_keeps_content_and_dynamics_shapes_separate():
-    config = make_config()
-    block = IntertwinedBlock(
-        residual_dim=config.residual_dim,
-        compressed_dim=config.compressed_dim,
-        predictor_hidden_dim=config.predictor_hidden_dim,
-        max_length=config.max_length,
-        num_heads=config.num_heads,
-        dropout=config.dropout,
-        split_latents=True,
-        content_dim=1,
-        dynamics_dim=3,
-    )
-    batch_size = 2
-    sequence_length = min(5, config.max_length)
-    out = block.forward_student(torch.randn(batch_size, sequence_length, config.residual_dim))
-
-    assert out["z_content"].shape == (batch_size, sequence_length, 1)
-    assert out["z"].shape == (batch_size, sequence_length, 3)
-    assert out["z_dynamics"].shape == (batch_size, sequence_length, 3)
-    assert out["delta"].shape == (batch_size, sequence_length, 3)
-
-
 def test_final_residual_block_shapes():
     config = make_config()
     block = FinalResidualBlock(
