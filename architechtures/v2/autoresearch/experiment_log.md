@@ -230,16 +230,18 @@ Final-layer future teacher without SIGReg:
 
 Split content+dynamics latents:
 
-- Implementation status: supported in code, not yet measured by a full autoresearch run.
-- Config prepared: `sweep_configs/compact_16m_topthird_mean_t1_t4_split_latents.yaml`
-- Intended run target: current-best top-third mean setup (`layers 6,7,8`, horizon `t+1..t+4`, 10% aux dropout), with the latent budget split into `content_dim=112` and `dynamics_dim=112` while preserving the old total `compressed_dim=224`.
+- `compact16m-5k-topthird-mean-t1-t4-split-latents-20260425`: `val_bpb=2.206675`
+- Historical config: `sweep_configs/compact_16m_topthird_mean_t1_t4_split_latents.yaml` during the run; removed from active sweep configs after rollback.
+- Change tested: current-best top-third mean setup (`layers 6,7,8`, horizon `t+1..t+4`, 10% aux dropout), with the latent budget split into `content_dim=112` and `dynamics_dim=112` while preserving the old total `compressed_dim=224`.
 - Contract:
   - `z_content` feeds SIGReg / stable representation pressure.
   - `z_dynamics` feeds JEPA prediction, EMA targets, and predicted deltas.
   - Non-split configs retain the old single-latent behavior.
-- Why this is worth testing: the previous single latent had to be both stable under SIGReg and predictive under JEPA. Splitting the same total width tests whether role conflict, not total width, is limiting the current best.
+- Final eval: `loss_lm=3.790255`, `loss_jepa=1.240986`, `loss_sigreg=4.382812`
+- Throughput: `20069.002832` tokens/sec, wall time `345.869230` seconds
 - Verification: focused model tests passed (`46 passed`) and `autoresearch/train.py --validate-only --profile smoke` accepted the split config.
-- Current state: implementation is smoke-checked but not yet measured by a full training run. Do not compare it to BPB results until a completed row exists in `results.tsv`.
+- Diagnostic note: SIGReg was much lower than the current best, but LM loss regressed badly. Dynamics latent scale became unstable in active layers; late-run `z_variance` reached hundreds to thousands and `delta_norm` reached thousands on layers `6,7,8`.
+- Conclusion: same-total-width 50/50 split latents are a clear discard for this setup, worse than current best by `0.094688` BPB. The result suggests the dynamics branch became too underconstrained or too narrow after removing SIGReg pressure from the JEPA latent. The implementation was rolled back from active code; the run result remains in `results.tsv` for history.
 
 Still unrun but now supported:
 
@@ -309,5 +311,5 @@ uv run -- python autoresearch/train.py \
 - Broad six-layer multi-horizon supervision regressed; if trying horizons again, keep the active layer count closer to the top-third winner.
 - Directly matching top-third states to final-layer future spans regressed at unchanged SIGReg weighting.
 - Final-layer future teacher without SIGReg also regressed; low JEPA loss from that objective did not mean better LM.
-- Split content+dynamics latents are implemented for a same-total-width test, but are not yet a measured result.
+- Split content+dynamics latents with a 50/50 same-total-width split regressed badly; the content branch got low SIGReg but the dynamics branch became scale-unstable and LM BPB worsened.
 - Float8 and FA-4 are not current wins in this environment; PyTorch bf16 compile with SDPA fallback is the practical path.
