@@ -49,7 +49,11 @@ class IntertwinedConfig:
     sigreg_t_max: float
     sigreg_n_points: int
     tie_weights: bool
+    num_kv_heads: int | None = None
     jepa_loss_type: str = "normalized_mse"
+    jepa_residual_adapter_layers: list[int] | None = None
+    jepa_residual_adapter_gate_init: float = 0.0
+    jepa_residual_adapter_stop_gradient: bool = False
     rope_base: float = 10000.0
     ema_momentum_final: float = 0.996
     ema_warmup_steps: int = 0
@@ -149,26 +153,36 @@ class CausalSelfAttention(nn.Module):
         residual_dim: int,
         num_heads: int,
         max_length: int,
+        num_kv_heads: int | None = None,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
     ):
         super().__init__()
         assert residual_dim % num_heads == 0, "residual_dim must be divisible by num_heads"
+        num_kv_heads = num_heads if num_kv_heads is None else int(num_kv_heads)
+        assert num_kv_heads > 0, "num_kv_heads must be positive"
+        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = residual_dim // num_heads
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.dropout = dropout
-        self.c_attn = nn.Linear(residual_dim, 3 * residual_dim, bias=False)
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_q = nn.Linear(residual_dim, residual_dim, bias=False)
+        self.c_k = nn.Linear(residual_dim, kv_dim, bias=False)
+        self.c_v = nn.Linear(residual_dim, kv_dim, bias=False)
         self.c_proj = nn.Linear(residual_dim, residual_dim, bias=False)
         self.rotary = RotaryEmbedding(self.head_dim, max_seq_len=max_length, base=rope_base)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.ndim == 3, "x must have shape (B, L, D)"
         batch_size, sequence_length, residual_dim = x.shape
-        q, k, v = self.c_attn(x).chunk(3, dim=-1)
+        q = self.c_q(x)
+        k = self.c_k(x)
+        v = self.c_v(x)
         q = q.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
         cos, sin = self.rotary(sequence_length, dtype=q.dtype)
         q = apply_rotary_embedding(q, cos, sin)
         k = apply_rotary_embedding(k, cos, sin)
@@ -206,17 +220,24 @@ class IntertwinedBlock(nn.Module):
         predictor_hidden_dim: int,
         max_length: int,
         num_heads: int = 1,
+        num_kv_heads: int | None = None,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
         residual_branch_scale: float = 1.0,
+        use_jepa_residual_adapter: bool = False,
+        jepa_residual_adapter_gate_init: float = 0.0,
+        jepa_residual_adapter_stop_gradient: bool = False,
     ):
         super().__init__()
         self.residual_branch_scale = float(residual_branch_scale)
+        self.use_jepa_residual_adapter = bool(use_jepa_residual_adapter)
+        self.jepa_residual_adapter_stop_gradient = bool(jepa_residual_adapter_stop_gradient)
         # Pre-norm causal self-attention on the residual stream.
         self.attn_norm = RMSNorm(residual_dim)
         self.attn = CausalSelfAttention(
             residual_dim=residual_dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             max_length=max_length,
             rope_base=rope_base,
             dropout=dropout,
@@ -225,6 +246,13 @@ class IntertwinedBlock(nn.Module):
         self.ce_norm = RMSNorm(residual_dim)
         self.compressor = SimpleCompressor(residual_dim, compressed_dim, dropout=dropout)
         self.predictor = DeltaPredictor(compressed_dim, predictor_hidden_dim, dropout=dropout)
+        self.jepa_residual_adapter = (
+            nn.Linear(compressed_dim, residual_dim, bias=False) if self.use_jepa_residual_adapter else None
+        )
+        if self.use_jepa_residual_adapter:
+            self.jepa_residual_adapter_gate = nn.Parameter(torch.tensor(float(jepa_residual_adapter_gate_init)))
+        else:
+            self.register_parameter("jepa_residual_adapter_gate", None)
         self.transition_mlp = nn.Sequential(
             RMSNorm(residual_dim),
             nn.Linear(residual_dim, predictor_hidden_dim),
@@ -255,6 +283,18 @@ class IntertwinedBlock(nn.Module):
         delta_l = self.predictor(z_l)
         # Keep the JEPA latent auxiliary-only; the residual stream has its own transition path.
         update_l = self.transition_mlp(x_l_post_attn)
+        adapter_gate = x_l_post_attn.new_zeros(())
+        adapter_update_norm = x_l_post_attn.new_zeros(())
+        adapter_effective_update_norm = x_l_post_attn.new_zeros(())
+        if self.jepa_residual_adapter is not None:
+            future_latent_l = rms_normalize_last_dim(z_l + delta_l)
+            if self.jepa_residual_adapter_stop_gradient:
+                future_latent_l = future_latent_l.detach()
+            adapter_update_l = self.jepa_residual_adapter(future_latent_l)
+            adapter_gate = torch.tanh(self.jepa_residual_adapter_gate).to(dtype=adapter_update_l.dtype)
+            adapter_update_norm = adapter_update_l.detach().float().norm()
+            adapter_effective_update_norm = adapter_gate.detach().float().abs() * adapter_update_norm
+            update_l = update_l + adapter_gate * adapter_update_l
         x_next = x_l_post_attn + self.residual_branch_scale * update_l
 
         return {
@@ -262,6 +302,9 @@ class IntertwinedBlock(nn.Module):
             "x_post_attn": x_l_post_attn,
             "z": z_l,
             "delta": delta_l,
+            "jepa_residual_adapter_gate": adapter_gate,
+            "jepa_residual_adapter_update_norm": adapter_update_norm,
+            "jepa_residual_adapter_effective_update_norm": adapter_effective_update_norm,
         }
 
 
@@ -288,6 +331,7 @@ class FinalResidualBlock(nn.Module):
         hidden_dim: int,
         max_length: int,
         num_heads: int = 1,
+        num_kv_heads: int | None = None,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
         residual_branch_scale: float = 1.0,
@@ -298,6 +342,7 @@ class FinalResidualBlock(nn.Module):
         self.attn = CausalSelfAttention(
             residual_dim=residual_dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             max_length=max_length,
             rope_base=rope_base,
             dropout=dropout,
@@ -415,6 +460,21 @@ def auxiliary_layer_indices(num_layers: int, start: int, stride: int) -> tuple[i
     return tuple(range(start, num_layers, stride))
 
 
+def explicit_layer_indices(num_layers: int, layers: list[int] | None, *, field_name: str) -> tuple[int, ...]:
+    if layers is None:
+        return ()
+    assert isinstance(layers, list), f"{field_name} must be a list of JEPA block indices"
+    seen = set()
+    indices = []
+    for raw_layer_index in layers:
+        layer_index = int(raw_layer_index)
+        assert 0 <= layer_index < num_layers, f"{field_name} contains an out-of-range JEPA block index"
+        assert layer_index not in seen, f"{field_name} must not contain duplicate JEPA block indices"
+        seen.add(layer_index)
+        indices.append(layer_index)
+    return tuple(indices)
+
+
 def auxiliary_target_specs(
     num_layers: int,
     groups: list[dict[str, object]] | None,
@@ -496,6 +556,22 @@ def load_intertwined_state_dict(model: nn.Module, state_dict: dict[str, torch.Te
     if legacy_position_key in migrated_state_dict:
         migrated_state_dict.pop(legacy_position_key)
         ignored_legacy_keys.append(legacy_position_key)
+    model_state = model.state_dict()
+    for key in list(migrated_state_dict):
+        if not key.endswith(".attn.c_attn.weight"):
+            continue
+        prefix = key.removesuffix("c_attn.weight")
+        q_key = f"{prefix}c_q.weight"
+        k_key = f"{prefix}c_k.weight"
+        v_key = f"{prefix}c_v.weight"
+        if q_key not in model_state or k_key not in model_state or v_key not in model_state:
+            continue
+        q_weight, k_weight, v_weight = migrated_state_dict.pop(key).chunk(3, dim=0)
+        if q_weight.shape == model_state[q_key].shape and k_weight.shape == model_state[k_key].shape and v_weight.shape == model_state[v_key].shape:
+            migrated_state_dict[q_key] = q_weight
+            migrated_state_dict[k_key] = k_weight
+            migrated_state_dict[v_key] = v_weight
+            ignored_legacy_keys.append(key)
     incompatible = model.load_state_dict(migrated_state_dict, strict=False)
     assert not incompatible.missing_keys and not incompatible.unexpected_keys, (
         "Unexpected checkpoint mismatch after RoPE migration: "
@@ -520,8 +596,12 @@ class IntertwinedHJEPA(nn.Module):
     def __init__(self, config: IntertwinedConfig):
         super().__init__()
         assert config.depth >= 2, "depth must be at least 2"
+        num_kv_heads = config.num_heads if config.num_kv_heads is None else int(config.num_kv_heads)
+        assert num_kv_heads > 0, "num_kv_heads must be positive"
+        assert config.num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
         assert 0.0 <= config.jepa_dropout_rate <= 1.0, "jepa_dropout_rate must be between 0 and 1"
         assert config.jepa_loss_type in {"normalized_mse", "normalized_cosine"}, "unsupported jepa_loss_type"
+        assert math.isfinite(config.jepa_residual_adapter_gate_init), "jepa_residual_adapter_gate_init must be finite"
         assert 0.0 <= config.ema_momentum <= 1.0 and 0.0 <= config.ema_momentum_final <= 1.0 and config.ema_warmup_steps >= 0, (
             "EMA momentum must be in [0, 1] and ema_warmup_steps must be non-negative"
         )
@@ -539,6 +619,12 @@ class IntertwinedHJEPA(nn.Module):
             residual_dim=config.residual_dim,
         )
         jepa_depth = config.depth - 1
+        self.jepa_residual_adapter_layer_indices = explicit_layer_indices(
+            jepa_depth,
+            config.jepa_residual_adapter_layers,
+            field_name="jepa_residual_adapter_layers",
+        )
+        jepa_residual_adapter_layer_set = set(self.jepa_residual_adapter_layer_indices)
         self.blocks = nn.ModuleList(
             [
                 IntertwinedBlock(
@@ -547,11 +633,15 @@ class IntertwinedHJEPA(nn.Module):
                     predictor_hidden_dim=config.predictor_hidden_dim,
                     max_length=config.max_length,
                     num_heads=config.num_heads,
+                    num_kv_heads=num_kv_heads,
                     rope_base=config.rope_base,
                     dropout=config.dropout,
                     residual_branch_scale=residual_branch_scale,
+                    use_jepa_residual_adapter=index in jepa_residual_adapter_layer_set,
+                    jepa_residual_adapter_gate_init=config.jepa_residual_adapter_gate_init,
+                    jepa_residual_adapter_stop_gradient=config.jepa_residual_adapter_stop_gradient,
                 )
-                for _ in range(jepa_depth)
+                for index in range(jepa_depth)
             ]
         )
         self.auxiliary_layer_start = int(config.auxiliary_layer_start)
@@ -572,6 +662,7 @@ class IntertwinedHJEPA(nn.Module):
             hidden_dim=config.predictor_hidden_dim,
             max_length=config.max_length,
             num_heads=config.num_heads,
+            num_kv_heads=num_kv_heads,
             rope_base=config.rope_base,
             dropout=config.dropout,
             residual_branch_scale=residual_branch_scale,
@@ -592,6 +683,8 @@ class IntertwinedHJEPA(nn.Module):
         for block in self.blocks:
             block.attn.c_proj._init_std = residual_output_std
             block.transition_mlp[4]._init_std = residual_output_std
+            if block.jepa_residual_adapter is not None:
+                block.jepa_residual_adapter._init_std = residual_output_std
         self.final_block.attn.c_proj._init_std = residual_output_std
         self.final_block.mlp[4]._init_std = residual_output_std
         self.apply(init_intertwined_weights)
@@ -621,6 +714,13 @@ class IntertwinedHJEPA(nn.Module):
     def student_parameters(self):
         # EMA parameters are frozen, so this naturally returns only trainable student weights.
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
+
+    def jepa_residual_adapter_gate_parameters(self):
+        return (
+            block.jepa_residual_adapter_gate
+            for block in self.blocks
+            if block.jepa_residual_adapter_gate is not None
+        )
 
     def ema_momentum_at_step(self, step: int | None) -> float:
         if step is None or self.ema_warmup_steps <= 0 or self.ema_momentum == self.ema_momentum_final:
@@ -709,6 +809,9 @@ class IntertwinedHJEPA(nn.Module):
         post_attn_states = []
         compressed = []
         deltas = []
+        adapter_gates = []
+        adapter_update_norms = []
+        adapter_effective_update_norms = []
 
         # JEPA blocks preserve the dense residual stream and expose compressed local predictions.
         for block in self.blocks:
@@ -718,6 +821,9 @@ class IntertwinedHJEPA(nn.Module):
             post_attn_states.append(out["x_post_attn"])
             compressed.append(out["z"])
             deltas.append(out["delta"])
+            adapter_gates.append(out["jepa_residual_adapter_gate"])
+            adapter_update_norms.append(out["jepa_residual_adapter_update_norm"])
+            adapter_effective_update_norms.append(out["jepa_residual_adapter_effective_update_norm"])
 
         states.append(h)
         final_out = self.final_block(h)
@@ -733,6 +839,7 @@ class IntertwinedHJEPA(nn.Module):
         if sequence_valid_mask is not None:
             jepa_valid_mask &= sequence_valid_mask
             jepa_current_valid_mask &= sequence_valid_mask
+            jepa_future_valid_mask &= sequence_valid_mask
 
         if compute_aux_losses:
             zero_loss = logits.new_zeros(())
@@ -849,6 +956,11 @@ class IntertwinedHJEPA(nn.Module):
             "auxiliary_layer_start": torch.tensor(self.auxiliary_layer_start, device=logits.device),
             "auxiliary_layer_stride": torch.tensor(self.auxiliary_layer_stride, device=logits.device),
             "num_auxiliary_layers": torch.tensor(len(self.auxiliary_layer_indices), device=logits.device),
+            "jepa_residual_adapter_gate": [gate.detach() for gate in adapter_gates],
+            "jepa_residual_adapter_update_norm": [norm.detach() for norm in adapter_update_norms],
+            "jepa_residual_adapter_effective_update_norm": [
+                norm.detach() for norm in adapter_effective_update_norms
+            ],
             "auxiliary_target_horizon_start": [
                 torch.tensor(spec.horizon_start, device=logits.device) for spec in self.auxiliary_target_specs
             ],

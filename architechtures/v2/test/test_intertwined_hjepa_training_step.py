@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from intertwined_hjepa import (
     IntertwinedConfig,
     IntertwinedHJEPA,
     auxiliary_layer_indices,
+    future_target_summary,
     jepa_delta_loss,
     jepa_prepared_delta_loss,
     next_token_loss,
@@ -17,6 +19,7 @@ from intertwined_hjepa import (
     split_scalars,
 )
 from sigreg import SIGReg
+from scripts.train_intertwined_hjepa import build_optimizer
 
 YAML_CONFIG = IntertwinedConfig.from_yaml(ROOT / "intertwined_hjepa.yaml")
 
@@ -98,6 +101,38 @@ def test_jepa_delta_loss_can_use_normalized_cosine():
     loss = jepa_delta_loss(delta, z, target, valid_mask=valid_mask, loss_type="normalized_cosine")
 
     assert torch.allclose(loss, expected)
+
+
+def test_future_target_summary_masks_invalid_future_positions():
+    target = torch.tensor(
+        [
+            [
+                [0.0, 10.0],
+                [1.0, 11.0],
+                [2.0, 12.0],
+                [3.0, 13.0],
+                [4.0, 14.0],
+            ]
+        ]
+    )
+    valid_mask = torch.tensor([[True, True, True, False, False]])
+
+    summary, layer_mask = future_target_summary(target, valid_mask, valid_mask, 1, 2)
+
+    expected_summary = torch.tensor(
+        [
+            [
+                [1.5, 11.5],
+                [2.0, 12.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        ]
+    )
+    expected_mask = torch.tensor([[True, True, False, False, False]])
+    assert torch.allclose(summary, expected_summary)
+    assert torch.equal(layer_mask, expected_mask)
 
 
 def test_residual_delta_target_predicts_projected_future_residual_movement():
@@ -239,6 +274,111 @@ def test_jepa_loss_updates_ce_path():
     assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
 
 
+def test_jepa_residual_adapter_gate_is_trainable_from_lm_path():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            jepa_residual_adapter_layers=[1],
+            jepa_residual_adapter_gate_init=0.0,
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids, compute_aux_losses=False)
+    outputs["loss"].backward()
+
+    assert torch.equal(outputs["diagnostics"]["jepa_residual_adapter_gate"][0], torch.zeros(()))
+    assert torch.equal(outputs["diagnostics"]["jepa_residual_adapter_gate"][2], torch.zeros(()))
+    adapter_gate = model.blocks[1].jepa_residual_adapter_gate
+    assert adapter_gate is not None
+    assert adapter_gate.grad is not None
+    assert all(parameter.grad is None for parameter in model.ema_target_encoders.parameters())
+
+
+def test_jepa_residual_adapter_effective_norm_tracks_gate_scale():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            jepa_residual_adapter_layers=[1],
+            jepa_residual_adapter_gate_init=0.05,
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, labels=input_ids, compute_aux_losses=False)
+    gate = outputs["diagnostics"]["jepa_residual_adapter_gate"][1].abs()
+    update_norm = outputs["diagnostics"]["jepa_residual_adapter_update_norm"][1]
+    effective_norm = outputs["diagnostics"]["jepa_residual_adapter_effective_update_norm"][1]
+
+    assert torch.allclose(effective_norm, gate * update_norm)
+
+
+def test_build_optimizer_can_boost_adapter_gate_lr_without_weight_decay():
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            jepa_residual_adapter_layers=[1],
+        )
+    )
+    args = SimpleNamespace(
+        lr=0.001,
+        weight_decay=0.01,
+        optimizer="adamw",
+        jepa_residual_adapter_gate_lr_mult=10.0,
+    )
+
+    optimizer = build_optimizer(model, args, torch.device("cpu"))
+    gate_param = model.blocks[1].jepa_residual_adapter_gate
+
+    assert gate_param is not None
+    assert len(optimizer.param_groups) == 2
+    assert len(optimizer.param_groups[1]["params"]) == 1
+    assert optimizer.param_groups[1]["params"][0] is gate_param
+    assert optimizer.param_groups[1]["lr"] == 0.01
+    assert optimizer.param_groups[1]["weight_decay"] == 0.0
+
+
 def test_sliced_epps_pulley_sigreg_is_finite_and_differentiable():
     sigreg = SIGReg(num_slices=8, knots=5)
     z = torch.randn(6, 4, requires_grad=True)
@@ -279,15 +419,17 @@ def test_stacked_auxiliary_losses_match_individual_layer_losses():
     torch.manual_seed(999)
     outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
 
-    individual_jepa_losses = [
-        jepa_delta_loss(
-            outputs["deltas"][index][:, :-1],
-            outputs["z"][index][:, :-1],
-            outputs["targets"][index][:, 1:],
-            valid_mask=outputs["jepa_valid_mask"][:, :-1],
+    individual_jepa_losses = []
+    for index in range(len(model.blocks)):
+        target_summary, layer_mask = future_target_summary(outputs["targets"][index], valid_mask, valid_mask, 1, 1)
+        individual_jepa_losses.append(
+            jepa_delta_loss(
+                outputs["deltas"][index],
+                outputs["z"][index],
+                target_summary,
+                valid_mask=layer_mask,
+            )
         )
-        for index in range(len(model.blocks))
-    ]
 
     sigreg_input = rms_normalize_last_dim(torch.stack(outputs["z"]))
     torch.manual_seed(999)
@@ -298,6 +440,53 @@ def test_stacked_auxiliary_losses_match_individual_layer_losses():
 
     assert torch.allclose(torch.stack(outputs["loss_jepa_layers"]), torch.stack(individual_jepa_losses))
     assert torch.allclose(torch.stack(outputs["loss_sigreg_layers"]), torch.stack(individual_sigreg_losses))
+
+
+def test_auxiliary_targets_do_not_use_masked_future_tokens():
+    torch.manual_seed(123)
+    model = IntertwinedHJEPA(
+        replace(
+            YAML_CONFIG,
+            vocab_size=32,
+            max_length=8,
+            residual_dim=16,
+            compressed_dim=8,
+            depth=4,
+            num_heads=4,
+            predictor_hidden_dim=32,
+            dropout=0.0,
+            ema_momentum=0.5,
+            lambda_jepa=0.1,
+            beta_sigreg=0.0,
+            sigreg_num_slices=8,
+            sigreg_n_points=5,
+            auxiliary_target_groups=[
+                {
+                    "layers": [1],
+                    "target_type": "same_layer",
+                    "horizon": [1, 1],
+                }
+            ],
+        )
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 0, 0, 0]], dtype=torch.long)
+    valid_mask = torch.tensor([[True, True, True, True, True, True], [True, True, True, False, False, False]])
+
+    outputs = model(input_ids=input_ids, labels=input_ids, valid_mask=valid_mask)
+    target_summary, layer_mask = future_target_summary(outputs["targets"][1], valid_mask, valid_mask, 1, 1)
+    expected_mask = torch.tensor(
+        [[True, True, True, True, True, False], [True, True, False, False, False, False]]
+    )
+    expected = jepa_delta_loss(
+        outputs["deltas"][1],
+        outputs["z"][1],
+        target_summary,
+        valid_mask=layer_mask,
+    )
+
+    assert torch.equal(layer_mask, expected_mask)
+    assert torch.allclose(outputs["loss_jepa_layers"][1], expected)
+    assert int(outputs["diagnostics"]["auxiliary_target_positions"].item()) == int(expected_mask.sum().item())
 
 
 def test_auxiliary_layer_indices_use_start_and_stride():

@@ -1,4 +1,5 @@
 from dataclasses import replace
+import math
 from pathlib import Path
 import warnings
 
@@ -14,6 +15,8 @@ from intertwined_hjepa import (
     IntertwinedConfig,
     IntertwinedHJEPA,
     RMSNorm,
+    load_intertwined_state_dict,
+    rms_normalize_last_dim,
 )
 from text_helpers import HFTokenizer, LMHead, TokenEmbeddings
 
@@ -42,13 +45,19 @@ def make_config():
 
 def manual_causal_attention_output(module: CausalSelfAttention, x: torch.Tensor) -> torch.Tensor:
     batch_size, sequence_length, residual_dim = x.shape
-    q, k, v = module.c_attn(x).chunk(3, dim=-1)
+    q = module.c_q(x)
+    k = module.c_k(x)
+    v = module.c_v(x)
     q = q.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
-    k = k.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
-    v = v.view(batch_size, sequence_length, module.num_heads, module.head_dim).transpose(1, 2)
+    k = k.view(batch_size, sequence_length, module.num_kv_heads, module.head_dim).transpose(1, 2)
+    v = v.view(batch_size, sequence_length, module.num_kv_heads, module.head_dim).transpose(1, 2)
     cos, sin = module.rotary(sequence_length, dtype=q.dtype)
     q = apply_rotary_embedding(q, cos, sin)
     k = apply_rotary_embedding(k, cos, sin)
+    if module.num_kv_heads != module.num_heads:
+        repeat = module.num_heads // module.num_kv_heads
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
     scores = torch.matmul(q, k.transpose(-2, -1)) * (module.head_dim ** -0.5)
     causal_mask = torch.triu(torch.ones(sequence_length, sequence_length, device=x.device, dtype=torch.bool), diagonal=1)
     probs = torch.softmax(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
@@ -63,6 +72,18 @@ class ConstantLike(nn.Module):
         self.fill_value = fill_value
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.full((*x.shape[:-1], self.out_dim), self.fill_value, dtype=x.dtype, device=x.device)
+
+
+class CaptureAndConstantLike(nn.Module):
+    def __init__(self, out_dim: int, fill_value: float):
+        super().__init__()
+        self.out_dim = out_dim
+        self.fill_value = fill_value
+        self.last_input = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.last_input = x.detach().clone()
         return torch.full((*x.shape[:-1], self.out_dim), self.fill_value, dtype=x.dtype, device=x.device)
 
 
@@ -127,6 +148,65 @@ def test_runtime_residual_branch_scaling_applies_to_jepa_block_updates():
     assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 3.0))
 
 
+def test_zero_gate_jepa_residual_adapter_preserves_block_update():
+    block = IntertwinedBlock(
+        residual_dim=4,
+        compressed_dim=2,
+        predictor_hidden_dim=8,
+        max_length=8,
+        num_heads=2,
+        dropout=0.0,
+        residual_branch_scale=0.5,
+        use_jepa_residual_adapter=True,
+        jepa_residual_adapter_gate_init=0.0,
+    )
+    block.attn_norm = nn.Identity()
+    block.ce_norm = nn.Identity()
+    block.attn = ConstantLike(out_dim=4, fill_value=2.0)
+    block.compressor = ConstantLike(out_dim=2, fill_value=3.0)
+    block.predictor = ConstantLike(out_dim=2, fill_value=1.0)
+    block.transition_mlp = ConstantLike(out_dim=4, fill_value=4.0)
+    block.jepa_residual_adapter = ConstantLike(out_dim=4, fill_value=100.0)
+    x = torch.zeros(1, 3, 4)
+
+    out = block.forward_student(x)
+
+    assert torch.allclose(out["jepa_residual_adapter_gate"], torch.zeros_like(out["jepa_residual_adapter_gate"]))
+    assert torch.allclose(out["x_post_attn"], torch.full_like(out["x_post_attn"], 1.0))
+    assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 3.0))
+
+
+def test_gated_jepa_residual_adapter_uses_normalized_predicted_future_latent():
+    gate_init = math.atanh(0.5)
+    block = IntertwinedBlock(
+        residual_dim=4,
+        compressed_dim=2,
+        predictor_hidden_dim=8,
+        max_length=8,
+        num_heads=2,
+        dropout=0.0,
+        residual_branch_scale=0.5,
+        use_jepa_residual_adapter=True,
+        jepa_residual_adapter_gate_init=gate_init,
+    )
+    block.attn_norm = nn.Identity()
+    block.ce_norm = nn.Identity()
+    block.attn = ConstantLike(out_dim=4, fill_value=2.0)
+    block.compressor = ConstantLike(out_dim=2, fill_value=3.0)
+    block.predictor = ConstantLike(out_dim=2, fill_value=1.0)
+    block.transition_mlp = ConstantLike(out_dim=4, fill_value=4.0)
+    adapter = CaptureAndConstantLike(out_dim=4, fill_value=8.0)
+    block.jepa_residual_adapter = adapter
+    x = torch.zeros(1, 3, 4)
+
+    out = block.forward_student(x)
+
+    expected_adapter_input = rms_normalize_last_dim(torch.full((1, 3, 2), 4.0))
+    assert torch.allclose(adapter.last_input, expected_adapter_input)
+    assert torch.allclose(out["jepa_residual_adapter_gate"], torch.full_like(out["jepa_residual_adapter_gate"], 0.5))
+    assert torch.allclose(out["x_next"], torch.full_like(out["x_next"], 5.0))
+
+
 def test_runtime_residual_branch_scaling_applies_to_final_block_updates():
     block = FinalResidualBlock(
         residual_dim=4,
@@ -162,6 +242,28 @@ def test_causal_self_attention_matches_manual_reference():
         manual = manual_causal_attention_output(attention, x)
 
     assert torch.allclose(direct, manual, atol=1e-6, rtol=1e-5)
+
+
+def test_causal_self_attention_gqa_matches_manual_reference():
+    attention = CausalSelfAttention(
+        residual_dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        max_length=8,
+        dropout=0.0,
+    ).eval()
+    x = torch.randn(2, 5, 16)
+
+    with torch.no_grad():
+        direct = attention(x)
+        manual = manual_causal_attention_output(attention, x)
+
+    assert torch.allclose(direct, manual, atol=1e-6, rtol=1e-5)
+
+
+def test_causal_self_attention_requires_num_heads_divisible_by_kv_heads():
+    with pytest.raises(AssertionError, match="num_heads must be divisible by num_kv_heads"):
+        CausalSelfAttention(residual_dim=12, num_heads=3, num_kv_heads=2, max_length=8)
 
 
 def test_causal_self_attention_ignores_future_tokens():
@@ -276,7 +378,9 @@ def test_model_uses_explicit_small_initialization():
             assert torch.allclose(module.weight, torch.ones_like(module.weight))
         if isinstance(module, CausalSelfAttention):
             for weight in (
-                module.c_attn.weight,
+                module.c_q.weight,
+                module.c_k.weight,
+                module.c_v.weight,
                 module.c_proj.weight,
             ):
                 assert 0.0 < weight.std().item() < 0.1
@@ -286,6 +390,32 @@ def test_model_uses_explicit_small_initialization():
         assert torch.equal(block.ce_norm.weight, ema_encoder.ce_norm.weight)
         for student_parameter, ema_parameter in zip(block.compressor.parameters(), ema_encoder.compressor.parameters()):
             assert torch.equal(student_parameter, ema_parameter)
+
+
+def test_load_intertwined_state_dict_splits_legacy_packed_attention_weights():
+    model = IntertwinedHJEPA(make_config())
+    state = model.state_dict()
+    legacy_state = {
+        key: value.detach().clone()
+        for key, value in state.items()
+        if not (".attn.c_q.weight" in key or ".attn.c_k.weight" in key or ".attn.c_v.weight" in key)
+    }
+    for key in state:
+        if not key.endswith(".attn.c_q.weight"):
+            continue
+        prefix = key.removesuffix("c_q.weight")
+        legacy_state[f"{prefix}c_attn.weight"] = torch.cat(
+            (
+                state[f"{prefix}c_q.weight"],
+                state[f"{prefix}c_k.weight"],
+                state[f"{prefix}c_v.weight"],
+            ),
+            dim=0,
+        )
+
+    migrated_keys = load_intertwined_state_dict(model, legacy_state)
+
+    assert any(key.endswith(".attn.c_attn.weight") for key in migrated_keys)
 
 
 def test_residual_output_projections_use_scaled_init():

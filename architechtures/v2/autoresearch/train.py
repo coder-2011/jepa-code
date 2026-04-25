@@ -93,6 +93,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adamw8bit", "adamw4bit", "adamwfp8"])
+    parser.add_argument("--jepa-residual-adapter-gate-lr-mult", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
@@ -146,6 +147,7 @@ def validate_args(args: argparse.Namespace) -> None:
     assert args.save_every >= 0, "--save-every must be non-negative"
     assert args.lr > 0, "--lr must be positive"
     assert args.weight_decay >= 0, "--weight-decay must be non-negative"
+    assert args.jepa_residual_adapter_gate_lr_mult > 0, "--jepa-residual-adapter-gate-lr-mult must be positive"
     assert args.grad_clip >= 0, "--grad-clip must be non-negative"
     assert args.jepa_dropout_rate is None or 0.0 <= args.jepa_dropout_rate <= 1.0, "--jepa-dropout-rate must be in [0, 1]"
     assert args.auxiliary_layer_start is None or args.auxiliary_layer_start >= 0, "--auxiliary-layer-start must be non-negative"
@@ -251,6 +253,7 @@ def build_train_argv(args: argparse.Namespace) -> list[str]:
         "--lr", str(args.lr),
         "--weight-decay", str(args.weight_decay),
         "--optimizer", args.optimizer,
+        "--jepa-residual-adapter-gate-lr-mult", str(args.jepa_residual_adapter_gate_lr_mult),
         "--grad-clip", str(args.grad_clip),
         "--log-every", str(args.log_every),
         "--eval-every", str(args.eval_every),

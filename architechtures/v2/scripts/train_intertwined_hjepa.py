@@ -47,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--optimizer", default="adamw", choices=["adamw", "adamw8bit", "adamw4bit", "adamwfp8"])
+    parser.add_argument("--jepa-residual-adapter-gate-lr-mult", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -73,6 +74,7 @@ def validate_args(args: argparse.Namespace) -> None:
     assert args.max_steps > 0, "--max-steps must be positive"
     assert args.lr > 0, "--lr must be positive"
     assert args.weight_decay >= 0, "--weight-decay must be non-negative"
+    assert args.jepa_residual_adapter_gate_lr_mult > 0, "--jepa-residual-adapter-gate-lr-mult must be positive"
     assert args.grad_clip >= 0, "--grad-clip must be non-negative"
     assert args.log_every > 0, "--log-every must be positive"
     assert args.eval_every >= 0, "--eval-every must be non-negative"
@@ -135,9 +137,27 @@ def maybe_apply_torchao_float8(model: IntertwinedHJEPA, args: argparse.Namespace
 
 
 def build_optimizer(model: IntertwinedHJEPA, args: argparse.Namespace, device: torch.device) -> torch.optim.Optimizer:
+    gate_params = tuple(model.jepa_residual_adapter_gate_parameters())
+    if gate_params and args.jepa_residual_adapter_gate_lr_mult != 1.0:
+        gate_param_ids = {id(parameter) for parameter in gate_params}
+        base_params = [
+            parameter
+            for parameter in model.student_parameters()
+            if id(parameter) not in gate_param_ids
+        ]
+        params = [
+            {"params": base_params, "lr": args.lr, "weight_decay": args.weight_decay},
+            {
+                "params": gate_params,
+                "lr": args.lr * args.jepa_residual_adapter_gate_lr_mult,
+                "weight_decay": 0.0,
+            },
+        ]
+    else:
+        params = model.student_parameters()
     kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
     if args.optimizer == "adamw":
-        return torch.optim.AdamW(model.student_parameters(), fused=device.type == "cuda", **kwargs)
+        return torch.optim.AdamW(params, fused=device.type == "cuda", **kwargs)
     from torchao.optim import AdamW4bit, AdamW8bit, AdamWFp8
 
     optimizer_cls = {
@@ -145,7 +165,7 @@ def build_optimizer(model: IntertwinedHJEPA, args: argparse.Namespace, device: t
         "adamw4bit": AdamW4bit,
         "adamwfp8": AdamWFp8,
     }[args.optimizer]
-    return optimizer_cls(model.student_parameters(), **kwargs)
+    return optimizer_cls(params, **kwargs)
 
 
 def set_seed(seed: int) -> None:
@@ -505,6 +525,26 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             )
             metrics.update(
                 {f"train/delta_norm_layer_{index}": float(norm_value) for index, norm_value in enumerate(outputs["diagnostics"]["delta_norm"])}
+            )
+            metrics.update(
+                {
+                    f"train/jepa_residual_adapter_gate_layer_{index}": float(gate_value)
+                    for index, gate_value in enumerate(outputs["diagnostics"]["jepa_residual_adapter_gate"])
+                }
+            )
+            metrics.update(
+                {
+                    f"train/jepa_residual_adapter_update_norm_layer_{index}": float(norm_value)
+                    for index, norm_value in enumerate(outputs["diagnostics"]["jepa_residual_adapter_update_norm"])
+                }
+            )
+            metrics.update(
+                {
+                    f"train/jepa_residual_adapter_effective_update_norm_layer_{index}": float(norm_value)
+                    for index, norm_value in enumerate(
+                        outputs["diagnostics"]["jepa_residual_adapter_effective_update_norm"]
+                    )
+                }
             )
             print(
                 f"step={step_index} tokens={tokens_processed} "
