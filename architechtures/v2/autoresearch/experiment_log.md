@@ -243,6 +243,26 @@ Split content+dynamics latents:
 - Diagnostic note: SIGReg was much lower than the current best, but LM loss regressed badly. Dynamics latent scale became unstable in active layers; late-run `z_variance` reached hundreds to thousands and `delta_norm` reached thousands on layers `6,7,8`.
 - Conclusion: same-total-width 50/50 split latents are a clear discard for this setup, worse than current best by `0.094688` BPB. The result suggests the dynamics branch became too underconstrained or too narrow after removing SIGReg pressure from the JEPA latent. The implementation was rolled back from active code; the run result remains in `results.tsv` for history.
 
+Zero-gated JEPA residual adapter:
+
+- `compact16m-5k-topthird-mean-t1-t4-gated-adapter-20260425`: `val_bpb=2.124057`
+- Config: `sweep_configs/compact_16m_topthird_mean_t1_t4_gated_adapter.yaml`
+- Change tested: current-best top-third mean setup (`layers 6,7,8`, horizon `t+1..t+4`, 10% aux dropout), plus a zero-initialized gated residual adapter from normalized predicted future latent `norm(z + delta)` back into the residual transition on layers `6,7,8`.
+- Contract:
+  - Gate is parameterized as `tanh(raw_gate)` and initialized to exactly `0.0`.
+  - At gate `0.0`, the adapter preserves the old residual update exactly.
+  - LM gradients can move the gate while it is closed; once the gate opens, LM gradients also flow into the adapter, compressor, and predictor unless `jepa_residual_adapter_stop_gradient=true`.
+- Final eval: `loss_lm=3.648525`, `loss_jepa=1.936831`, `loss_sigreg=9.730469`
+- Effective dropout fraction: `0.098600`
+- Throughput: `22694.915117` tokens/sec, wall time `298.439852` seconds
+- Diagnostic note: gates stayed very close to zero throughout the run, e.g. late train logs were roughly within `[-0.0042, 0.0037]` on active layers. Adapter update norms were large, but the learned scalar gates kept the residual contribution tiny.
+- Verification:
+  - Focused pytest suite passed: `46 passed`.
+  - `autoresearch/train.py --validate-only --profile smoke` accepted the config.
+  - Tiny smoke training completed.
+  - Deterministic numeric probes passed for future-span means, exact adapter residual math, zero-gate preservation, real compact-config shapes/layer routing, and LM gradient flow through the opened adapter.
+- Conclusion: implemented and verified, but this config is a discard for BPB. It regressed versus current best by `0.012070` BPB and did not meaningfully exploit the residual adapter at the 5k budget.
+
 Still unrun but now supported:
 
 - alternating blocks such as one-based 4/6/8 via `auxiliary_layer_start=3`, `auxiliary_layer_stride=2`
